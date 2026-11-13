@@ -1,0 +1,3 @@
+recursive-include src/unigym_test_pack_isaaclab_cartpole/pack *.yaml *.usd
+include README.md
+include THIRD_PARTY_NOTICES.md

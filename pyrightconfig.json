@@ -1,0 +1,10 @@
+{
+  "include": ["packages", "tools"],
+  "exclude": ["**/.venv", "**/__pycache__", "**/build"],
+  "venvPath": ".",
+  "venv": ".venv",
+  "pythonVersion": "3.11",
+  "typeCheckingMode": "standard",
+  "reportMissingImports": "none",
+  "reportMissingTypeStubs": "none"
+}

@@ -1,0 +1,9 @@
+schema: unigym.pack/1
+name: isaaclab_cartpole
+version: 1.0.0
+api: 1
+trust: content
+provides:
+  assets:
+    - id: isaaclab_cartpole.usd
+      resource: assets/cartpole.usd

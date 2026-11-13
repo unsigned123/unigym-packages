@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "unigym-test-pack-basic"
+version = "0.1.0"
+description = "Basic content pack for unigym test-pack contract tests"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.entry-points."unigym.test_packs"]
+basic = "unigym_test_pack_basic:pack_root"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+unigym_test_pack_basic = [
+    "py.typed",
+    "pack/*.yaml",
+    "pack/*/*.yaml",
+]

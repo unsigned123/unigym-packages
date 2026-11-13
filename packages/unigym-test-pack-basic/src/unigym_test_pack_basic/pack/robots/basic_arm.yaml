@@ -1,0 +1,14 @@
+schema: unigym.robot/1
+name: basic_arm
+joint_sets:
+  body:
+    - shoulder
+    - elbow
+default_joint_pos:
+  shoulder: 0.0
+  elbow: 0.0
+base_body: base
+base_height: 0.4
+body_bindings:
+  base:
+    mujoco: base

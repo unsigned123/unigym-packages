@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "unigym-test-pack-isaaclab-cartpole"
+version = "0.1.0"
+description = "IsaacLab Cartpole content pack for unigym backend tests"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.entry-points."unigym.test_packs"]
+isaaclab_cartpole = "unigym_test_pack_isaaclab_cartpole:pack_root"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+include-package-data = true
+license-files = ["THIRD_PARTY_NOTICES.md"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+unigym_test_pack_isaaclab_cartpole = [
+    "py.typed",
+    "pack/*.yaml",
+    "pack/*/*.usd",
+    "pack/*/*/*.usd",
+]

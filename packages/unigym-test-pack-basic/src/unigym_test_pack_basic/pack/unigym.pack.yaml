@@ -1,0 +1,13 @@
+schema: unigym.pack/1
+name: basic
+version: 1.0.0
+api: 1
+trust: content
+provides:
+  providers:
+    - id: basic_arm
+      kind: robot
+      resource: robots/basic_arm.yaml
+  scenes:
+    - id: basic.tabletop
+      resource: scenes/tabletop.yaml

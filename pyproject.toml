@@ -1,0 +1,99 @@
+[project]
+name = "unigym-test-packs-workspace"
+version = "0.1.0"
+description = "Independent test-pack distributions for unigym"
+requires-python = ">=3.11"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "import-linter==2.15",
+    "pyright[nodejs]==1.1.414",
+    "pytest>=8.0,<10.0",
+    "ruff==0.8.6",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.workspace]
+members = ["packages/*"]
+
+[tool.uv.sources]
+unigym = { path = "../unigym-core", editable = true }
+unigym-test-pack-basic = { workspace = true }
+unigym-test-pack-isaaclab-cartpole = { workspace = true }
+unigym-test-packs = { workspace = true }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = [
+    "-ra",
+    "--strict-markers",
+    "--strict-config",
+    "--import-mode=importlib",
+]
+
+[tool.ruff]
+line-length = 100
+extend-exclude = [".venv", "dist"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "D"]
+extend-ignore = ["D105", "D107"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["D1", "D2", "D3", "D4"]
+
+[tool.importlinter]
+root_packages = [
+    "unigym",
+    "unigym_test_packs",
+    "unigym_test_pack_basic",
+    "unigym_test_pack_isaaclab_cartpole",
+]
+
+[[tool.importlinter.contracts]]
+name = "Plugin uses only the public pack API"
+type = "forbidden"
+source_modules = ["unigym_test_packs"]
+forbidden_modules = ["unigym", "unigym.*"]
+ignore_imports = [
+    "unigym_test_packs.** -> unigym.pack_api",
+    "unigym_test_packs.** -> unigym.packs",
+]
+
+[[tool.importlinter.contracts]]
+name = "Pack code uses only the approved public surfaces"
+type = "forbidden"
+source_modules = [
+    "unigym_test_pack_basic",
+    "unigym_test_pack_isaaclab_cartpole",
+]
+forbidden_modules = [
+    "unigym.packs.runtime",
+    "unigym.packs.schema",
+    "unigym.packs.catalog",
+    "unigym.backends",
+    "unigym.backends.*",
+    "unigym.core",
+    "unigym.core.*",
+    "unigym.env",
+    "unigym.env.*",
+    "unigym.run",
+    "unigym.run.*",
+    "unigym.scenes",
+    "unigym.scenes.*",
+]
+
+[[tool.importlinter.contracts]]
+name = "Plugin and pack distributions stay independent"
+type = "independence"
+modules = [
+    "unigym_test_packs",
+    "unigym_test_pack_basic",
+    "unigym_test_pack_isaaclab_cartpole",
+]
