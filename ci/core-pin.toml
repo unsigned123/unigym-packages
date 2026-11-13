@@ -2,4 +2,4 @@
 # The ref must be a pushed commit in the configured repository.
 [core]
 repository = "unsigned123/unigym"
-ref = "8512b8df73b8319c39c6dd070a927749c0f30469"
+ref = "9b9d0eab047f7c05d4585478a4fd29a9451452a7"

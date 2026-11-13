@@ -50,7 +50,8 @@ uv run --frozen pytest tests/unit tests/contract -q
 uv run --frozen pytest --strict-test-packs -q
 uv run --frozen pytest tests/consumer/test_basic_pack.py -q
 uv run --frozen pytest tests/consumer/test_cartpole_pack.py -q
-uv run --frozen pytest tests/consumer/test_g1_pack.py -q
+uv run --frozen pytest tests/consumer/test_g1_pack.py tests/consumer/test_g1_robot_profile.py -q
+uv run --frozen pytest tests/consumer/test_gr1_pack.py -q
 uv run --frozen python tools/check_wheel.py --core-checkout ../unigym-core
 ```
 
@@ -63,3 +64,7 @@ targets select test paths instead; they do not change the installed set.
 
 Update `ci/core-pin.toml` only to a commit that exists in
 `unsigned123/unigym`. A local-only hash makes the pinned lanes unreproducible.
+
+The pin includes R2b core external-only robot registration, so the G1/GR1
+robot-provider consumer lanes run against the same external-only registry
+semantics as core `main`.

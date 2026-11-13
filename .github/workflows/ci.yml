@@ -119,7 +119,7 @@ jobs:
       - name: Keep only the basic pack installed
         run: |
           uv pip uninstall --python .venv/bin/python \
-            unigym-test-pack-isaaclab-cartpole unigym-test-pack-g1
+            unigym-test-pack-isaaclab-cartpole unigym-test-pack-g1 unigym-test-pack-gr1
       - name: Subset suite
         run: .venv/bin/python -m pytest -q -rs
 

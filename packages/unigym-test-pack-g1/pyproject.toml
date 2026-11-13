@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "unigym-test-pack-g1"
-version = "0.1.0"
+version = "0.2.0"
 description = "43-DoF G1 content pack for unigym backend tests"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -25,6 +25,7 @@ where = ["src"]
 unigym_test_pack_g1 = [
     "py.typed",
     "pack/*.yaml",
+    "pack/*/*.yaml",
     "pack/*/*.usd",
     "pack/*/*.usda",
     "pack/*/*/*.usd",

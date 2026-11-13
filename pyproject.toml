@@ -23,6 +23,7 @@ members = ["packages/*"]
 unigym = { path = "../unigym-core", editable = true }
 unigym-test-pack-basic = { workspace = true }
 unigym-test-pack-g1 = { workspace = true }
+unigym-test-pack-gr1 = { workspace = true }
 unigym-test-pack-isaaclab-cartpole = { workspace = true }
 unigym-test-packs = { workspace = true }
 
@@ -55,6 +56,7 @@ root_packages = [
     "unigym_test_packs",
     "unigym_test_pack_basic",
     "unigym_test_pack_g1",
+    "unigym_test_pack_gr1",
     "unigym_test_pack_isaaclab_cartpole",
 ]
 
@@ -74,6 +76,7 @@ type = "forbidden"
 source_modules = [
     "unigym_test_pack_basic",
     "unigym_test_pack_g1",
+    "unigym_test_pack_gr1",
     "unigym_test_pack_isaaclab_cartpole",
 ]
 forbidden_modules = [
@@ -99,5 +102,6 @@ modules = [
     "unigym_test_packs",
     "unigym_test_pack_basic",
     "unigym_test_pack_g1",
+    "unigym_test_pack_gr1",
     "unigym_test_pack_isaaclab_cartpole",
 ]

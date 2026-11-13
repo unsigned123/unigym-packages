@@ -12,6 +12,7 @@ resolution-markers = [
 members = [
     "unigym-test-pack-basic",
     "unigym-test-pack-g1",
+    "unigym-test-pack-gr1",
     "unigym-test-pack-isaaclab-cartpole",
     "unigym-test-packs",
     "unigym-test-packs-workspace",
@@ -990,8 +991,13 @@ source = { editable = "packages/unigym-test-pack-basic" }
 
 [[package]]
 name = "unigym-test-pack-g1"
-version = "0.1.0"
+version = "0.2.0"
 source = { editable = "packages/unigym-test-pack-g1" }
+
+[[package]]
+name = "unigym-test-pack-gr1"
+version = "0.2.0"
+source = { editable = "packages/unigym-test-pack-gr1" }
 
 [[package]]
 name = "unigym-test-pack-isaaclab-cartpole"

@@ -18,6 +18,7 @@ PLUGIN_PROJECT = REPO_ROOT / "packages" / "unigym-test-packs"
 BASIC_PROJECT = REPO_ROOT / "packages" / "unigym-test-pack-basic"
 CARTPOLE_PROJECT = REPO_ROOT / "packages" / "unigym-test-pack-isaaclab-cartpole"
 G1_PROJECT = REPO_ROOT / "packages" / "unigym-test-pack-g1"
+GR1_PROJECT = REPO_ROOT / "packages" / "unigym-test-pack-gr1"
 
 G1_EXPECTED_ASSETS = {
     "g1.usd",
@@ -48,8 +49,9 @@ G1_USDA_SHA256 = "d465d4c4ee6bd4863556f86e306bfb0eeaee125128a17a24bbe52d5340f3e5
 CONSUMER_TEST = '''\
 import pytest
 from unigym.pack_api import load_manifest_v1
+from unigym.robots import build_robot_profile
 
-pytestmark = pytest.mark.requires_test_packs("basic", "isaaclab_cartpole", "g1")
+pytestmark = pytest.mark.requires_test_packs("basic", "isaaclab_cartpole", "g1", "gr1")
 
 
 def test_installed_wheels(pack_root, pack_runtime):
@@ -74,6 +76,12 @@ def test_installed_wheels(pack_root, pack_runtime):
     g1_usd = g1.resource_for("assets", "g1.usd")
     assert (g1_usd.parent / "configuration" / "three_finger_hand").is_dir()
     assert (g1_usd.parent / "configuration" / "g1_29dof_with_hand_rev_1_0_base.usd").is_file()
+
+    assert g1.activate("g1").robots == ("g1",)
+    assert build_robot_profile({"name": "g1"}).base_height == pytest.approx(0.78)
+    gr1 = pack_runtime("gr1")
+    assert gr1.activate("gr1").robots == ("gr1",)
+    assert len(build_robot_profile({"name": "gr1"}).full_joint_names) == 39
 '''
 
 
@@ -98,7 +106,11 @@ def _entry_points_text(archive: zipfile.ZipFile) -> str:
 
 
 def _check_wheel_contents(
-    plugin_wheel: Path, basic_wheel: Path, cartpole_wheel: Path, g1_wheel: Path
+    plugin_wheel: Path,
+    basic_wheel: Path,
+    cartpole_wheel: Path,
+    g1_wheel: Path,
+    gr1_wheel: Path,
 ) -> None:
     with zipfile.ZipFile(plugin_wheel) as archive:
         names = set(archive.namelist())
@@ -179,6 +191,21 @@ def _check_wheel_contents(
         raise SystemExit(f"{g1_wheel} is missing THIRD_PARTY_NOTICES.md")
     if "[unigym.test_packs]" not in entries or "g1 =" not in entries:
         raise SystemExit(f"{g1_wheel} is missing the unigym.test_packs entry point")
+    if "unigym_test_pack_g1/pack/robots/g1.yaml" not in names:
+        raise SystemExit(f"{g1_wheel} is missing the g1 robot profile")
+
+    with zipfile.ZipFile(gr1_wheel) as archive:
+        names = set(archive.namelist())
+        entries = _entry_points_text(archive)
+    required = {
+        "unigym_test_pack_gr1/pack/unigym.pack.yaml",
+        "unigym_test_pack_gr1/pack/robots/gr1.yaml",
+    }
+    missing = sorted(required - names)
+    if missing:
+        raise SystemExit(f"{gr1_wheel} is missing pack data: {missing}")
+    if "[unigym.test_packs]" not in entries or "gr1 =" not in entries:
+        raise SystemExit(f"{gr1_wheel} is missing the unigym.test_packs entry point")
 
 
 def main() -> int:
@@ -195,7 +222,13 @@ def main() -> int:
     try:
         dist = work / "dist"
         dist.mkdir()
-        for project in (PLUGIN_PROJECT, BASIC_PROJECT, CARTPOLE_PROJECT, G1_PROJECT):
+        for project in (
+            PLUGIN_PROJECT,
+            BASIC_PROJECT,
+            CARTPOLE_PROJECT,
+            G1_PROJECT,
+            GR1_PROJECT,
+        ):
             _run(["uv", "build", "--wheel", "--out-dir", str(dist), str(project)], cwd=REPO_ROOT)
 
         if args.core_wheel is not None:
@@ -218,7 +251,10 @@ def main() -> int:
         basic_wheel = _single(wheels, "unigym_test_pack_basic-*.whl")
         cartpole_wheel = _single(wheels, "unigym_test_pack_isaaclab_cartpole-*.whl")
         g1_wheel = _single(wheels, "unigym_test_pack_g1-*.whl")
-        _check_wheel_contents(plugin_wheel, basic_wheel, cartpole_wheel, g1_wheel)
+        gr1_wheel = _single(wheels, "unigym_test_pack_gr1-*.whl")
+        _check_wheel_contents(
+            plugin_wheel, basic_wheel, cartpole_wheel, g1_wheel, gr1_wheel
+        )
 
         venv = work / "venv"
         _run(["uv", "venv", "--python", "3.11", str(venv)], cwd=REPO_ROOT)
@@ -238,6 +274,7 @@ def main() -> int:
                 str(basic_wheel),
                 str(cartpole_wheel),
                 str(g1_wheel),
+                str(gr1_wheel),
             ],
             cwd=REPO_ROOT,
         )

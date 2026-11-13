@@ -1,4 +1,4 @@
-.PHONY: sync test test-strict test-unit test-basic test-cartpole test-g1 lint typecheck imports wheel
+.PHONY: sync test test-strict test-unit test-basic test-cartpole test-g1 test-gr1 lint typecheck imports wheel
 
 sync:
 	uv sync --all-packages
@@ -19,7 +19,10 @@ test-cartpole:
 	uv run --frozen pytest tests/consumer/test_cartpole_pack.py -q
 
 test-g1:
-	uv run --frozen pytest tests/consumer/test_g1_pack.py -q
+	uv run --frozen pytest tests/consumer/test_g1_pack.py tests/consumer/test_g1_robot_profile.py -q
+
+test-gr1:
+	uv run --frozen pytest tests/consumer/test_gr1_pack.py -q
 
 lint:
 	uv run --frozen ruff check .
