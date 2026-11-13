@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import shutil
 import subprocess
@@ -16,12 +17,39 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 PLUGIN_PROJECT = REPO_ROOT / "packages" / "unigym-test-packs"
 BASIC_PROJECT = REPO_ROOT / "packages" / "unigym-test-pack-basic"
 CARTPOLE_PROJECT = REPO_ROOT / "packages" / "unigym-test-pack-isaaclab-cartpole"
+G1_PROJECT = REPO_ROOT / "packages" / "unigym-test-pack-g1"
+
+G1_EXPECTED_ASSETS = {
+    "g1.usd",
+    "configuration/g1_29dof_with_hand_rev_1_0_base.usd",
+    "configuration/g1_29dof_with_hand_rev_1_0_physics_simplified.usd",
+    "configuration/g1_29dof_with_hand_rev_1_0_physics.usd",
+    "configuration/g1_29dof_with_hand_rev_1_0_robot.usd",
+    "configuration/g1_29dof_with_hand_rev_1_0_robot.usda",
+    "configuration/g1_29dof_with_hand_rev_1_0_sensor.usd",
+    "configuration/g1_Gripper_three_finger_hand_physics_right.usd",
+    "configuration/g1_left_hand_inspire_left_physics.usd",
+    "configuration/g1_left_hand_three_finger_hand_physics_left.usd",
+    "configuration/g1_right_hand_inspire_right_physics.usd",
+    "configuration/g1_right_hand_three_finger_hand_physics_right.usd",
+    "configuration/three_finger_hand/three_finger_hand_base_left.usd",
+    "configuration/three_finger_hand/three_finger_hand_base_right.usd",
+    "configuration/three_finger_hand/three_finger_hand_physics_left.usd",
+    "configuration/three_finger_hand/three_finger_hand_physics_right.usd",
+    "configuration/three_finger_hand/three_fingers_left_hand_robot.usd",
+    "configuration/three_finger_hand/three_fingers_left_hand.usd",
+    "configuration/three_finger_hand/three_fingers_right_hand_robot.usd",
+    "configuration/three_finger_hand/three_fingers_right_hand.usd",
+}
+
+G1_USD_SHA256 = "448e37857ce9bec3bf29c41c88dd81932cd9b0ad2a107bb307353168b33a7266"
+G1_USDA_SHA256 = "d465d4c4ee6bd4863556f86e306bfb0eeaee125128a17a24bbe52d5340f3e5d7"
 
 CONSUMER_TEST = '''\
 import pytest
 from unigym.pack_api import load_manifest_v1
 
-pytestmark = pytest.mark.requires_test_packs("basic", "isaaclab_cartpole")
+pytestmark = pytest.mark.requires_test_packs("basic", "isaaclab_cartpole", "g1")
 
 
 def test_installed_wheels(pack_root, pack_runtime):
@@ -39,6 +67,13 @@ def test_installed_wheels(pack_root, pack_runtime):
     usd = cartpole.resource_for("assets", "isaaclab_cartpole.usd")
     assert b"Props" in usd.read_bytes()
     assert (usd.parent / "Props" / "instanceable_meshes.usd").is_file()
+
+    g1_root = pack_root("g1")
+    assert load_manifest_v1(g1_root).name == "g1"
+    g1 = pack_runtime("g1")
+    g1_usd = g1.resource_for("assets", "g1.usd")
+    assert (g1_usd.parent / "configuration" / "three_finger_hand").is_dir()
+    assert (g1_usd.parent / "configuration" / "g1_29dof_with_hand_rev_1_0_base.usd").is_file()
 '''
 
 
@@ -63,7 +98,7 @@ def _entry_points_text(archive: zipfile.ZipFile) -> str:
 
 
 def _check_wheel_contents(
-    plugin_wheel: Path, basic_wheel: Path, cartpole_wheel: Path
+    plugin_wheel: Path, basic_wheel: Path, cartpole_wheel: Path, g1_wheel: Path
 ) -> None:
     with zipfile.ZipFile(plugin_wheel) as archive:
         names = set(archive.namelist())
@@ -105,6 +140,46 @@ def _check_wheel_contents(
             f"{cartpole_wheel} is missing the unigym.test_packs entry point"
         )
 
+    with zipfile.ZipFile(g1_wheel) as archive:
+        names = set(archive.namelist())
+        entries = _entry_points_text(archive)
+    required = {
+        "unigym_test_pack_g1/pack/unigym.pack.yaml",
+        "unigym_test_pack_g1/pack/assets/g1.usd",
+        "unigym_test_pack_g1/pack/assets/configuration/g1_29dof_with_hand_rev_1_0_base.usd",
+        "unigym_test_pack_g1/pack/assets/configuration/g1_29dof_with_hand_rev_1_0_robot.usda",
+        "unigym_test_pack_g1/pack/assets/configuration/three_finger_hand/"
+        "three_finger_hand_base_left.usd",
+        "unigym_test_pack_g1/pack/assets/configuration/three_finger_hand/"
+        "three_finger_hand_base_right.usd",
+    }
+    missing = sorted(required - names)
+    if missing:
+        raise SystemExit(f"{g1_wheel} is missing pack data: {missing}")
+    asset_prefix = "unigym_test_pack_g1/pack/assets/"
+    g1_assets = {
+        name[len(asset_prefix) :] for name in names if name.startswith(asset_prefix)
+    }
+    if g1_assets != G1_EXPECTED_ASSETS:
+        missing = sorted(G1_EXPECTED_ASSETS - g1_assets)
+        extra = sorted(g1_assets - G1_EXPECTED_ASSETS)
+        raise SystemExit(
+            f"{g1_wheel} G1 asset set differs; missing={missing}, extra={extra}"
+        )
+    with zipfile.ZipFile(g1_wheel) as archive:
+        usd = archive.read(f"{asset_prefix}g1.usd")
+        usda = archive.read(
+            f"{asset_prefix}configuration/g1_29dof_with_hand_rev_1_0_robot.usda"
+        )
+    if hashlib.sha256(usd).hexdigest() != G1_USD_SHA256:
+        raise SystemExit(f"{g1_wheel} g1.usd bytes differ")
+    if hashlib.sha256(usda).hexdigest() != G1_USDA_SHA256:
+        raise SystemExit(f"{g1_wheel} g1 robot.usda bytes differ")
+    if not any(name.endswith("THIRD_PARTY_NOTICES.md") for name in names):
+        raise SystemExit(f"{g1_wheel} is missing THIRD_PARTY_NOTICES.md")
+    if "[unigym.test_packs]" not in entries or "g1 =" not in entries:
+        raise SystemExit(f"{g1_wheel} is missing the unigym.test_packs entry point")
+
 
 def main() -> int:
     """Build and exercise the wheel set, returning a process exit code."""
@@ -120,7 +195,7 @@ def main() -> int:
     try:
         dist = work / "dist"
         dist.mkdir()
-        for project in (PLUGIN_PROJECT, BASIC_PROJECT, CARTPOLE_PROJECT):
+        for project in (PLUGIN_PROJECT, BASIC_PROJECT, CARTPOLE_PROJECT, G1_PROJECT):
             _run(["uv", "build", "--wheel", "--out-dir", str(dist), str(project)], cwd=REPO_ROOT)
 
         if args.core_wheel is not None:
@@ -142,7 +217,8 @@ def main() -> int:
         plugin_wheel = _single(wheels, "unigym_test_packs-*.whl")
         basic_wheel = _single(wheels, "unigym_test_pack_basic-*.whl")
         cartpole_wheel = _single(wheels, "unigym_test_pack_isaaclab_cartpole-*.whl")
-        _check_wheel_contents(plugin_wheel, basic_wheel, cartpole_wheel)
+        g1_wheel = _single(wheels, "unigym_test_pack_g1-*.whl")
+        _check_wheel_contents(plugin_wheel, basic_wheel, cartpole_wheel, g1_wheel)
 
         venv = work / "venv"
         _run(["uv", "venv", "--python", "3.11", str(venv)], cwd=REPO_ROOT)
@@ -161,6 +237,7 @@ def main() -> int:
                 str(plugin_wheel),
                 str(basic_wheel),
                 str(cartpole_wheel),
+                str(g1_wheel),
             ],
             cwd=REPO_ROOT,
         )

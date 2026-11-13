@@ -7,11 +7,13 @@ plugin (`unigym-test-packs`) and content pack distributions. Pack discovery uses
 the dedicated `unigym.test_packs` entry-point group; the plugin never reads asset
 environment variables.
 
-## M0/M1
+## M0-M2
 
 - `unigym-test-packs`: marker, discovery, fixtures and strict mode.
 - `unigym-test-pack-basic`: first content pack (`providers` and `scenes` faces).
 - `unigym-test-pack-isaaclab-cartpole`: Cartpole USD asset pack (`assets` face).
+- `unigym-test-pack-g1`: complete 43-DoF G1 USD tree (`assets` face), shipped as
+  one selective wheel; runtime configuration selects declared resources.
 
 ## Commands
 

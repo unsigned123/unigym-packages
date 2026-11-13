@@ -11,6 +11,7 @@ resolution-markers = [
 [manifest]
 members = [
     "unigym-test-pack-basic",
+    "unigym-test-pack-g1",
     "unigym-test-pack-isaaclab-cartpole",
     "unigym-test-packs",
     "unigym-test-packs-workspace",
@@ -986,6 +987,11 @@ provides-extras = ["daemon", "webui", "record", "media", "usd", "warp", "dev"]
 name = "unigym-test-pack-basic"
 version = "0.1.0"
 source = { editable = "packages/unigym-test-pack-basic" }
+
+[[package]]
+name = "unigym-test-pack-g1"
+version = "0.1.0"
+source = { editable = "packages/unigym-test-pack-g1" }
 
 [[package]]
 name = "unigym-test-pack-isaaclab-cartpole"
