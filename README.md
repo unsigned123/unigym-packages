@@ -21,11 +21,16 @@ environment variables.
 uv sync --all-packages
 uv run --frozen pytest
 uv run --frozen pytest --strict-test-packs
+uv run --frozen pytest tests/consumer/test_basic_pack.py
+uv run --frozen pytest tests/consumer/test_cartpole_pack.py
+uv run --frozen pytest tests/consumer/test_g1_pack.py
 uv run --frozen ruff check .
 uv run --frozen pyright
 uv run --frozen lint-imports
 uv run --frozen python tools/check_wheel.py --core-checkout ../unigym-core
 ```
+
+CI lanes and the core pin are documented in `docs/ci.md`.
 
 Test code declares pack dependencies with:
 
@@ -37,5 +42,7 @@ Then uses `pack_root(name)` for the installed tree or `pack_runtime(*names)` for
 the explicit core pack runtime. Activation is always explicit through
 `PackRuntime.activate`.
 
-Missing packs skip by default. CI lanes use `--strict-test-packs` so a missing
-required pack fails at test setup.
+Missing packs skip by default. The strict/full CI lanes use
+`--strict-test-packs` so a missing required pack fails at test setup; the
+installed-set subset lane intentionally stays non-strict to prove the skip
+path.

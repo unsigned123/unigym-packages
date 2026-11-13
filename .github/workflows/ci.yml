@@ -1,0 +1,188 @@
+name: test packs
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: lint and contracts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read core pin
+        run: |
+          CORE_REPOSITORY=$(python3 -c 'import tomllib; print(tomllib.load(open("ci/core-pin.toml", "rb"))["core"]["repository"])')
+          CORE_REF=$(python3 -c 'import tomllib; print(tomllib.load(open("ci/core-pin.toml", "rb"))["core"]["ref"])')
+          echo "CORE_REPOSITORY=$CORE_REPOSITORY" >> "$GITHUB_ENV"
+          echo "CORE_REF=$CORE_REF" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.CORE_REPOSITORY }}
+          ref: ${{ env.CORE_REF }}
+          path: core
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Link core checkout
+        run: ln -sfn "$GITHUB_WORKSPACE/core" "$GITHUB_WORKSPACE/../unigym-core"
+      - name: Sync workspace
+        run: uv sync --all-packages
+      - name: Ruff
+        run: uv run --frozen ruff check packages tests tools
+      - name: Pyright
+        env:
+          PYRIGHT_PYTHON_GLOBAL_NODE: "false"
+        run: uv run --frozen pyright
+      - name: Import contracts
+        run: uv run --frozen lint-imports --no-cache
+
+  unit:
+    name: unit and contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read core pin
+        run: |
+          CORE_REPOSITORY=$(python3 -c 'import tomllib; print(tomllib.load(open("ci/core-pin.toml", "rb"))["core"]["repository"])')
+          CORE_REF=$(python3 -c 'import tomllib; print(tomllib.load(open("ci/core-pin.toml", "rb"))["core"]["ref"])')
+          echo "CORE_REPOSITORY=$CORE_REPOSITORY" >> "$GITHUB_ENV"
+          echo "CORE_REF=$CORE_REF" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.CORE_REPOSITORY }}
+          ref: ${{ env.CORE_REF }}
+          path: core
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Link core checkout
+        run: ln -sfn "$GITHUB_WORKSPACE/core" "$GITHUB_WORKSPACE/../unigym-core"
+      - name: Sync workspace
+        run: uv sync --all-packages
+      - name: Unit and contract tests
+        run: .venv/bin/python -m pytest tests/unit tests/contract -q
+
+  strict-full:
+    name: strict full
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read core pin
+        run: |
+          CORE_REPOSITORY=$(python3 -c 'import tomllib; print(tomllib.load(open("ci/core-pin.toml", "rb"))["core"]["repository"])')
+          CORE_REF=$(python3 -c 'import tomllib; print(tomllib.load(open("ci/core-pin.toml", "rb"))["core"]["ref"])')
+          echo "CORE_REPOSITORY=$CORE_REPOSITORY" >> "$GITHUB_ENV"
+          echo "CORE_REF=$CORE_REF" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.CORE_REPOSITORY }}
+          ref: ${{ env.CORE_REF }}
+          path: core
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Link core checkout
+        run: ln -sfn "$GITHUB_WORKSPACE/core" "$GITHUB_WORKSPACE/../unigym-core"
+      - name: Sync workspace
+        run: uv sync --all-packages
+      - name: Strict full suite
+        run: .venv/bin/python -m pytest --strict-test-packs -q
+
+  subset-basic:
+    name: subset basic
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read core pin
+        run: |
+          CORE_REPOSITORY=$(python3 -c 'import tomllib; print(tomllib.load(open("ci/core-pin.toml", "rb"))["core"]["repository"])')
+          CORE_REF=$(python3 -c 'import tomllib; print(tomllib.load(open("ci/core-pin.toml", "rb"))["core"]["ref"])')
+          echo "CORE_REPOSITORY=$CORE_REPOSITORY" >> "$GITHUB_ENV"
+          echo "CORE_REF=$CORE_REF" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.CORE_REPOSITORY }}
+          ref: ${{ env.CORE_REF }}
+          path: core
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Link core checkout
+        run: ln -sfn "$GITHUB_WORKSPACE/core" "$GITHUB_WORKSPACE/../unigym-core"
+      - name: Sync workspace
+        run: uv sync --all-packages
+      - name: Keep only the basic pack installed
+        run: |
+          uv pip uninstall --python .venv/bin/python \
+            unigym-test-pack-isaaclab-cartpole unigym-test-pack-g1
+      - name: Subset suite
+        run: .venv/bin/python -m pytest -q -rs
+
+  strict-missing:
+    name: strict missing pack
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read core pin
+        run: |
+          CORE_REPOSITORY=$(python3 -c 'import tomllib; print(tomllib.load(open("ci/core-pin.toml", "rb"))["core"]["repository"])')
+          CORE_REF=$(python3 -c 'import tomllib; print(tomllib.load(open("ci/core-pin.toml", "rb"))["core"]["ref"])')
+          echo "CORE_REPOSITORY=$CORE_REPOSITORY" >> "$GITHUB_ENV"
+          echo "CORE_REF=$CORE_REF" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.CORE_REPOSITORY }}
+          ref: ${{ env.CORE_REF }}
+          path: core
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Link core checkout
+        run: ln -sfn "$GITHUB_WORKSPACE/core" "$GITHUB_WORKSPACE/../unigym-core"
+      - name: Sync workspace
+        run: uv sync --all-packages
+      - name: Remove the Cartpole and G1 packs
+        run: |
+          uv pip uninstall --python .venv/bin/python \
+            unigym-test-pack-isaaclab-cartpole unigym-test-pack-g1
+      - name: Strict missing must fail at setup
+        run: |
+          set +e
+          .venv/bin/python -m pytest --strict-test-packs \
+            tests/consumer/test_cartpole_pack.py -q > strict-missing.log 2>&1
+          status=$?
+          set -e
+          cat strict-missing.log
+          test "$status" -ne 0
+          grep -q "missing test pack(s): isaaclab_cartpole" strict-missing.log
+
+  wheel:
+    name: isolated wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read core pin
+        run: |
+          CORE_REPOSITORY=$(python3 -c 'import tomllib; print(tomllib.load(open("ci/core-pin.toml", "rb"))["core"]["repository"])')
+          CORE_REF=$(python3 -c 'import tomllib; print(tomllib.load(open("ci/core-pin.toml", "rb"))["core"]["ref"])')
+          echo "CORE_REPOSITORY=$CORE_REPOSITORY" >> "$GITHUB_ENV"
+          echo "CORE_REF=$CORE_REF" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.CORE_REPOSITORY }}
+          ref: ${{ env.CORE_REF }}
+          path: core
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Link core checkout
+        run: ln -sfn "$GITHUB_WORKSPACE/core" "$GITHUB_WORKSPACE/../unigym-core"
+      - name: Sync workspace
+        run: uv sync --all-packages
+      - name: Build and run wheels outside the checkout
+        run: uv run --frozen python tools/check_wheel.py --core-checkout ../unigym-core --online

@@ -1,0 +1,84 @@
+name: test packs nightly
+
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  core-pinned:
+    name: core pinned
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read core pin
+        run: |
+          CORE_REPOSITORY=$(python3 -c 'import tomllib; print(tomllib.load(open("ci/core-pin.toml", "rb"))["core"]["repository"])')
+          CORE_REF=$(python3 -c 'import tomllib; print(tomllib.load(open("ci/core-pin.toml", "rb"))["core"]["ref"])')
+          echo "CORE_REPOSITORY=$CORE_REPOSITORY" >> "$GITHUB_ENV"
+          echo "CORE_REF=$CORE_REF" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.CORE_REPOSITORY }}
+          ref: ${{ env.CORE_REF }}
+          path: core
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Link core checkout
+        run: ln -sfn "$GITHUB_WORKSPACE/core" "$GITHUB_WORKSPACE/../unigym-core"
+      - name: Sync workspace
+        run: uv sync --all-packages
+      - name: Strict suite against pinned core
+        run: .venv/bin/python -m pytest --strict-test-packs -q
+
+  core-main:
+    name: core main drift
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read core repository
+        run: |
+          CORE_REPOSITORY=$(python3 -c 'import tomllib; print(tomllib.load(open("ci/core-pin.toml", "rb"))["core"]["repository"])')
+          echo "CORE_REPOSITORY=$CORE_REPOSITORY" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.CORE_REPOSITORY }}
+          ref: main
+          path: core
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Link core checkout
+        run: ln -sfn "$GITHUB_WORKSPACE/core" "$GITHUB_WORKSPACE/../unigym-core"
+      - name: Sync workspace
+        run: uv sync --all-packages
+      - name: Strict suite against core main
+        run: .venv/bin/python -m pytest --strict-test-packs -q
+
+  wheel-main:
+    name: wheel and large assets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read core repository
+        run: |
+          CORE_REPOSITORY=$(python3 -c 'import tomllib; print(tomllib.load(open("ci/core-pin.toml", "rb"))["core"]["repository"])')
+          echo "CORE_REPOSITORY=$CORE_REPOSITORY" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.CORE_REPOSITORY }}
+          ref: main
+          path: core
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Link core checkout
+        run: ln -sfn "$GITHUB_WORKSPACE/core" "$GITHUB_WORKSPACE/../unigym-core"
+      - name: Sync workspace
+        run: uv sync --all-packages
+      - name: Isolated wheel and large-asset gates
+        run: uv run --frozen python tools/check_wheel.py --core-checkout ../unigym-core --online
