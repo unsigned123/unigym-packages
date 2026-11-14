@@ -7,3 +7,11 @@ provides:
   assets:
     - id: isaaclab_cartpole.usd
       resource: assets/cartpole.usd
+    - id: static_cup.usda
+      resource: assets/static_cup.usda
+    - id: dynamic_cube.usda
+      resource: assets/dynamic_cube.usda
+    - id: jointless_cube.urdf
+      resource: assets/jointless_cube.urdf
+    - id: jointed_cube.urdf
+      resource: assets/jointed_cube.urdf

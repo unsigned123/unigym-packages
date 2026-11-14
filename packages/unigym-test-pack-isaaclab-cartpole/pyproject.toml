@@ -26,5 +26,9 @@ unigym_test_pack_isaaclab_cartpole = [
     "py.typed",
     "pack/*.yaml",
     "pack/*/*.usd",
+    "pack/*/*.usda",
+    "pack/*/*.urdf",
     "pack/*/*/*.usd",
+    "pack/*/*/*.usda",
+    "pack/*/*/*.urdf",
 ]
