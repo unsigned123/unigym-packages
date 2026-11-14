@@ -1,0 +1,5 @@
+schema: unigym.scene_preset/1
+name: tabletop
+objects:
+  types:
+    - name: table_plate

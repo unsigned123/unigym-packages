@@ -50,6 +50,7 @@ CONSUMER_TEST = '''\
 import pytest
 from unigym.pack_api import load_manifest_v1
 from unigym.robots import build_robot_profile
+from unigym.scene_presets import load_scene_preset
 
 pytestmark = pytest.mark.requires_test_packs("basic", "isaaclab_cartpole", "g1", "gr1")
 
@@ -61,7 +62,8 @@ def test_installed_wheels(pack_root, pack_runtime):
     runtime = pack_runtime("basic")
     assert runtime.catalog.packs() == ("basic",)
     assert runtime.resource_for("providers", "basic_arm").is_file()
-    assert runtime.resource_for("scenes", "basic.tabletop").is_file()
+    assert runtime.resource_for("scene_presets", "basic.tabletop").is_file()
+    assert load_scene_preset("basic.tabletop", runtime).name == "tabletop"
 
     cartpole_root = pack_root("isaaclab_cartpole")
     assert load_manifest_v1(cartpole_root).name == "isaaclab_cartpole"
@@ -126,7 +128,7 @@ def _check_wheel_contents(
     required = {
         "unigym_test_pack_basic/pack/unigym.pack.yaml",
         "unigym_test_pack_basic/pack/robots/basic_arm.yaml",
-        "unigym_test_pack_basic/pack/scenes/tabletop.yaml",
+        "unigym_test_pack_basic/pack/scene_presets/tabletop.yaml",
     }
     missing = sorted(required - names)
     if missing:

@@ -10,7 +10,8 @@ environment variables.
 ## M0-M3 + R2b
 
 - `unigym-test-packs`: marker, discovery, fixtures and strict mode.
-- `unigym-test-pack-basic`: first content pack (`providers` and `scenes` faces).
+- `unigym-test-pack-basic`: first content pack (`providers` and `scene_presets`
+  faces).
 - `unigym-test-pack-isaaclab-cartpole`: Cartpole USD asset pack (`assets` face).
 - `unigym-test-pack-g1`: complete 43-DoF G1 USD tree and data-only `g1` robot
   profile, shipped as one selective wheel.

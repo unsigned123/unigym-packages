@@ -67,4 +67,8 @@ Update `ci/core-pin.toml` only to a commit that exists in
 
 The pin includes R2b core external-only robot registration, so the G1/GR1
 robot-provider consumer lanes run against the same external-only registry
-semantics as core `main`.
+semantics as core `main`. It also includes the core `scene_presets` cutover:
+packs declare `provides.scene_presets` and the basic pack's
+`unigym.scene_preset/1` document resolves through `unigym.scene_presets`
+(`load_scene_preset`), with the legacy `scenes` face and `scene:` key removed
+rather than aliased.
