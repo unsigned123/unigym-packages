@@ -72,3 +72,10 @@ packs declare `provides.scene_presets` and the basic pack's
 `unigym.scene_preset/1` document resolves through `unigym.scene_presets`
 (`load_scene_preset`), with the legacy `scenes` face and `scene:` key removed
 rather than aliased.
+
+It additionally includes the pack-object and provenance surface:
+`unigym.packs.require` / `installed()` return a read-only `PackSet`, pack-scoped
+refs (`robot`, `asset`, `scene_preset`, `scene_provider`) are minted from
+manifests without importing pack Python, and the live registries expose origin
+queries (`robot_origin`, `adapter_origin`, `scene_provider_origin`, ...) backed
+by origin side tables. `unigym pack list --json` projects the same provenance.
