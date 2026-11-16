@@ -10,6 +10,7 @@ from unigym.runtime.actions import NamedAction
 
 from unigym_rl import (
     EpisodeEnd,
+    RingBuffer,
     TaskConfigError,
     TaskContractError,
     TaskEnv,
@@ -425,3 +426,189 @@ def test_close_calls_on_close_once_and_keeps_run_open() -> None:
     task.close()
     assert calls == ["close"]
     assert run.instance.env is run.env
+
+
+class StepQueuedTask(QueuedTask):
+    """Task recording every ``on_step`` call before the next observation."""
+
+    def __init__(self, run, **kwargs) -> None:
+        self.step_calls: list[tuple[torch.Tensor, TaskState]] = []
+        super().__init__(run, **kwargs)
+
+    def on_step(self, action, state):
+        self._log("task.on_step")
+        self.step_calls.append((action.clone(), state))
+
+
+class RecordingBuffer:
+    """Buffer double logging the ids it is asked to reset."""
+
+    def __init__(self, log: list[str]) -> None:
+        self.log = log
+        self.reset_calls: list[list[int] | None] = []
+
+    def reset(self, env_ids=None):
+        self.log.append("buffer.reset")
+        self.reset_calls.append(None if env_ids is None else env_ids.tolist())
+
+
+class BufferTask(MinimalTask):
+    """Task registering the buffer supplied by the test in ``on_bind``."""
+
+    def __init__(self, run, *, buffer, **kwargs) -> None:
+        self._buffer = buffer
+        super().__init__(run, **kwargs)
+
+    def on_bind(self, context):
+        self.register_buffer(self._buffer)
+
+
+class HistoryTask(QueuedTask):
+    """Task whose observation is the current action-history count and last row."""
+
+    obs_dim = 3
+
+    def on_bind(self, context):
+        self.actions = self.register_buffer(
+            RingBuffer(context.num_envs, capacity=4, shape=(2,), device=context.device)
+        )
+
+    def on_step(self, action, state):
+        self.actions.push(action)
+
+    def observe(self, state):
+        self._log("task.observe")
+        self.observed.append(state)
+        count = self.actions.count.to(torch.float32).unsqueeze(-1)
+        last = self.actions.latest(1)[:, 0]
+        return torch.cat([count, last], dim=-1)
+
+
+def test_on_step_runs_once_before_observe_with_pre_reset_state() -> None:
+    log: list[str] = []
+    run = FakeRun(num_envs=2, log=log)
+    task = StepQueuedTask(run, log=log)
+
+    task.reset()
+    assert task.step_calls == []
+    assert "task.on_step" not in log
+    log.clear()
+
+    flat = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    task.step(flat)
+
+    assert len(task.step_calls) == 1
+    action, state = task.step_calls[0]
+    assert torch.equal(action, flat)
+    assert state is task.observed[-1]
+    assert log == ["runner.step", "env.advance", "task.on_step", "task.observe", "task.reward"]
+
+
+def test_on_step_is_not_called_on_reset_and_precedes_post_reset_observe() -> None:
+    log: list[str] = []
+    run = FakeRun(num_envs=2, log=log)
+    task = StepQueuedTask(run, log=log)
+    task.term_masks = [_mask([True, False])]
+
+    task.reset()
+    assert task.step_calls == []
+    log.clear()
+    observed_before = len(task.observed)
+
+    task.step(torch.zeros(2, 2))
+
+    assert len(task.step_calls) == 1
+    _, state = task.step_calls[0]
+    assert state is task.observed[observed_before]
+    assert len(task.observed) == observed_before + 2
+    assert log == [
+        "runner.step",
+        "env.advance",
+        "task.on_step",
+        "task.observe",
+        "task.reward",
+        "task.on_episode_end",
+        "runner.reset",
+        "env.reset_envs",
+        "task.on_reset",
+        "task.observe",
+    ]
+
+
+def test_registered_buffer_resets_before_the_initial_observation() -> None:
+    log: list[str] = []
+    run = FakeRun(num_envs=2, log=log)
+    buffer = RecordingBuffer(log)
+    task = BufferTask(run, buffer=buffer, log=log)
+
+    task.reset()
+
+    assert buffer.reset_calls == [[0, 1]]
+    assert log == [
+        "runner.reset",
+        "env.reset_envs",
+        "buffer.reset",
+        "task.on_reset",
+        "task.observe",
+    ]
+
+
+def test_register_buffer_is_idempotent_and_requires_a_callable_reset() -> None:
+    run = FakeRun(num_envs=2)
+    task = MinimalTask(run)
+    log: list[str] = []
+    buffer = RecordingBuffer(log)
+
+    assert task.register_buffer(buffer) is buffer
+    assert task.register_buffer(buffer) is buffer
+    task.reset()
+    assert buffer.reset_calls == [[0, 1]]
+
+    with pytest.raises(TaskConfigError, match="reset"):
+        task.register_buffer(object())
+
+
+def test_done_only_buffer_reset_preserves_live_rows_and_post_reset_obs() -> None:
+    run = FakeRun(num_envs=2)
+    task = HistoryTask(run)
+    task.term_masks = [_mask([True, False])]
+
+    obs, _ = task.reset()
+    assert torch.equal(obs, torch.zeros(2, 3))
+    assert task.actions.count.tolist() == [0, 0]
+
+    observed_before = len(task.observed)
+    actions = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    obs, _, terminated, truncated, info = task.step(actions)
+
+    assert terminated.tolist() == [True, False]
+    assert truncated.tolist() == [False, False]
+    assert len(task.observed) == observed_before + 2
+
+    pre_state = task.observed[observed_before]
+    post_state = task.observed[observed_before + 1]
+    assert pre_state is not post_state
+    assert torch.equal(info["final_observation"], torch.tensor([[1.0, 1.0, 2.0]]))
+
+    assert torch.equal(obs[0], torch.zeros(3))
+    assert torch.equal(obs[1], torch.tensor([1.0, 3.0, 4.0]))
+    assert task.actions.count.tolist() == [0, 1]
+    assert torch.equal(task.actions.latest(1)[0, 0], torch.zeros(2))
+    assert torch.equal(task.actions.latest(1)[1, 0], torch.tensor([3.0, 4.0]))
+
+
+def test_registering_a_buffer_without_pushing_changes_nothing() -> None:
+    log: list[str] = []
+    run = FakeRun(num_envs=2, log=log)
+    buffer = RingBuffer(num_envs=2, capacity=3, shape=(2,))
+    task = BufferTask(run, buffer=buffer, log=log)
+
+    obs, _ = task.reset()
+    assert torch.equal(obs, run.env.obs_cache["proprio"])
+    log.clear()
+
+    task.step(torch.zeros(2, 2))
+
+    assert buffer.count.tolist() == [0, 0]
+    assert torch.equal(buffer.history(), torch.zeros(2, 3, 2))
+    assert log == ["runner.step", "env.advance", "task.observe", "task.reward"]

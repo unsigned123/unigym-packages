@@ -89,6 +89,69 @@ support. The skrl lane uses a manual `wrap_env` + `agent.act` /
 `record_transition` / `update` loop (skrl 2.1 ships `PPO_CFG`, not a
 `PPO_DEFAULT_CONFIG` dict) and is deterministic under `torch.manual_seed(0)`.
 
+## R2.5 status
+
+R2.5 adds construction and bookkeeping sugar only: no trainer and no new env
+type.
+
+### Programmatic `EnvSpec`
+
+`EnvSpec` builds a fresh, lazy core `Run` from plain fields instead of a yaml
+file. Termination ownership is fixed: every run declares
+`termination_mode="external"` and
+`runner={auto_reset: false, reset_on_termination: false}`, and `EnvSpec`
+exposes no way to override either.
+
+```python
+from unigym.world import World
+from unigym_rl import EnvSpec
+
+spec = EnvSpec(
+    world=World.base(mjcf="robot.xml"),
+    robot={"name": "my_robot", "actuation": [...]},
+    num_envs=4,
+    inspect=True,
+)
+
+task = spec.make_task(MyTask)       # fresh run + task; caller closes both
+# gym = spec.make_gym(MyTask)       # requires the gymnasium extra (lazy import)
+```
+
+`make_task` validates that its argument is a `TaskEnv` subclass.
+`make_gym` imports `GymTaskEnv` lazily, so importing `unigym_rl` or using
+`EnvSpec` never imports `gymnasium`. `make_run` returns a fresh `Run` on every
+call and never builds the backend.
+
+### Action history: `RingBuffer` + `on_step`
+
+`RingBuffer` stores a fixed-capacity chronological history per env. Each env
+has its own write pointer and count, so resetting one row never disturbs
+another; unwritten slots are zero-filled. It has no dependency on `TaskEnv`
+and never pushes implicitly.
+
+```python
+from unigym_rl import RingBuffer
+
+class MyTask(TaskEnv):
+    def on_bind(self, context):
+        self.actions = self.register_buffer(
+            RingBuffer(context.num_envs, capacity=16, shape=(context.action_spec.dim,))
+        )
+
+    def on_step(self, action, state):
+        self.actions.push(action)
+
+    def observe(self, state):
+        ...
+```
+
+`register_buffer` returns the buffer, is idempotent by identity, and only
+requires a callable `reset(env_ids=None)`. Registered buffers are reset before
+the post-reset observation is computed (all ids on `reset`, done ids on the
+`step` done path). `on_step` is called exactly once per `step`, after the
+runner advances and before `observe` computes the next observation; it is not
+called by `reset`. This round adds no automatic action push.
+
 ## Installing / testing
 
 R0 needs no install. Run the tests with the core checkout on `PYTHONPATH`
@@ -154,6 +217,8 @@ Full hook list:
 | Hook | Purpose | Default |
 | --- | --- | --- |
 | `on_bind(context)` | capture `context.env` / controls | no-op |
+| `register_buffer(buffer)` | register a history buffer; reset on env reset | empty |
+| `on_step(action, state)` | once per step, before `observe` | no-op |
 | `observe(state)` | flat observation | required |
 | `reward(transition)` | per-env reward | required |
 | `terminated(transition)` | terminal mask | all False |
@@ -191,8 +256,10 @@ post-reset; the Run is never stopped or closed by `TaskEnv`.
 
 ```text
 src/unigym_rl/
-  __init__.py       # TaskEnv exports + lazy GymTaskEnv
+  __init__.py       # TaskEnv / EnvSpec / RingBuffer exports + lazy GymTaskEnv
   context.py        # TaskContext / TaskState / Transition / EpisodeEnd
+  spec.py           # programmatic external-termination Run builder (R2.5)
+  buffers.py        # per-env RingBuffer history (R2.5)
   task.py           # TaskEnv + reset/step driver
   gym.py            # optional Gymnasium VectorEnv wrapper (lazy)
   errors.py
@@ -207,4 +274,6 @@ tests/
   test_task_env_mujoco.py   # real MuJoCo manual rollout (R1)
   test_gym_task_env.py      # Gymnasium VectorEnv face (R2)
   test_skrl_smoke.py        # short skrl PPO smoke (R2)
+  test_spec.py              # programmatic EnvSpec (R2.5)
+  test_buffers.py           # RingBuffer history (R2.5)
 ```

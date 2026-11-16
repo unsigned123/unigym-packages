@@ -1,7 +1,9 @@
 """``unigym-rl``: the L2 task-environment layer over ``unigym`` core.
 
-:class:`TaskEnv` is the base task contract; the optional Gymnasium vector face
-is :class:`unigym_rl.gym.GymTaskEnv`.  The package deliberately does not import
+:class:`TaskEnv` is the base task contract; :class:`EnvSpec` builds a
+task-owned ``Run`` programmatically and :class:`RingBuffer` stores per-env
+history.  The optional Gymnasium vector face is
+:class:`unigym_rl.gym.GymTaskEnv`.  The package deliberately does not import
 ``gymnasium`` at import time: the Gym wrapper is exported lazily, so a base
 ``TaskEnv`` user needs no RL framework installed::
 
@@ -16,13 +18,17 @@ is :class:`unigym_rl.gym.GymTaskEnv`.  The package deliberately does not import
 
 from __future__ import annotations
 
+from unigym_rl.buffers import RingBuffer
 from unigym_rl.context import EpisodeEnd, TaskContext, TaskState, Transition
 from unigym_rl.errors import TaskConfigError, TaskContractError, TaskEnvError
+from unigym_rl.spec import EnvSpec
 from unigym_rl.task import TaskEnv
 
 __all__ = [
+    "EnvSpec",
     "EpisodeEnd",
     "GymTaskEnv",
+    "RingBuffer",
     "TaskConfigError",
     "TaskContext",
     "TaskContractError",

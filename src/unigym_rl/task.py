@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 import torch
 from unigym.runner.state import read_extra
@@ -33,6 +33,12 @@ if TYPE_CHECKING:
     from unigym.runtime.actions import OrderedActionSpec
 
 __all__ = ["TaskEnv"]
+
+
+class Buffer(Protocol):
+    """The only surface ``TaskEnv.register_buffer`` requires."""
+
+    def reset(self, env_ids: torch.Tensor | None = None) -> None: ...
 
 
 def _resolve_control_dt(spec: object, instance: object) -> float:
@@ -149,6 +155,7 @@ class TaskEnv:
         self._last_obs: torch.Tensor | None = None
         self._closed = False
         self._started = False
+        self._buffers: list[Buffer] = []
         self.on_bind(self.context)
 
     # ------------------------------------------------------------------ #
@@ -170,6 +177,7 @@ class TaskEnv:
         result = self.runner.reset(None)
         all_ids = torch.arange(self.num_envs, dtype=torch.int64, device=self.device)
         state = self._snapshot(t=int(result.t))
+        self._reset_buffers(all_ids)
         self.on_reset(all_ids, state)
         obs = self._validate_obs(self.observe(state))
         self._last_obs = obs
@@ -191,6 +199,7 @@ class TaskEnv:
         self._validate_core_termination(result)
 
         pre = self._snapshot(t=int(result.t), extra=result.extra)
+        self.on_step(flat, pre)
         next_obs = self._validate_obs(self.observe(pre))
         zeros = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         transition = Transition(
@@ -239,6 +248,7 @@ class TaskEnv:
             self.on_episode_end(done_ids, pre, transition)
             self.runner.reset(done_ids)
             post = self._snapshot(t=int(result.t) + 1)
+            self._reset_buffers(done_ids)
             self.on_reset(done_ids, post)
             obs = self._validate_obs(self.observe(post))
         else:
@@ -267,6 +277,22 @@ class TaskEnv:
     # ------------------------------------------------------------------ #
     def on_bind(self, context: TaskContext) -> None:
         """Called once after the run is bound; default no-op."""
+
+    def register_buffer(self, buffer: Buffer) -> Buffer:
+        """Register a history buffer reset on every env reset; return it.
+
+        Idempotent by object identity; the buffer only needs a callable
+        ``reset(env_ids=None)``.  Nothing is pushed automatically.
+        """
+        if not callable(getattr(buffer, "reset", None)):
+            raise TaskConfigError(
+                "register_buffer expects an object with a callable reset(env_ids=None), "
+                f"got {type(buffer).__name__}"
+            )
+        if any(existing is buffer for existing in self._buffers):
+            return buffer
+        self._buffers.append(buffer)
+        return buffer
 
     def observe(self, state: TaskState) -> torch.Tensor:
         """Return the flat ``(num_envs, obs_dim)`` observation for *state*."""
@@ -300,6 +326,10 @@ class TaskEnv:
         del transition, terminated, truncated
         return None
 
+    def on_step(self, action: torch.Tensor, state: TaskState) -> None:
+        """Called once per step before ``observe``; default no-op."""
+        del action, state
+
     def on_reset(self, env_ids: torch.Tensor, state: TaskState) -> None:
         """Called after every reset (all ids, then done ids); default no-op."""
 
@@ -330,6 +360,10 @@ class TaskEnv:
     def _ensure_open(self) -> None:
         if self._closed:
             raise TaskEnvError(f"{type(self).__name__} is closed")
+
+    def _reset_buffers(self, env_ids: torch.Tensor) -> None:
+        for buffer in self._buffers:
+            buffer.reset(env_ids)
 
     def _snapshot(
         self,
