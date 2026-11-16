@@ -260,5 +260,5 @@ body_bindings:
   right_hand.thumb_2:
     mjcf: right_hand_thumb_2_link
     usd: right_hand/right_hand_thumb_2_link
-action_faces: {}
+extra_action_sets: {}
 full_joint_order: null
