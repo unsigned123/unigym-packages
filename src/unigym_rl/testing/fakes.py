@@ -72,12 +72,15 @@ class FakeEnv:
 
     # backend-neutral state face
     def _extra(self) -> dict[str, object]:
+        due = self.due_ids()
         return {
             "step": self.episode_steps.clone(),
             "episode": self.episodes.clone(),
             "clock": torch.full(
                 (self.num_envs,), float(self.t), dtype=torch.float32, device=self.device
             ),
+            "reset_env_ids": due,
+            "should_reset": bool(due.numel()),
         }
 
     # runner-facing operations
@@ -134,13 +137,15 @@ class FakeRunner:
         if self.log is not None:
             self.log.append("runner.step")
         self.calls.append(("step", actions))
+        t = int(self._ticks)
         self.env.advance(actions)
         self._ticks += 1
+        extra = self.env._extra()
         return StepResult(
-            t=self._ticks,
+            t=t,
             obs={},
-            extra=self.env._extra(),
-            reset_env_ids=self.env.due_ids(),
+            extra=extra,
+            reset_env_ids=extra["reset_env_ids"],
             terminated=torch.zeros(self.env.num_envs, dtype=torch.bool, device=self.env.device),
         )
 

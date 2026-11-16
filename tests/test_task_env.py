@@ -320,6 +320,33 @@ def test_runner_auto_reset_must_be_caller_owned() -> None:
         MinimalTask(run)
 
 
+def test_runner_reset_on_termination_must_be_caller_owned() -> None:
+    run = FakeRun(num_envs=1, reset_on_termination=True)
+    with pytest.raises(TaskConfigError, match="reset_on_termination"):
+        MinimalTask(run)
+
+
+def test_step_state_t_and_extra_keys_match_core_semantics() -> None:
+    run = FakeRun(num_envs=2, obs_dim=3)
+    task = MinimalTask(run)
+    task.reset()
+    assert task.observed[-1].t == 0
+
+    _, _, _, _, info = task.step(torch.zeros(2, 2))
+    state = info["state"]
+    assert state.t == 0
+    assert {"step", "episode", "clock", "reset_env_ids", "should_reset"} <= set(state.extra)
+    assert state.extra["step"].shape == (2,)
+    assert state.extra["episode"].shape == (2,)
+    assert state.extra["clock"].shape == (2,)
+    assert state.extra["reset_env_ids"].dtype is torch.int64
+    assert state.extra["reset_env_ids"].shape == (0,)
+    assert state.extra["should_reset"] is False
+
+    _, _, _, _, info = task.step(torch.zeros(2, 2))
+    assert info["state"].t == 1
+
+
 def test_missing_observe_raises() -> None:
     run = FakeRun(num_envs=1)
     task = RewardOnly(run)

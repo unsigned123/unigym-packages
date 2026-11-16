@@ -56,6 +56,47 @@ def test_fake_env_due_clock_and_reset_calls() -> None:
     assert env.episode_steps.tolist() == [0, 0]
 
 
+def test_fake_runner_step_t_is_pre_increment() -> None:
+    env = FakeEnv(num_envs=2)
+    runner = FakeRunner(env)
+    actions = make_fake_action_spec().unflatten(torch.zeros(2, 2))
+
+    first = runner.step(actions)
+    second = runner.step(actions)
+
+    assert first.t == 0
+    assert second.t == 1
+    assert runner.ticks_done == 2
+
+
+def test_step_extra_carries_reset_control_keys() -> None:
+    run = FakeRun(num_envs=2, obs_dim=3, due_every=0)
+    task = EchoTask(run)
+    task.reset()
+
+    _, _, _, _, info = task.step(torch.zeros(2, 2))
+    extra = info["state"].extra
+
+    assert "reset_env_ids" in extra
+    assert "should_reset" in extra
+    assert extra["reset_env_ids"].dtype is torch.int64
+    assert extra["reset_env_ids"].shape == (0,)
+    assert extra["should_reset"] is False
+
+
+def test_due_step_extra_reports_typed_due_ids() -> None:
+    run = FakeRun(num_envs=2, obs_dim=3, due_every=1)
+    task = EchoTask(run)
+    task.reset()
+
+    _, _, _, _, info = task.step(torch.zeros(2, 2))
+    extra = info["episode_end"].state.extra
+
+    assert extra["reset_env_ids"].dtype is torch.int64
+    assert extra["reset_env_ids"].tolist() == [0, 1]
+    assert extra["should_reset"] is True
+
+
 def test_fake_runner_reset_none_resets_all() -> None:
     env = FakeEnv(num_envs=3)
     runner = FakeRunner(env)
