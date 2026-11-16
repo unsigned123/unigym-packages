@@ -3,9 +3,9 @@
   tiny_arm.xml - self-authored, MIT-clean MuJoCo test fixture.
 
   A two-hinge arm on a free base, built from MuJoCo primitives only: no
-  mesh, texture, heightfield, include, or network reference.  The model is
-  original to this repository and MIT-licensed (see tests/_support/data/
-  README.md for provenance and the intended consumers).
+  mesh, texture, heightfield, include, or network reference.  This fixture is
+  copied byte-for-byte from the MIT-licensed unigym-core repository
+  (`tests/_support/data/tiny_arm.xml`); see this directory's README.md.
 
   `compiler angle="radian"` is explicit: MuJoCo defaults to degrees, and the
   joint/limit tests assert the radian values declared below.
