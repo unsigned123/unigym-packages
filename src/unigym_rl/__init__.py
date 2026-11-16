@@ -1,13 +1,17 @@
 """``unigym-rl``: the L2 task-environment layer over ``unigym`` core.
 
-R0 exposes the task contract only -- no training loop, no RL framework
-integration, no terrain and no real backend.  Build a :class:`TaskEnv`
-subclass on top of an externally-terminated core run::
+:class:`TaskEnv` is the base task contract; the optional Gymnasium vector face
+is :class:`unigym_rl.gym.GymTaskEnv`.  The package deliberately does not import
+``gymnasium`` at import time: the Gym wrapper is exported lazily, so a base
+``TaskEnv`` user needs no RL framework installed::
 
     run = Run(..., termination_mode="external")
     env = MyTask(run)
     obs, info = env.reset()
     obs, reward, terminated, truncated, info = env.step(actions)
+
+    # optional, requires the ``gymnasium`` extra
+    from unigym_rl import GymTaskEnv
 """
 
 from __future__ import annotations
@@ -18,6 +22,7 @@ from unigym_rl.task import TaskEnv
 
 __all__ = [
     "EpisodeEnd",
+    "GymTaskEnv",
     "TaskConfigError",
     "TaskContext",
     "TaskContractError",
@@ -28,3 +33,17 @@ __all__ = [
 ]
 
 __version__ = "0.0.0"
+
+_LAZY_EXPORTS = {"GymTaskEnv": "unigym_rl.gym"}
+
+
+def __getattr__(name: str) -> object:
+    """Resolve optional exports without importing their dependencies eagerly."""
+    module_name = _LAZY_EXPORTS.get(name)
+    if module_name is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    from importlib import import_module
+
+    value = getattr(import_module(module_name), name)
+    globals()[name] = value
+    return value

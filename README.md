@@ -25,8 +25,8 @@ R0 is the package skeleton plus the fake-env `TaskEnv` contract only:
 
 Not implemented in R0: a real backend, skrl/rsl-rl integration, a training
 loop, reward normalization, terrain, multi-agent coordination, or Gymnasium
-subclassing. Optional future extras (`gymnasium`, `skrl`, `rsl-rl`) are
-planned but intentionally **not** declared as dependencies yet.
+subclassing. Optional extras (`gymnasium`, `skrl`, `rsl-rl`) are declared in
+`pyproject.toml` (rsl-rl remains planned, not implemented).
 
 ## R1 status
 
@@ -54,6 +54,40 @@ R1 adds **no** trainer, no Gymnasium/skrl/rsl-rl dependency, no terrain, no
 multi-agent support, and no core changes. The Run is built from the
 programmatic config shape rather than a yaml file; see
 `tests/test_task_env_mujoco.py`.
+
+## R2 status
+
+R2 adds the optional Gymnasium `VectorEnv` face and a short skrl PPO smoke,
+still with no trainer in the package:
+
+- `unigym_rl.gym.GymTaskEnv` subclasses `gymnasium.vector.VectorEnv` and wraps
+  one `TaskEnv`;
+- `num_envs`, `device`, `single_observation_space` / `observation_space`
+  `(num_envs, obs_dim)` and `single_action_space` / `action_space`
+  `(num_envs, action_dim)` `Box` spaces;
+- `metadata["autoreset_mode"] = AutoresetMode.SAME_STEP` (the task already
+  returns post-reset observations for done rows);
+- `reset(seed, options)` and `step(actions)` accept NumPy or torch batches and
+  return NumPy obs/reward/terminated/truncated; the task `info` dictionary is
+  passed through intact (`final_observation`, `final_info`, `episode_end`,
+  `termination_reasons`, `state`);
+- `close()` delegates to `TaskEnv`; `render()` raises an honest
+  `NotImplementedError`;
+- `GymTaskEnv` is exported lazily from `unigym_rl` and from `unigym_rl.gym`, so
+  importing the package never imports `gymnasium`.
+
+The optional dependencies are declared as extras (the base install stays free
+of RL frameworks):
+
+```bash
+pip install 'unigym-rl[gymnasium]'   # gymnasium>=1.0,<2
+pip install 'unigym-rl[skrl]'        # skrl>=2.1,<3
+```
+
+R2 adds **no** trainer, no `train.py`, no rsl-rl, no terrain and no multi-agent
+support. The skrl lane uses a manual `wrap_env` + `agent.act` /
+`record_transition` / `update` loop (skrl 2.1 ships `PPO_CFG`, not a
+`PPO_DEFAULT_CONFIG` dict) and is deterministic under `torch.manual_seed(0)`.
 
 ## Installing / testing
 
@@ -157,9 +191,10 @@ post-reset; the Run is never stopped or closed by `TaskEnv`.
 
 ```text
 src/unigym_rl/
-  __init__.py
+  __init__.py       # TaskEnv exports + lazy GymTaskEnv
   context.py        # TaskContext / TaskState / Transition / EpisodeEnd
   task.py           # TaskEnv + reset/step driver
+  gym.py            # optional Gymnasium VectorEnv wrapper (lazy)
   errors.py
   testing/
     __init__.py
@@ -170,4 +205,6 @@ tests/
   test_task_env.py
   test_task_env_fake.py
   test_task_env_mujoco.py   # real MuJoCo manual rollout (R1)
+  test_gym_task_env.py      # Gymnasium VectorEnv face (R2)
+  test_skrl_smoke.py        # short skrl PPO smoke (R2)
 ```

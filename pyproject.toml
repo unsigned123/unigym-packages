@@ -14,6 +14,10 @@ dependencies = [
     "numpy",
 ]
 
+[project.optional-dependencies]
+gymnasium = ["gymnasium>=1.0,<2"]
+skrl = ["skrl>=2.1,<3"]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 

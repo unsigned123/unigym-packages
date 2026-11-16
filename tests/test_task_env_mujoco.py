@@ -87,6 +87,8 @@ class TinyArmTask(TaskEnv):
     a per-env tick limit.
     """
 
+    obs_dim = OBS_DIM
+
     def __init__(
         self,
         run: Run,
