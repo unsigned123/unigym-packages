@@ -28,6 +28,33 @@ loop, reward normalization, terrain, multi-agent coordination, or Gymnasium
 subclassing. Optional future extras (`gymnasium`, `skrl`, `rsl-rl`) are
 planned but intentionally **not** declared as dependencies yet.
 
+## R1 status
+
+R1 proves the same `TaskEnv` contract on one **real MuJoCo robot** with a
+manual rollout and no RL framework:
+
+- a self-contained, MIT-clean two-hinge MJCF fixture at
+  `tests/fixtures/tiny_arm.xml` (copied from core; no core test path is
+  imported);
+- a test-only robot profile registered through `unigym.robots.register_robot`
+  (`tiny`, `body = shoulder, elbow`, base body `base`) and restored after
+  each test;
+- a real `Run` with `backend="mujoco"`, `adapter="manual"`,
+  `num_envs=1` and `2`, `termination_mode="external"`, and
+  `runner={auto_reset: false, reset_on_termination: false}`;
+- a `TaskEnv` subclass whose observation is the flattened
+  `articulation/tiny/{joint_pos,joint_vel}` state, with deterministic reward
+  and task-owned `terminated` / `truncated` / named reason masks;
+- manual `env.reset()` / `env.step(actions)` rollouts asserting done-only
+  `runner.reset`, `on_episode_end` before reset, pre-reset
+  `final_observation`, post-reset returned observation, and an empty
+  all-False core termination group.
+
+R1 adds **no** trainer, no Gymnasium/skrl/rsl-rl dependency, no terrain, no
+multi-agent support, and no core changes. The Run is built from the
+programmatic config shape rather than a yaml file; see
+`tests/test_task_env_mujoco.py`.
+
 ## Installing / testing
 
 R0 needs no install. Run the tests with the core checkout on `PYTHONPATH`
@@ -138,6 +165,9 @@ src/unigym_rl/
     __init__.py
     fakes.py        # fake run/runner/env (tests only)
 tests/
+  fixtures/
+    tiny_arm.xml     # self-contained MIT-clean MuJoCo fixture (R1)
   test_task_env.py
   test_task_env_fake.py
+  test_task_env_mujoco.py   # real MuJoCo manual rollout (R1)
 ```
