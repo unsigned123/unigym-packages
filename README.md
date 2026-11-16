@@ -152,6 +152,45 @@ the post-reset observation is computed (all ids on `reset`, done ids on the
 runner advances and before `observe` computes the next observation; it is not
 called by `reset`. This round adds no automatic action push.
 
+## CLI options sugar
+
+R2.6 adds an optional `unigym_rl.cli` parser for a small set of run knobs.
+It is sugar only: no trainer, no config-file format, and no new env type.
+`import unigym_rl` does not import `unigym_rl.cli`; import it explicitly.
+
+```python
+from unigym_rl.cli import parse_args
+
+opts = parse_args()  # or parse_args(["--num-envs", "4"])
+spec = EnvSpec(
+    world=world,
+    robot=robot,
+    num_envs=opts.env.num_envs,
+    device=opts.env.device,
+    seed=opts.env.seed,
+)
+task = spec.make_task(MyTask, max_steps=opts.env.max_episode_steps)
+# a future trainer would read opts.train.max_iterations / rollout_steps
+```
+
+```bash
+python train.py --num-envs 8 --max-episode-steps 500 --device cpu \
+  --seed 0 --max-iterations 1000 --rollout-steps 64
+```
+
+Hyphenated flags are canonical; underscore aliases (`--num_envs`,
+`--max_episode_steps`, `--max_iterations`, `--rollout_steps`) behave
+identically. Defaults: `num_envs=8`, `max_episode_steps=500`, `device="cpu"`,
+`seed=0`, `max_iterations=1000`, `rollout_steps=64`. Positive-int fields reject
+values below 1 both on the CLI and in direct dataclass construction; an empty
+`device` is rejected.
+
+Parameter ownership: `num_envs` / `device` / `seed` go to `EnvSpec`;
+`max_episode_steps` is the task truncation budget; `max_iterations` /
+`rollout_steps` are reserved for a future trainer. The parser never constructs
+an `EnvSpec`, `World`, robot, task, or trainer, and no CLI value is propagated
+to `TaskEnv.reset`.
+
 ## Installing / testing
 
 R0 needs no install. Run the tests with the core checkout on `PYTHONPATH`
@@ -260,6 +299,7 @@ src/unigym_rl/
   context.py        # TaskContext / TaskState / Transition / EpisodeEnd
   spec.py           # programmatic external-termination Run builder (R2.5)
   buffers.py        # per-env RingBuffer history (R2.5)
+  cli.py            # optional argparse option dataclasses (R2.6)
   task.py           # TaskEnv + reset/step driver
   gym.py            # optional Gymnasium VectorEnv wrapper (lazy)
   errors.py
@@ -276,4 +316,5 @@ tests/
   test_skrl_smoke.py        # short skrl PPO smoke (R2)
   test_spec.py              # programmatic EnvSpec (R2.5)
   test_buffers.py           # RingBuffer history (R2.5)
+  test_cli.py               # optional CLI option sugar (R2.6)
 ```
