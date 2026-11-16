@@ -191,6 +191,14 @@ Parameter ownership: `num_envs` / `device` / `seed` go to `EnvSpec`;
 an `EnvSpec`, `World`, robot, task, or trainer, and no CLI value is propagated
 to `TaskEnv.reset`.
 
+## Examples
+
+- `examples/cartpole/` — a runnable fixed-base MuJoCo CartPole demo: a
+  programmatic `EnvSpec`, a local demo `RobotProfile`, one slider action column
+  with a passive observed pole, optional randomized resets via
+  `set_joint_state` + `settle`, and a manual skrl PPO loop. It is repo-only and
+  is not installed into the wheel; see `examples/cartpole/README.md`.
+
 ## Installing / testing
 
 R0 needs no install. Run the tests with the core checkout on `PYTHONPATH`
@@ -205,9 +213,9 @@ Static checks:
 
 ```bash
 PYTHONPATH=/data1/code/dlx/unigym-core:/data1/code/dlx/unigym-rl/src \
-  /data1/code/dlx/unigym-core/.venv/bin/python -m ruff check src tests
+  /data1/code/dlx/unigym-core/.venv/bin/python -m ruff check src tests examples
 PYTHONPATH=/data1/code/dlx/unigym-core:/data1/code/dlx/unigym-rl/src \
-  /data1/code/dlx/unigym-core/.venv/bin/python -m ruff format --check src tests
+  /data1/code/dlx/unigym-core/.venv/bin/python -m ruff format --check src tests examples
 ```
 
 ## External termination mode
