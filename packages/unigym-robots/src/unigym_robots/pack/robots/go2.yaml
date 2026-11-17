@@ -34,27 +34,27 @@ assets:
 base_body: base
 base_height: 0.3
 foot_bodies:
-- FL_foot
-- FR_foot
-- RL_foot
-- RR_foot
+- FL_calf
+- FR_calf
+- RL_calf
+- RR_calf
 body_sets: {}
 body_bindings:
   base:
     mjcf: base
     usd: base
-  FL_foot:
-    mjcf: FL_foot
-    usd: FL_foot
-  FR_foot:
-    mjcf: FR_foot
-    usd: FR_foot
-  RL_foot:
-    mjcf: RL_foot
-    usd: RL_foot
-  RR_foot:
-    mjcf: RR_foot
-    usd: RR_foot
+  FL_calf:
+    mjcf: FL_calf
+    usd: FL_calf
+  FR_calf:
+    mjcf: FR_calf
+    usd: FR_calf
+  RL_calf:
+    mjcf: RL_calf
+    usd: RL_calf
+  RR_calf:
+    mjcf: RR_calf
+    usd: RR_calf
 extra_action_sets: {}
 actuation:
 - name: legs
