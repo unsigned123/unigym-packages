@@ -9,6 +9,11 @@ from unigym_robots import pack_root
 
 PACK = pack_root()
 ROBOT_IDS = ("go1", "go2", "g1")
+EXPECTED_ASSET_BACKENDS = {
+    "go1": {"mjcf": ("mujoco", "mjwarp")},
+    "go2": {"mjcf": ("mujoco", "mjwarp"), "usd": ("isaaclab2",)},
+    "g1": {"mjcf": ("mujoco", "mjwarp"), "usd": ("isaaclab2",)},
+}
 
 
 def test_pack_root_carries_the_manifest_and_robot_profiles() -> None:
@@ -45,6 +50,16 @@ def test_profiles_carry_assets_and_actuation() -> None:
         assert all(item.get("law") for item in actuation)
 
 
+def test_profiles_declare_asset_backends_per_format() -> None:
+    """Each shipped profile gates its declared formats to the right backends."""
+    for robot_id, expected in EXPECTED_ASSET_BACKENDS.items():
+        document = yaml.safe_load(
+            (PACK / "robots" / f"{robot_id}.yaml").read_text(encoding="utf-8")
+        )
+        declared = document.get("asset_backends") or {}
+        assert {fmt: tuple(names) for fmt, names in declared.items()} == expected
+
+
 def test_no_robot_binaries_are_shipped() -> None:
     package_root = PACK.parent
     suffixes = {".xml", ".usd", ".usda", ".stl", ".obj", ".dae", ".png", ".jpg", ".tar", ".gz"}
@@ -70,6 +85,10 @@ def test_pack_robot_returns_a_complete_profile() -> None:
         assert profile.name == robot_id
         assert profile.assets is not None
         assert profile.assets.mjcf == f"release:{robot_id}-mjcf"
+        assert {
+            asset_format: tuple(backends)
+            for asset_format, backends in profile.asset_backends.items()
+        } == EXPECTED_ASSET_BACKENDS[robot_id]
         assert profile.actuation
         assert pack_set.robot(robot_id) == profile
         assert robot_id not in ROBOT_REGISTRY

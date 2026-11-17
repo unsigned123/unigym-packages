@@ -31,6 +31,12 @@ default_joint_pos:
 assets:
   mjcf: release:go2-mjcf
   usd: release:go2-usd
+asset_backends:
+  mjcf:
+  - mujoco
+  - mjwarp
+  usd:
+  - isaaclab2
 base_body: base
 base_height: 0.3
 foot_bodies:

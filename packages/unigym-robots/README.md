@@ -67,13 +67,15 @@ import unigym.packs
 packs = unigym.packs.require("unigym_robots", entry_points=True)
 go2 = packs.pack("unigym_robots").robot("go2")   # RobotProfile
 go2.assets.mjcf                                  # "release:go2-mjcf"
+go2.asset_backends                               # {"mjcf": ("mujoco", "mjwarp"), "usd": ("isaaclab2",)}
 go2.actuation[0].joint_set                       # "body"
 ```
 
 `pack.robot(id)` loads the complete profile from `pack/robots/<id>.yaml`
 without activating the pack or mutating the robot registry. Profiles carry
 joint sets, the standby pose, `release:` asset references (never local
-binaries), body bindings and actuation groups. Building a world remains
+binaries), per-format `asset_backends` allow-lists, body bindings and
+actuation groups. Building a world remains
 explicit: these profiles do not construct one. Without an installed entry
 point, discover the shipped root with
 `unigym.packs.discover_set([unigym_robots.pack_root()])`.

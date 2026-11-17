@@ -264,6 +264,12 @@ extra_action_sets: {}
 assets:
   mjcf: release:g1-mjcf
   usd: release:g1-29dof-usd
+asset_backends:
+  mjcf:
+  - mujoco
+  - mjwarp
+  usd:
+  - isaaclab2
 actuation:
 - name: body
   law: standard_pd
