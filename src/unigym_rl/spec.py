@@ -16,7 +16,9 @@ from typing import TYPE_CHECKING
 from unigym_rl.errors import TaskConfigError
 
 if TYPE_CHECKING:
+    from unigym.robots.base import RobotProfile
     from unigym.run.api import Run
+    from unigym.runtime.actions import OrderedActionSpec, PolicyBinding
     from unigym.world import World
 
     from unigym_rl.gym import GymTaskEnv
@@ -29,13 +31,19 @@ __all__ = ["EnvSpec"]
 class EnvSpec:
     """Declarative input for an externally-terminated RL ``Run``.
 
-    ``world`` and ``robot`` use the core programmatic declaration shape; this
-    class is not a robot-profile builder.  ``make_run`` returns a fresh, lazy
-    ``Run`` on every call, and the caller owns its lifecycle.
+    ``world``, ``robot``, ``action_spec`` and ``policies`` are explicit: a
+    complete core :class:`~unigym.robots.base.RobotProfile`, an
+    :class:`~unigym.runtime.actions.OrderedActionSpec` and a non-empty tuple of
+    :class:`~unigym.runtime.actions.PolicyBinding`.  This class never builds a
+    World and never infers the action layout from the ``body`` joint set.
+    ``make_run`` returns a fresh, lazy ``Run`` on every call, and the caller
+    owns its lifecycle.
     """
 
     world: World
-    robot: Mapping[str, object] | str
+    robot: RobotProfile
+    action_spec: OrderedActionSpec
+    policies: tuple[PolicyBinding, ...]
     num_envs: int = 1
     device: str | None = None
     backend: str = "mujoco"
@@ -47,6 +55,28 @@ class EnvSpec:
     inspect: bool = False
 
     def __post_init__(self) -> None:
+        from unigym.robots.base import RobotProfile
+        from unigym.runtime.actions import OrderedActionSpec, PolicyBinding
+
+        if not isinstance(self.robot, RobotProfile):
+            raise TaskConfigError(
+                f"EnvSpec: robot must be a complete RobotProfile, got "
+                f"{type(self.robot).__name__}"
+            )
+        if not isinstance(self.action_spec, OrderedActionSpec):
+            raise TaskConfigError(
+                f"EnvSpec: action_spec must be an OrderedActionSpec, got "
+                f"{type(self.action_spec).__name__} | hint: declare the action "
+                f"groups explicitly; they are never inferred from the body set"
+            )
+        if not isinstance(self.policies, tuple) or not self.policies:
+            raise TaskConfigError("EnvSpec: policies must be a non-empty tuple of PolicyBinding")
+        for index, binding in enumerate(self.policies):
+            if not isinstance(binding, PolicyBinding):
+                raise TaskConfigError(
+                    f"EnvSpec: policies[{index}] must be a PolicyBinding, got "
+                    f"{type(binding).__name__}"
+                )
         if isinstance(self.num_envs, bool) or not isinstance(self.num_envs, int):
             raise TaskConfigError(
                 f"EnvSpec: num_envs must be an int, got {type(self.num_envs).__name__}"
@@ -61,6 +91,8 @@ class EnvSpec:
         return Run(
             world=self.world,
             robot=self.robot,
+            action_spec=self.action_spec,
+            policies=self.policies,
             backend=self.backend,
             num_envs=self.num_envs,
             device=self.device,

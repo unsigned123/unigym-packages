@@ -14,20 +14,25 @@ from pathlib import Path
 import pytest
 import torch
 from unigym.robots import ROBOT_REGISTRY
+from unigym.robots.base import RobotProfile
+from unigym.runtime.actions import OrderedActionSpec, PolicyBinding
 
 _EXAMPLE_DIR = Path(__file__).resolve().parents[1] / "examples" / "cartpole"
 if str(_EXAMPLE_DIR) not in sys.path:
     sys.path.insert(0, str(_EXAMPLE_DIR))
 
 from task import (  # noqa: E402
+    CARTPOLE_ACTION_SPEC,
+    CARTPOLE_ACTUATION,
     CARTPOLE_ARTICULATION,
     CARTPOLE_JOINTS,
+    CARTPOLE_POLICIES,
     CARTPOLE_PROFILE,
     CARTPOLE_XML,
     CartPoleTask,
+    make_cartpole_profile,
     make_cartpole_spec,
     make_cartpole_task,
-    register_cartpole_robot,
 )
 
 
@@ -50,11 +55,18 @@ def _close(env: CartPoleTask) -> None:
 def test_profile_spec_and_one_action_column() -> None:
     """The demo profile builds an external-termination one-action task."""
     assert CARTPOLE_XML.is_file()
-    register_cartpole_robot()
-    register_cartpole_robot()
-    assert CARTPOLE_PROFILE in ROBOT_REGISTRY
+    profile = make_cartpole_profile()
+    assert isinstance(profile, RobotProfile)
+    assert profile.name == CARTPOLE_PROFILE
+    assert profile.actuation == CARTPOLE_ACTUATION
+    assert isinstance(CARTPOLE_ACTION_SPEC, OrderedActionSpec)
+    assert all(isinstance(binding, PolicyBinding) for binding in CARTPOLE_POLICIES)
+    assert CARTPOLE_PROFILE not in ROBOT_REGISTRY
 
     spec = make_cartpole_spec(num_envs=2)
+    assert spec.robot.name == CARTPOLE_PROFILE
+    assert spec.action_spec is CARTPOLE_ACTION_SPEC
+    assert spec.policies == CARTPOLE_POLICIES
     run = spec.make_run()
     try:
         assert run.built is False

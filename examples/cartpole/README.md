@@ -6,7 +6,8 @@ adds no package API.
 
 What it proves:
 
-- a demo `RobotProfile` registered programmatically for a self-contained MJCF;
+- a demo `RobotProfile` (with explicit actuation) for a self-contained MJCF;
+- explicit `OrderedActionSpec` / `PolicyBinding` constants;
 - an `EnvSpec` over `World.base(mjcf=...)` with task-owned termination;
 - a fixed-base articulation with exactly one action column (`slider`);
 - a passive, observed pole joint (`hinge_1`);
@@ -25,6 +26,11 @@ What it proves:
 | Terminated | `abs(cart_x) > cart_limit` (1.5 m) or `abs(pole_theta) > pole_limit` (12 deg) |
 | Truncated | env-local step counter reaches `max_steps` |
 | Reasons | `cart_limit`, `pole_limit`, `time_limit` |
+
+`make_cartpole_spec()` passes an explicit `RobotProfile`, an explicit
+`OrderedActionSpec` and explicit `PolicyBinding` policies to `EnvSpec`; the
+action layout is never inferred from the `body` joint set. `EnvSpec` also
+requires an explicit `World`; it never constructs one.
 
 The policy-order `articulation/cartpole/joint_pos` slice only covers the
 actuated `body` joint set, so it contains the cart but not the passive pole.

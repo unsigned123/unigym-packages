@@ -1,9 +1,11 @@
 """Fixed-base MuJoCo CartPole demo over the ``unigym_rl`` task layer.
 
-The demo registers one local :class:`~unigym.robots.base.RobotProfile` for the
+The demo builds one local :class:`~unigym.robots.base.RobotProfile` for the
 self-contained MuJoCo Playground ``cartpole.xml`` asset.  The cart slider is the
 only action column (a ``standard_pd`` position target); the pole hinge is
-passive and observed.  Observations are read from the live core model by joint
+passive and observed.  The action layout and policy binding are explicit
+module constants (``CARTPOLE_ACTION_SPEC`` / ``CARTPOLE_POLICIES``); nothing is
+inferred from the ``body`` joint set.  Observations are read from the live core model by joint
 name, because the policy-order ``articulation/.../joint_pos`` slice only covers
 the actuated ``body`` joint set and the passive pole is not part of it.
 
@@ -18,8 +20,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import torch
-from unigym.robots import ROBOT_REGISTRY, register_robot
+from unigym.actuators.ir import ActuationGroup
 from unigym.robots.base import BodyBinding, RobotProfile
+from unigym.runtime.actions import OrderedActionSpec, PolicyBinding
 from unigym.world import World
 
 from unigym_rl import EnvSpec, TaskConfigError, TaskContext, TaskEnv, TaskState, Transition
@@ -32,8 +35,11 @@ if TYPE_CHECKING:
 __all__ = [
     "ACTION_JOINT",
     "ACTION_LIMIT",
+    "CARTPOLE_ACTION_SPEC",
+    "CARTPOLE_ACTUATION",
     "CARTPOLE_ARTICULATION",
     "CARTPOLE_JOINTS",
+    "CARTPOLE_POLICIES",
     "CARTPOLE_PROFILE",
     "CARTPOLE_XML",
     "CART_LIMIT",
@@ -42,9 +48,9 @@ __all__ = [
     "POLE_JOINT",
     "POLE_LIMIT",
     "make_cartpole_gym",
+    "make_cartpole_profile",
     "make_cartpole_spec",
     "make_cartpole_task",
-    "register_cartpole_robot",
 ]
 
 CARTPOLE_ARTICULATION = "cartpole"
@@ -58,18 +64,41 @@ POLE_LIMIT = math.radians(12.0)
 ACTION_LIMIT = 1.8
 CARTPOLE_XML = Path(__file__).resolve().with_name("cartpole.xml")
 
-ACTUATION = [
-    {
-        "name": "body",
-        "law": "standard_pd",
-        "joint_set": "body",
-        "gains": {"kp": 50.0, "kd": 5.0},
-    }
-]
+CARTPOLE_ACTUATION = (
+    ActuationGroup(
+        name="body",
+        law="standard_pd",
+        joint_set="body",
+        gains={"kp": 50.0, "kd": 5.0},
+    ),
+)
+
+CARTPOLE_ACTION_SPEC = OrderedActionSpec.from_mapping(
+    [
+        {
+            "name": CARTPOLE_ARTICULATION,
+            "articulation": CARTPOLE_ARTICULATION,
+            "joints": [ACTION_JOINT],
+            "target": "position",
+            "role": "body",
+        }
+    ]
+)
+
+CARTPOLE_POLICIES = (
+    PolicyBinding.from_mapping(
+        {"adapter": "manual", "groups": [[CARTPOLE_ARTICULATION, CARTPOLE_ARTICULATION]]}
+    ),
+)
 
 
-def _cartpole_profile() -> RobotProfile:
-    """The demo profile matching ``cartpole.xml`` (fixed base, one slider)."""
+def make_cartpole_profile() -> RobotProfile:
+    """The demo profile matching ``cartpole.xml`` (fixed base, one slider).
+
+    The slider is the only actuated joint; the pole hinge is passive and is
+    observed by name.  Assets stay ``None`` because the bundled world owns the
+    MJCF.
+    """
     return RobotProfile(
         name=CARTPOLE_PROFILE,
         joint_sets={"body": (ACTION_JOINT,)},
@@ -80,14 +109,8 @@ def _cartpole_profile() -> RobotProfile:
         foot_bodies=(),
         body_sets={},
         body_bindings={"cart": BodyBinding("cart", {"mjcf": "cart"})},
+        actuation=CARTPOLE_ACTUATION,
     )
-
-
-def register_cartpole_robot() -> None:
-    """Register the demo profile once; existing registrations win."""
-    if CARTPOLE_PROFILE in ROBOT_REGISTRY:
-        return
-    register_robot(CARTPOLE_PROFILE, _cartpole_profile)
 
 
 class CartPoleTask(TaskEnv):
@@ -235,10 +258,11 @@ class CartPoleTask(TaskEnv):
 
 def make_cartpole_spec(*, num_envs: int, device: str | None = None, seed: int = 0) -> EnvSpec:
     """Build the demo ``EnvSpec`` over the bundled absolute MJCF path."""
-    register_cartpole_robot()
     return EnvSpec(
         world=World.base(mjcf=CARTPOLE_XML),
-        robot={"name": CARTPOLE_PROFILE, "actuation": ACTUATION},
+        robot=make_cartpole_profile(),
+        action_spec=CARTPOLE_ACTION_SPEC,
+        policies=CARTPOLE_POLICIES,
         num_envs=num_envs,
         device=device,
         seed=seed,

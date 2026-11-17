@@ -4,13 +4,12 @@ from __future__ import annotations
 
 import subprocess
 import sys
-from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 import torch
-from unigym.robots import register_robot, restore_robot_registry, snapshot_robot_registry
 from unigym.robots.base import BodyBinding, RobotProfile
+from unigym.runtime.actions import OrderedActionSpec, PolicyBinding
 from unigym.world import World
 
 from unigym_rl import EnvSpec, TaskConfigError, TaskEnv, TaskState, Transition
@@ -39,23 +38,30 @@ def _tiny_profile() -> RobotProfile:
         foot_bodies=(),
         body_sets={},
         body_bindings={"base": BodyBinding("base", {"mjcf": "base"})},
+        actuation=ACTUATION,
     )
 
 
-@pytest.fixture(autouse=True)
-def _registered_tiny_robot() -> Iterator[None]:
-    snapshot = snapshot_robot_registry()
-    register_robot("tiny", _tiny_profile)
-    try:
-        yield
-    finally:
-        restore_robot_registry(snapshot)
+ACTION_SPEC = OrderedActionSpec.from_mapping(
+    [
+        {
+            "name": "tiny",
+            "articulation": "tiny",
+            "joints": ["shoulder", "elbow"],
+            "target": "position",
+            "role": "body",
+        }
+    ]
+)
+POLICIES = (PolicyBinding.from_mapping({"adapter": "manual", "groups": [["tiny", "tiny"]]}),)
 
 
 def _spec(*, num_envs: int = 1) -> EnvSpec:
     return EnvSpec(
         world=World.base(mjcf=FIXTURE_MJCF),
-        robot={"name": "tiny", "actuation": ACTUATION},
+        robot=_tiny_profile(),
+        action_spec=ACTION_SPEC,
+        policies=POLICIES,
         num_envs=num_envs,
         inspect=True,
     )
@@ -133,7 +139,9 @@ def test_num_envs_below_one_is_rejected(num_envs: int) -> None:
     with pytest.raises(TaskConfigError, match="num_envs"):
         EnvSpec(
             world=World.base(mjcf=FIXTURE_MJCF),
-            robot={"name": "tiny", "actuation": ACTUATION},
+            robot=_tiny_profile(),
+            action_spec=ACTION_SPEC,
+            policies=POLICIES,
             num_envs=num_envs,
         )
 
@@ -142,8 +150,43 @@ def test_non_integer_num_envs_is_rejected() -> None:
     with pytest.raises(TaskConfigError, match="num_envs"):
         EnvSpec(
             world=World.base(mjcf=FIXTURE_MJCF),
-            robot={"name": "tiny", "actuation": ACTUATION},
+            robot=_tiny_profile(),
+            action_spec=ACTION_SPEC,
+            policies=POLICIES,
             num_envs=True,  # type: ignore[arg-type]
+        )
+
+
+def test_envspec_requires_a_complete_robot_profile() -> None:
+    """The robot field accepts only a RobotProfile, never a pack/name mapping."""
+    with pytest.raises(TaskConfigError, match="RobotProfile"):
+        EnvSpec(
+            world=World.base(mjcf=FIXTURE_MJCF),
+            robot={"name": "tiny"},  # type: ignore[arg-type]
+            action_spec=ACTION_SPEC,
+            policies=POLICIES,
+        )
+
+
+def test_envspec_requires_an_explicit_action_spec() -> None:
+    """The action layout is explicit; it is never inferred from the body set."""
+    with pytest.raises(TaskConfigError, match="action_spec"):
+        EnvSpec(
+            world=World.base(mjcf=FIXTURE_MJCF),
+            robot=_tiny_profile(),
+            action_spec=[],  # type: ignore[arg-type]
+            policies=POLICIES,
+        )
+
+
+def test_envspec_requires_explicit_policy_bindings() -> None:
+    """Policies are explicit PolicyBinding records, not derived defaults."""
+    with pytest.raises(TaskConfigError, match="policies"):
+        EnvSpec(
+            world=World.base(mjcf=FIXTURE_MJCF),
+            robot=_tiny_profile(),
+            action_spec=ACTION_SPEC,
+            policies=(),  # type: ignore[arg-type]
         )
 
 

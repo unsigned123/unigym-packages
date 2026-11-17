@@ -103,12 +103,16 @@ file. Termination ownership is fixed: every run declares
 exposes no way to override either.
 
 ```python
+from unigym.robots.base import RobotProfile
+from unigym.runtime.actions import OrderedActionSpec, PolicyBinding
 from unigym.world import World
 from unigym_rl import EnvSpec
 
 spec = EnvSpec(
-    world=World.base(mjcf="robot.xml"),
-    robot={"name": "my_robot", "actuation": [...]},
+    world=World.base(mjcf="world.xml"),
+    robot=RobotProfile(...),                 # complete profile (joints/assets/actuation)
+    action_spec=OrderedActionSpec(...),      # explicit; never inferred from body
+    policies=(PolicyBinding(...),),          # explicit adapter ownership
     num_envs=4,
     inspect=True,
 )
@@ -119,6 +123,8 @@ task = spec.make_task(MyTask)       # fresh run + task; caller closes both
 
 `make_task` validates that its argument is a `TaskEnv` subclass.
 `make_gym` imports `GymTaskEnv` lazily, so importing `unigym_rl` or using
+`EnvSpec` requires an explicit `World`, `RobotProfile`, `OrderedActionSpec` and
+`PolicyBinding` tuple; it never constructs a World or infers an action layout.
 `EnvSpec` never imports `gymnasium`. `make_run` returns a fresh `Run` on every
 call and never builds the backend.
 
@@ -165,6 +171,8 @@ opts = parse_args()  # or parse_args(["--num-envs", "4"])
 spec = EnvSpec(
     world=world,
     robot=robot,
+    action_spec=action_spec,
+    policies=policies,
     num_envs=opts.env.num_envs,
     device=opts.env.device,
     seed=opts.env.seed,
