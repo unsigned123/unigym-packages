@@ -48,3 +48,21 @@ Missing packs skip by default. The strict/full CI lanes use
 `--strict-test-packs` so a missing required pack fails at test setup; the
 installed-set subset lane intentionally stays non-strict to prove the skip
 path.
+
+## Status in `unigym-packages`
+
+This tree is imported verbatim from its former standalone repository. It is
+**repo-only** in `unigym-packages`: not a member of the root uv workspace, not
+hit by the root release pipeline, and not published by default because of the
+large tracked USD assets in `packages/unigym-test-pack-g1` and
+`packages/unigym-test-pack-isaaclab-cartpole`.
+
+Possible future handling for the assets: move them to Git LFS or attach them to
+GitHub releases and resolve them at test/download time. Either change is a
+separate decision; do not publish these packs implicitly from a package
+release.
+
+The nested workspace still expects a core checkout at `../unigym-core` relative
+to this directory when developed from `unigym-packages`, i.e. a `unigym-core`
+directory at the repository root next to `test-packs/`. Adjust the local
+`[tool.uv.sources]` entry if your checkout lives elsewhere.
