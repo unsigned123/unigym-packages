@@ -94,14 +94,15 @@ def test_action_spec_is_explicit_twelve_joint_body_group() -> None:
     assert len(GO2_JOINTS) == 12
     assert isinstance(go2_task.GO2_ACTION_SPEC, OrderedActionSpec)
     assert go2_task.GO2_ACTION_SPEC.dim == 12
+    assert go2_task.GO2_ACTION_GROUP == "legs"
     group = go2_task.GO2_ACTION_SPEC.groups[0]
-    assert group.name == GO2_ARTICULATION
+    assert group.name == go2_task.GO2_ACTION_GROUP
     assert group.articulation == GO2_ARTICULATION
     assert group.joints == GO2_JOINTS
     assert group.target == "position"
     assert group.role == "body"
     assert all(isinstance(binding, PolicyBinding) for binding in go2_task.GO2_POLICIES)
-    assert go2_task.GO2_POLICIES[0].groups == ((GO2_ARTICULATION, GO2_ARTICULATION),)
+    assert go2_task.GO2_POLICIES[0].groups == ((GO2_ARTICULATION, go2_task.GO2_ACTION_GROUP),)
 
 
 def test_one_env_reset_and_step_are_finite(one_env: Any) -> None:

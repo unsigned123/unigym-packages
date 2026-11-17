@@ -37,6 +37,7 @@ if TYPE_CHECKING:
 __all__ = [
     "ACTION_JOINTS",
     "COMMAND_RANGES",
+    "GO2_ACTION_GROUP",
     "GO2_ACTION_SPEC",
     "GO2_ARTICULATION",
     "GO2_DEFAULT_JOINT_POS",
@@ -56,6 +57,7 @@ __all__ = [
 
 GO2_PROFILE_ID = "go2"
 GO2_ARTICULATION = "go2"
+GO2_ACTION_GROUP = "legs"
 
 GO2_JOINTS = (
     "FL_hip_joint",
@@ -102,16 +104,15 @@ ACTION_RATE_WEIGHT = 0.01
 LIN_TRACKING_SIGMA = 0.25
 YAW_TRACKING_SIGMA = 0.25
 
-# The action group is named after the articulation (not ``legs``): the core
-# collect sink builds its per-policy metric key from the control-runtime name,
-# which is the action-group name.  Matching the articulation keeps
-# ``articulation/go2/...`` aligned for that sink.
+# The action group keeps its physical name (``legs``) while the articulation is
+# ``go2``: recorded state keys are namespaced by the articulation
+# (``articulation/go2/...``), never by the action-group name.
 ACTION_JOINTS = GO2_JOINTS
 
 GO2_ACTION_SPEC = OrderedActionSpec(
     (
         OrderedActionGroup(
-            name=GO2_ARTICULATION,
+            name=GO2_ACTION_GROUP,
             articulation=GO2_ARTICULATION,
             joints=GO2_JOINTS,
             target="position",
@@ -120,7 +121,7 @@ GO2_ACTION_SPEC = OrderedActionSpec(
     )
 )
 
-GO2_POLICIES = (PolicyBinding(adapter="manual", groups=((GO2_ARTICULATION, GO2_ARTICULATION),)),)
+GO2_POLICIES = (PolicyBinding(adapter="manual", groups=((GO2_ARTICULATION, GO2_ACTION_GROUP),)),)
 
 
 def go2_profile() -> RobotProfile:

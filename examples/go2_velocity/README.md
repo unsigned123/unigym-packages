@@ -79,9 +79,9 @@ inline material texture), so this example uses the flat ground already in the
 downloaded Menagerie `scene.xml`. Because that scene owns the Go2 MJCF, the
 profile passed to the run is a copy with `assets=None`; the pack profile is
 still the source of all joint/body/actuation metadata. The action group is
-named `go2` (same as the articulation) so the core collect sink's
-per-articulation metric key stays aligned; the profile's physical actuation
-group is still named `legs`.
+named `legs` (`GO2_ACTION_GROUP`) on the `go2` articulation, matching the
+profile's physical actuation group. Recorded state keys are namespaced by the
+articulation (`articulation/go2/...`), not by the action-group name.
 
 ## Run
 
