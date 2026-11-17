@@ -259,6 +259,12 @@ class MyTask(TaskEnv):
   with a passive observed pole, optional randomized resets via
   `set_joint_state` + `settle`, and a manual skrl PPO loop. It is repo-only and
   is not installed into the wheel; see `examples/cartpole/README.md`.
+- `examples/go2_velocity/` — a flat-ground Go2 velocity-tracking smoke: the
+  installed `unigym-robots` pack profile, a 48-column observation, per-env
+  commands, tracking/alive rewards, task-owned tilt/height/time termination,
+  and an 8-env manual skrl PPO loop. It requires
+  `unigym-robots download --set mjcf-v0` first (never auto-downloaded); see
+  `examples/go2_velocity/README.md`.
 
 ## Installing / testing
 
