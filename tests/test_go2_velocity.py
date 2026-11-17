@@ -105,6 +105,20 @@ def test_action_spec_is_explicit_twelve_joint_body_group() -> None:
     assert go2_task.GO2_POLICIES[0].groups == ((GO2_ARTICULATION, go2_task.GO2_ACTION_GROUP),)
 
 
+def test_spec_disables_the_core_episode_clock() -> None:
+    """The Go2 spec is external with a null duration; ``max_steps`` owns time."""
+    _require_go2_assets()
+
+    spec = go2_task.make_go2_velocity_spec(num_envs=1)
+    run = spec.make_run()
+    try:
+        assert spec.episode_length_s is None
+        assert run.spec.termination_mode == "external"
+        assert run.spec.cfg["env"]["episode_length_s"] is None
+    finally:
+        run.close()
+
+
 def test_one_env_reset_and_step_are_finite(one_env: Any) -> None:
     """One env returns finite ``(1, 48)`` obs and ``(1,)`` reward."""
     obs, info = one_env.reset()

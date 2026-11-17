@@ -170,6 +170,9 @@ def make_go2_velocity_spec(
         num_envs=num_envs,
         device=device,
         seed=seed,
+        # external mode: no core episode clock; the task's max_steps owns
+        # truncation.
+        episode_length_s=None,
         no_artifacts=True,
         inspect=True,
     )

@@ -37,7 +37,9 @@ class EnvSpec:
     :class:`~unigym.runtime.actions.PolicyBinding`.  This class never builds a
     World and never infers the action layout from the ``body`` joint set.
     ``make_run`` returns a fresh, lazy ``Run`` on every call, and the caller
-    owns its lifecycle.
+    owns its lifecycle.  ``episode_length_s=None`` (the default) disables the
+    core episode clock: task code, normally ``max_steps``, is the only time
+    authority.
     """
 
     world: World

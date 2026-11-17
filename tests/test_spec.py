@@ -93,6 +93,16 @@ def test_make_run_is_lazy_with_task_owned_termination_and_no_yaml() -> None:
         run.close()
 
 
+def test_make_run_uses_null_episode_length_as_no_core_clock() -> None:
+    """External mode turns the default ``None`` into an explicit null clock."""
+    run = _spec().make_run()
+    try:
+        assert run.spec.termination_mode == "external"
+        assert run.spec.cfg["env"]["episode_length_s"] is None
+    finally:
+        run.close()
+
+
 def test_make_run_returns_a_fresh_lazy_run_each_call() -> None:
     spec = _spec()
     first = spec.make_run()
