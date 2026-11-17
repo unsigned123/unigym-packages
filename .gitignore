@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+
+# Virtualenvs
+.venv/
+venv/
+env/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+*.whl
+
+# Caches and tool state
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyright/
+.import_linter_cache/
+.grimp_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Local data outputs and logs
+outputs/
+runs/
+logs/
+wandb/
+checkpoints/
+*.log
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+
+# NOTE: test-packs/ tracked USD/URDF assets are intentional and must not be
+# ignored. Do not add broad asset globs here.

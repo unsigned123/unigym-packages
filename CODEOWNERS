@@ -1,0 +1,11 @@
+# Default owners for first-party unigym packages.
+# Reviewers are requested automatically for the matching paths.
+
+*                       @unsigned123
+
+/packages/unigym-rl/    @unsigned123
+/test-packs/            @unsigned123
+/.github/               @unsigned123
+
+# Core is not in this repository; changes that need core live in
+# https://github.com/unsigned123/unigym
