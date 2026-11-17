@@ -12,6 +12,7 @@ does not replace it. Core (`unigym`) stays in its own repository
 | Path | Distribution | Purpose |
 | --- | --- | --- |
 | `packages/unigym-rl` | `unigym-rl` | L2 task-environment layer over core: `TaskEnv`, programmatic `EnvSpec`, optional Gymnasium `VectorEnv` face and skrl smoke. |
+| `packages/unigym-robots` | `unigym-robots` | Pinned Unitree Go1/Go2/G1 MJCF and USD assets, downloaded from GitHub Release tarballs. No core dependency and no binaries in the wheel. |
 | `test-packs/` | repo-only | Test-pack plugin and content-pack distributions plus their USD assets. Not a workspace member and not published by default; see `test-packs/README.md`. |
 
 `test-packs/` is kept in this repository only for co-location. It has its own
@@ -25,6 +26,8 @@ GitHub release assets is possible but is not part of this layout.
 unigym (core repo, version 0.106.x)  ->  dependency
   -> packages/unigym-rl
   -> user / RL framework training loop
+
+packages/unigym-robots  -> standalone asset downloader (no core dependency)
 ```
 
 Packages depend on core through a version range declared in their own
@@ -55,6 +58,20 @@ python -m ruff check packages/unigym-rl/src packages/unigym-rl/tests packages/un
 python -m ruff format --check packages/unigym-rl/src packages/unigym-rl/tests packages/unigym-rl/examples
 ```
 
+`unigym-robots` needs neither core nor the network for its tests:
+
+```bash
+python -m pytest packages/unigym-robots/tests -q
+python -m ruff check packages/unigym-robots/src packages/unigym-robots/tests
+python -m ruff format --check packages/unigym-robots/src packages/unigym-robots/tests
+```
+
+Its robot assets are GitHub Release artifacts, not wheel content:
+
+```bash
+unigym-robots download --set mjcf-v0
+```
+
 Run the CartPole demo from the package directory:
 
 ```bash
@@ -69,6 +86,9 @@ python examples/cartpole/train_skrl.py --num-envs 1 --max-iterations 1
   `unigym-rl-v0.1.0`). Tags trigger `.github/workflows/release.yml`.
 - Core compatibility is recorded per release in `COMPATIBILITY.md`; the current
   lane is `unigym-rl 0.1.x` -> `unigym >=0.106,<0.107`.
+- `unigym-robots` code is versioned independently. Its robot assets are attached
+  to the GitHub Release `unigym-robots-assets-v0.1.0` and are never published to
+  PyPI. See `packages/unigym-robots/PROVENANCE.md`.
 - `test-packs/` is not published by default. Publishing requires an explicit,
   separate decision about assets and packaging.
 - GitHub Actions publishes through PyPI Trusted Publishing; no API tokens are

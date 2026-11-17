@@ -6,6 +6,7 @@ repository. Each package release declares the core range it supports.
 | Package | Package version | Core requirement | Notes |
 | --- | --- | --- | --- |
 | `unigym-rl` | `0.1.x` | `unigym >=0.106,<0.107` | L2 task-environment layer; validated against core `0.106.0` and core `main` at `dac3337`. |
+| `unigym-robots` | `0.1.x` | none | Standalone asset downloader for pinned Unitree Go1/Go2/G1 MJCF and USD assets. Assets are GitHub Release tarballs, not wheel content. |
 
 Core is not on PyPI yet. Install it from a checkout until it is published:
 

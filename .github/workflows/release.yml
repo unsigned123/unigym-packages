@@ -9,6 +9,9 @@ name: Release
 # the repository settings, with a manual approval gate on `pypi`.
 #
 # test-packs is intentionally not built or published here.
+# unigym-robots assets are GitHub Release artifacts (tag
+# `unigym-robots-assets-v0.1.0`), not PyPI distributions; this workflow does not
+# build or publish them.
 
 on:
   push:

@@ -45,3 +45,31 @@ jobs:
 
       - name: Ruff format check
         run: python -m ruff format --check packages/unigym-rl/src packages/unigym-rl/tests packages/unigym-rl/examples
+
+  unigym-robots:
+    name: unigym-robots (Python 3.11)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout packages repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install package (editable)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ./packages/unigym-robots
+          python -m pip install 'ruff==0.8.6'
+
+      - name: Tests
+        run: python -m pytest packages/unigym-robots/tests -q
+
+      - name: Ruff lint
+        run: python -m ruff check packages/unigym-robots/src packages/unigym-robots/tests
+
+      - name: Ruff format check
+        run: python -m ruff format --check packages/unigym-robots/src packages/unigym-robots/tests

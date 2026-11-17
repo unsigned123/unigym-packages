@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "unigym-robots"
+version = "0.1.0"
+description = "Pinned Unitree robot assets (MJCF and USD) for unigym, distributed as GitHub Release tarballs"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "unsigned123" }]
+dependencies = []
+
+[project.scripts]
+unigym-robots = "unigym_robots.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/unsigned123/unigym-packages"
+Source = "https://github.com/unsigned123/unigym-packages/tree/main/packages/unigym-robots"
+Releases = "https://github.com/unsigned123/unigym-packages/releases"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+unigym_robots = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
