@@ -22,7 +22,38 @@ if TYPE_CHECKING:
     from unigym.runtime.actions import OrderedActionSpec
     from unigym.runtime.controllers import ControlRuntime
 
-__all__ = ["EpisodeEnd", "TaskContext", "TaskState", "Transition"]
+__all__ = [
+    "ArticulationState",
+    "EpisodeEnd",
+    "TaskContext",
+    "TaskState",
+    "Transition",
+]
+
+#: fixed-width articulation leaves: leaf -> expected trailing dimension.
+_ARTICULATION_WIDTHS = {
+    "base_pos_w": 3,
+    "base_quat_w": 4,
+    "base_lin_vel_w": 3,
+    "base_ang_vel_w": 3,
+    "base_lin_vel_b": 3,
+    "base_ang_vel_b": 3,
+    "gravity_b": 3,
+}
+#: joint leaves: their width must agree with each other, not a constant.
+_ARTICULATION_JOINTS = ("joint_pos", "joint_vel", "applied_torque")
+_ARTICULATION_LEAVES = (
+    "joint_pos",
+    "joint_vel",
+    "applied_torque",
+    "base_pos_w",
+    "base_quat_w",
+    "base_lin_vel_w",
+    "base_ang_vel_w",
+    "base_lin_vel_b",
+    "base_ang_vel_b",
+    "gravity_b",
+)
 
 
 def _require_int(value: object, name: str, *, minimum: int) -> int:
@@ -95,6 +126,80 @@ class TaskContext:
 
 
 @dataclass(frozen=True)
+class ArticulationState:
+    """The typed, per-articulation projection of one state snapshot.
+
+    Every tensor is ``(num_envs, width)`` on the backend device, in policy
+    joint order for the joint leaves.  Build one through
+    :meth:`TaskState.articulation`; the accessor validates the published
+    ``articulation/<name>/...`` keys instead of asking task code to parse
+    string paths.
+    """
+
+    joint_pos: torch.Tensor
+    joint_vel: torch.Tensor
+    applied_torque: torch.Tensor
+    base_pos_w: torch.Tensor
+    base_quat_w: torch.Tensor
+    base_lin_vel_w: torch.Tensor
+    base_ang_vel_w: torch.Tensor
+    base_lin_vel_b: torch.Tensor
+    base_ang_vel_b: torch.Tensor
+    gravity_b: torch.Tensor
+
+
+def _articulation_names(extra: Mapping[str, object]) -> list[str]:
+    """Articulation names present in the namespaced extra record."""
+    names: set[str] = set()
+    for key in extra:
+        if not isinstance(key, str) or not key.startswith("articulation/"):
+            continue
+        parts = key.split("/")
+        if len(parts) >= 3 and parts[1]:
+            names.add(parts[1])
+    return sorted(names)
+
+
+def _require_articulation_tensor(
+    value: object,
+    key: str,
+    num_envs: int,
+    *,
+    width: int | None,
+) -> torch.Tensor:
+    """Validate one published articulation tensor and return it unchanged."""
+    if not isinstance(value, torch.Tensor):
+        raise TaskContractError(
+            f"TaskState.articulation: extra[{key!r}] must be a torch.Tensor, "
+            f"got {type(value).__name__}"
+        )
+    if not value.is_floating_point():
+        raise TaskContractError(
+            f"TaskState.articulation: extra[{key!r}] must be floating point, " f"got {value.dtype}"
+        )
+    if value.ndim != 2:
+        raise TaskContractError(
+            f"TaskState.articulation: extra[{key!r}] must be (num_envs, width), "
+            f"got shape {tuple(value.shape)}"
+        )
+    if value.shape[0] != num_envs:
+        raise TaskContractError(
+            f"TaskState.articulation: extra[{key!r}] must have {num_envs} rows, "
+            f"got {value.shape[0]}"
+        )
+    if value.shape[1] == 0:
+        raise TaskContractError(
+            f"TaskState.articulation: extra[{key!r}] must not have an empty " "feature dimension"
+        )
+    if width is not None and value.shape[1] != width:
+        raise TaskContractError(
+            f"TaskState.articulation: extra[{key!r}] must have width {width}, "
+            f"got {value.shape[1]}"
+        )
+    return value
+
+
+@dataclass(frozen=True)
 class TaskState:
     """One engine-state snapshot, pre-reset unless documented otherwise.
 
@@ -118,6 +223,58 @@ class TaskState:
         obs_cache = _require_mapping(self.obs_cache, "TaskState.obs_cache")
         object.__setattr__(self, "extra", dict(extra))
         object.__setattr__(self, "obs_cache", dict(obs_cache))
+
+    def articulation(self, name: str) -> ArticulationState:
+        """Return the typed state of one articulation.
+
+        Args:
+            name: The core articulation name (the ``articulation/<name>/...``
+                key namespace).
+
+        Returns:
+            An :class:`ArticulationState` carrying the ten published leaves.
+
+        Raises:
+            TaskContractError: The name is malformed, the articulation is not
+                published, or a leaf is missing/malformed (wrong type, not
+                floating point, not 2-D, wrong row count or width).
+        """
+        if not isinstance(name, str) or not name.strip():
+            raise TaskContractError(
+                "TaskState.articulation: name must be a non-empty string, " f"got {name!r}"
+            )
+        prefix = f"articulation/{name}/"
+        available = _articulation_names(self.extra)
+        values: dict[str, torch.Tensor] = {}
+        joint_width: int | None = None
+        for leaf in _ARTICULATION_LEAVES:
+            key = f"{prefix}{leaf}"
+            if key not in self.extra:
+                hint = (
+                    f" | available articulations: {available}"
+                    if available
+                    else " | hint: the run publishes these keys only for a " "declared articulation"
+                )
+                raise TaskContractError(
+                    f"TaskState.articulation({name!r}): missing extra[{key!r}]" f"{hint}"
+                )
+            width = _ARTICULATION_WIDTHS.get(leaf)
+            if leaf in _ARTICULATION_JOINTS:
+                if joint_width is None:
+                    value = _require_articulation_tensor(
+                        self.extra[key], key, self.num_envs, width=None
+                    )
+                    joint_width = int(value.shape[1])
+                else:
+                    value = _require_articulation_tensor(
+                        self.extra[key], key, self.num_envs, width=joint_width
+                    )
+            else:
+                value = _require_articulation_tensor(
+                    self.extra[key], key, self.num_envs, width=width
+                )
+            values[leaf] = value
+        return ArticulationState(**values)
 
 
 @dataclass(frozen=True)

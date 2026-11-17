@@ -1,15 +1,11 @@
 """Flat-ground Go2 velocity-tracking smoke over the ``unigym_rl`` task layer.
 
 The robot profile comes from the installed ``unigym-robots`` pack
-(``release:go2-mjcf``), and the flat-ground world is the Menagerie
-``scene.xml`` shipped beside the downloaded ``go2.xml``.  The world owns the
-Go2 asset, so the task profile copied for the run carries ``assets=None``;
-otherwise the same MJCF would be attached twice.
-
-The MuJoCo backend requires an explicit ``world_base``.  A bare
-``World().flat_ground()`` therefore cannot build (and this core checkout also
-lacks the default inline material texture), so this smoke resolves the
-downloaded Menagerie scene instead.  No asset is downloaded here.
+(``release:go2-mjcf``) and owns the Go2 asset.  The world is the
+backend-neutral :meth:`unigym.world.World.flat` ground: it owns no robot and
+no explicit ``world_base``.  The run layer is the single robot owner
+(profile + spawn + explicit action layout + policy binding); the backend only
+selects the profile's asset format.
 
 This module is a demo, not package API: ``examples`` is repo-only and is never
 installed into the ``unigym-rl`` wheel.
@@ -17,8 +13,6 @@ installed into the ``unigym-rl`` wheel.
 
 from __future__ import annotations
 
-import dataclasses
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 import torch
@@ -26,7 +20,15 @@ from unigym.packs import require
 from unigym.runtime.actions import OrderedActionGroup, OrderedActionSpec, PolicyBinding
 from unigym.world import World
 
-from unigym_rl import EnvSpec, TaskConfigError, TaskContext, TaskEnv, TaskState, Transition
+from unigym_rl import (
+    ArticulationState,
+    EnvSpec,
+    TaskConfigError,
+    TaskContext,
+    TaskEnv,
+    TaskState,
+    Transition,
+)
 
 if TYPE_CHECKING:
     from unigym.robots.base import RobotProfile
@@ -47,9 +49,9 @@ __all__ = [
     "LOW_HEIGHT_LIMIT",
     "OBS_DIM",
     "TILT_GRAVITY_Z",
+    "GO2_SPAWN",
     "Go2VelocityTask",
     "go2_profile",
-    "go2_scene_path",
     "make_go2_velocity_gym",
     "make_go2_velocity_spec",
     "make_go2_velocity_task",
@@ -97,6 +99,9 @@ COMMAND_RANGES = ((-0.6, 0.8), (-0.4, 0.4), (-0.8, 0.8))
 TILT_GRAVITY_Z = -0.5
 LOW_HEIGHT_LIMIT = 0.18
 
+#: Run-owned robot root spawn (metres); the world never declares one.
+GO2_SPAWN = {"pos": (0.0, 0.0, 0.4)}
+
 LIN_TRACKING_WEIGHT = 1.5
 YAW_TRACKING_WEIGHT = 0.5
 ALIVE_WEIGHT = 0.5
@@ -130,51 +135,33 @@ def go2_profile() -> RobotProfile:
     return packs.pack("unigym_robots").robot(GO2_PROFILE_ID)
 
 
-def go2_scene_path() -> Path:
-    """Return the downloaded Menagerie flat-ground scene beside ``go2.xml``."""
-    try:
-        from unigym_robots import asset_path
-    except ImportError as exc:  # pragma: no cover - ``go2_profile`` runs first
-        raise TaskConfigError(
-            "Go2 assets need the unigym-robots package; install it and run "
-            "`unigym-robots download --set mjcf-v0`"
-        ) from exc
-    scene = Path(asset_path("go2-mjcf")).with_name("scene.xml")
-    if not scene.is_file():
-        raise TaskConfigError(
-            f"Go2 scene asset is missing at {scene}; download it with "
-            "`unigym-robots download --set mjcf-v0` (never auto-downloaded here)"
-        )
-    return scene
-
-
-def _world_owned_profile(profile: RobotProfile) -> RobotProfile:
-    """Drop the profile asset because the world scene already owns it."""
-    return dataclasses.replace(profile, assets=None)
-
-
 def make_go2_velocity_spec(
     *,
     num_envs: int,
     device: str | None = None,
     seed: int = 0,
+    backend: str = "mujoco",
 ) -> EnvSpec:
-    """Build the flat-ground Go2 ``EnvSpec`` from the installed pack and assets."""
-    profile = go2_profile()
-    scene = go2_scene_path()
+    """Build the flat-ground Go2 ``EnvSpec`` from the installed pack.
+
+    The backend is passed only to ``EnvSpec``: it selects the profile asset
+    format and the backend build lane.  Task code stays backend-agnostic.
+    """
     return EnvSpec(
-        world=World.base(mjcf=scene),
-        robot=_world_owned_profile(profile),
+        world=World.flat(),
+        robot=go2_profile(),
+        spawn=GO2_SPAWN,
         action_spec=GO2_ACTION_SPEC,
         policies=GO2_POLICIES,
         num_envs=num_envs,
         device=device,
+        backend=backend,
         seed=seed,
         # external mode: no core episode clock; the task's max_steps owns
         # truncation.
         episode_length_s=None,
         no_artifacts=True,
-        inspect=True,
+        inspect=False,
     )
 
 
@@ -261,41 +248,28 @@ class Go2VelocityTask(TaskEnv):
             device=self.device,
         )
 
-    def _extra_column(self, state: TaskState, leaf: str) -> torch.Tensor:
-        """Read one ``articulation/go2/<leaf>`` tensor from the core extra record."""
-        key = f"articulation/{GO2_ARTICULATION}/{leaf}"
-        value = state.extra.get(key)
-        if not isinstance(value, torch.Tensor):
+    def _joints(self, state: ArticulationState, leaf: str) -> torch.Tensor:
+        """One joint leaf, checked against the Go2 joint count and moved to device."""
+        value = getattr(state, leaf)
+        if value.shape[1] != len(GO2_JOINTS):
             raise TaskConfigError(
-                f"Go2VelocityTask: state extra key {key!r} is missing or not a tensor"
+                f"Go2VelocityTask: articulation {GO2_ARTICULATION!r} {leaf!r} "
+                f"must have {len(GO2_JOINTS)} columns, got {value.shape[1]}"
             )
-        value = value.to(device=self.device, dtype=torch.float32)
-        if value.ndim != 2 or value.shape[0] != self.num_envs:
-            raise TaskConfigError(
-                f"Go2VelocityTask: state extra key {key!r} must be (N, ...), "
-                f"got shape {tuple(value.shape)} for N={self.num_envs}"
-            )
-        return value
+        return value.to(device=self.device, dtype=torch.float32)
 
-    def _width(self, value: torch.Tensor, width: int, leaf: str) -> torch.Tensor:
-        if value.shape[1] != width:
-            raise TaskConfigError(
-                f"Go2VelocityTask: state extra {leaf!r} must have {width} columns, "
-                f"got {value.shape[1]}"
-            )
-        return value
+    def _vector(self, state: ArticulationState, leaf: str) -> torch.Tensor:
+        """One base/gravity leaf moved to the task device."""
+        return getattr(state, leaf).to(device=self.device, dtype=torch.float32)
 
     def observe(self, state: TaskState) -> torch.Tensor:
         """Return the 48-column observation described in the class docstring."""
-        base_lin_vel = self._width(self._extra_column(state, "base_lin_vel_b"), 3, "base_lin_vel_b")
-        base_ang_vel = self._width(self._extra_column(state, "base_ang_vel_b"), 3, "base_ang_vel_b")
-        gravity = self._width(self._extra_column(state, "gravity_b"), 3, "gravity_b")
-        joint_pos = self._width(
-            self._extra_column(state, "joint_pos"), len(GO2_JOINTS), "joint_pos"
-        )
-        joint_vel = self._width(
-            self._extra_column(state, "joint_vel"), len(GO2_JOINTS), "joint_vel"
-        )
+        articulation = state.articulation(GO2_ARTICULATION)
+        base_lin_vel = self._vector(articulation, "base_lin_vel_b")
+        base_ang_vel = self._vector(articulation, "base_ang_vel_b")
+        gravity = self._vector(articulation, "gravity_b")
+        joint_pos = self._joints(articulation, "joint_pos")
+        joint_vel = self._joints(articulation, "joint_vel")
         if self._default_joint_pos is None:  # pragma: no cover - on_bind always runs
             raise TaskConfigError("Go2VelocityTask: standby pose was never resolved")
         return torch.cat(
@@ -313,8 +287,9 @@ class Go2VelocityTask(TaskEnv):
 
     def reward(self, transition: Transition) -> torch.Tensor:
         """Velocity/yaw tracking, alive bonus and action-rate penalty."""
-        base_lin_vel = self._extra_column(transition.info, "base_lin_vel_b")
-        base_ang_vel = self._extra_column(transition.info, "base_ang_vel_b")
+        articulation = transition.info.articulation(GO2_ARTICULATION)
+        base_lin_vel = self._vector(articulation, "base_lin_vel_b")
+        base_ang_vel = self._vector(articulation, "base_ang_vel_b")
         linear_error = ((base_lin_vel[:, :2] - self._command[:, :2]) ** 2).sum(dim=1)
         yaw_error = (base_ang_vel[:, 2] - self._command[:, 2]) ** 2
         return (
@@ -376,10 +351,12 @@ class Go2VelocityTask(TaskEnv):
     # masks
     # ------------------------------------------------------------------ #
     def _tilt_mask(self, transition: Transition) -> torch.Tensor:
-        return self._extra_column(transition.info, "gravity_b")[:, 2] > TILT_GRAVITY_Z
+        articulation = transition.info.articulation(GO2_ARTICULATION)
+        return self._vector(articulation, "gravity_b")[:, 2] > TILT_GRAVITY_Z
 
     def _low_height_mask(self, transition: Transition) -> torch.Tensor:
-        return self._extra_column(transition.info, "base_pos_w")[:, 2] < LOW_HEIGHT_LIMIT
+        articulation = transition.info.articulation(GO2_ARTICULATION)
+        return self._vector(articulation, "base_pos_w")[:, 2] < LOW_HEIGHT_LIMIT
 
 
 def make_go2_velocity_task(
@@ -388,9 +365,15 @@ def make_go2_velocity_task(
     max_steps: int,
     device: str | None = None,
     seed: int = 0,
+    backend: str = "mujoco",
 ) -> Go2VelocityTask:
-    """Build a fresh real-MuJoCo :class:`Go2VelocityTask`."""
-    spec = make_go2_velocity_spec(num_envs=num_envs, device=device, seed=seed)
+    """Build a fresh :class:`Go2VelocityTask` on the requested backend."""
+    spec = make_go2_velocity_spec(
+        num_envs=num_envs,
+        device=device,
+        seed=seed,
+        backend=backend,
+    )
     task = spec.make_task(Go2VelocityTask, max_steps=max_steps, seed=seed)
     assert isinstance(task, Go2VelocityTask)
     return task
@@ -402,6 +385,7 @@ def make_go2_velocity_gym(
     max_steps: int,
     device: str | None = None,
     seed: int = 0,
+    backend: str = "mujoco",
 ) -> GymTaskEnv:
     """Wrap the demo task in the optional Gymnasium face (lazy import)."""
     task = make_go2_velocity_task(
@@ -409,6 +393,7 @@ def make_go2_velocity_gym(
         max_steps=max_steps,
         device=device,
         seed=seed,
+        backend=backend,
     )
     try:
         from unigym_rl.gym import GymTaskEnv

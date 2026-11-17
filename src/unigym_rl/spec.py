@@ -32,10 +32,13 @@ class EnvSpec:
     """Declarative input for an externally-terminated RL ``Run``.
 
     ``world``, ``robot``, ``action_spec`` and ``policies`` are explicit: a
-    complete core :class:`~unigym.robots.base.RobotProfile`, an
+    :class:`~unigym.world.World` (for example ``World.flat()``), a complete
+    core :class:`~unigym.robots.base.RobotProfile`, an
     :class:`~unigym.runtime.actions.OrderedActionSpec` and a non-empty tuple of
-    :class:`~unigym.runtime.actions.PolicyBinding`.  This class never builds a
-    World and never infers the action layout from the ``body`` joint set.
+    :class:`~unigym.runtime.actions.PolicyBinding`.  ``spawn`` is the
+    run-owned robot root spawn (``{"pos": (x, y, z), "yaw": radians?}``).
+    This class never builds a World, never asks the World for a robot, and
+    never infers the action layout from the ``body`` joint set.
     ``make_run`` returns a fresh, lazy ``Run`` on every call, and the caller
     owns its lifecycle.  ``episode_length_s=None`` (the default) disables the
     core episode clock: task code, normally ``max_steps``, is the only time
@@ -46,6 +49,7 @@ class EnvSpec:
     robot: RobotProfile
     action_spec: OrderedActionSpec
     policies: tuple[PolicyBinding, ...]
+    spawn: Mapping[str, object] | None = None
     num_envs: int = 1
     device: str | None = None
     backend: str = "mujoco"
@@ -79,6 +83,12 @@ class EnvSpec:
                     f"EnvSpec: policies[{index}] must be a PolicyBinding, got "
                     f"{type(binding).__name__}"
                 )
+        if self.spawn is not None and not isinstance(self.spawn, Mapping):
+            raise TaskConfigError(
+                "EnvSpec: spawn must be a mapping ({pos, yaw?}) or None, got "
+                f"{type(self.spawn).__name__} | hint: the run owns the robot "
+                "spawn; the world never declares one"
+            )
         if isinstance(self.num_envs, bool) or not isinstance(self.num_envs, int):
             raise TaskConfigError(
                 f"EnvSpec: num_envs must be an int, got {type(self.num_envs).__name__}"
@@ -93,6 +103,7 @@ class EnvSpec:
         return Run(
             world=self.world,
             robot=self.robot,
+            spawn=self.spawn,
             action_spec=self.action_spec,
             policies=self.policies,
             backend=self.backend,

@@ -45,7 +45,6 @@ def _require_go2_assets() -> None:
     pytest.importorskip("unigym_robots")
     try:
         go2_task.go2_profile()
-        go2_task.go2_scene_path()
     except Exception as exc:
         pytest.skip(f"Go2 pack/assets unavailable: {exc}")
 
@@ -105,6 +104,23 @@ def test_action_spec_is_explicit_twelve_joint_body_group() -> None:
     assert go2_task.GO2_POLICIES[0].groups == ((GO2_ARTICULATION, go2_task.GO2_ACTION_GROUP),)
 
 
+def test_spec_uses_flat_world_and_profile_assets() -> None:
+    """The World owns no robot; the profile asset and spawn are run-owned."""
+    _require_go2_assets()
+
+    assert not hasattr(go2_task, "go2_scene_path")
+    spec = go2_task.make_go2_velocity_spec(num_envs=1)
+
+    assert spec.world.is_flat is True
+    assert spec.world.fragment() == {}
+    assert spec.spawn == go2_task.GO2_SPAWN
+    assert spec.robot.assets is not None
+    assert spec.robot.assets.mjcf == "release:go2-mjcf"
+    assert spec.action_spec is go2_task.GO2_ACTION_SPEC
+    assert spec.policies is go2_task.GO2_POLICIES
+    assert spec.inspect is False
+
+
 def test_spec_disables_the_core_episode_clock() -> None:
     """The Go2 spec is external with a null duration; ``max_steps`` owns time."""
     _require_go2_assets()
@@ -115,8 +131,27 @@ def test_spec_disables_the_core_episode_clock() -> None:
         assert spec.episode_length_s is None
         assert run.spec.termination_mode == "external"
         assert run.spec.cfg["env"]["episode_length_s"] is None
+        assert run.spec.cfg["world_base"]["mjcf"].endswith("flat_ground.xml")
+        assert [entry["name"] for entry in run.spec.cfg["articulations"]] == ["go2"]
+        assert run.spec.cfg["articulations"][0]["spawn"] == {"pos": [0.0, 0.0, 0.4]}
     finally:
         run.close()
+
+
+def test_flat_world_go2_parity_keeps_the_asset_contact_options(one_env: Any) -> None:
+    """The flat world inherits the Go2 asset's ``<option>`` block verbatim."""
+    import mujoco
+    from unigym.assets.release import resolve_release_ref
+
+    profile = go2_task.go2_profile()
+    assert profile.assets is not None
+    source = mujoco.MjModel.from_xml_path(resolve_release_ref(profile.assets.mjcf))
+    model = one_env.env.mj_model
+
+    assert model.opt.cone == mujoco.mjtCone.mjCONE_ELLIPTIC
+    assert model.opt.impratio == 100.0
+    assert model.opt.cone == source.opt.cone
+    assert model.opt.impratio == source.opt.impratio
 
 
 def test_one_env_reset_and_step_are_finite(one_env: Any) -> None:
@@ -124,7 +159,11 @@ def test_one_env_reset_and_step_are_finite(one_env: Any) -> None:
     obs, info = one_env.reset()
     assert obs.shape == (1, go2_task.OBS_DIM)
     assert torch.isfinite(obs).all()
-    assert info["state"].t == 0
+    state = info["state"]
+    assert state.t == 0
+    articulation = state.articulation(GO2_ARTICULATION)
+    assert articulation.joint_pos.shape == (1, len(GO2_JOINTS))
+    assert articulation.gravity_b.shape == (1, 3)
     torch.testing.assert_close(obs[:, -3:], one_env.command)
 
     for _ in range(3):

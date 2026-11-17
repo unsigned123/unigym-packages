@@ -109,8 +109,9 @@ from unigym.world import World
 from unigym_rl import EnvSpec
 
 spec = EnvSpec(
-    world=World.base(mjcf="world.xml"),
+    world=World.flat(),                      # environment only: no robot, no world_base
     robot=RobotProfile(...),                 # complete profile (joints/assets/actuation)
+    spawn={"pos": (0.0, 0.0, 0.4)},          # run-owned robot root spawn
     action_spec=OrderedActionSpec(...),      # explicit; never inferred from body
     policies=(PolicyBinding(...),),          # explicit adapter ownership
     num_envs=4,
@@ -127,6 +128,21 @@ task = spec.make_task(MyTask)       # fresh run + task; caller closes both
 `PolicyBinding` tuple; it never constructs a World or infers an action layout.
 `EnvSpec` never imports `gymnasium`. `make_run` returns a fresh `Run` on every
 call and never builds the backend.
+
+### Typed articulation state
+
+`TaskState.articulation(name)` resolves the core's
+`articulation/<name>/...` keys into a frozen `ArticulationState`:
+
+```python
+s = state.articulation("go2")
+obs = torch.cat((s.base_lin_vel_b, s.base_ang_vel_b, s.gravity_b), dim=1)
+```
+
+It validates tensor type, 2-D shape, batch rows and fixed widths (joint leaves
+share one width; base/gravity leaves have their declared widths) and raises a
+teaching `TaskContractError` for missing or malformed fields. Task code never
+parses the namespaced strings directly.
 
 ### Action history: `RingBuffer` + `on_step`
 

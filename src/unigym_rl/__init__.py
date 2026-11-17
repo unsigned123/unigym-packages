@@ -23,7 +23,13 @@ The minimal task loop is::
 from __future__ import annotations
 
 from unigym_rl.buffers import RingBuffer
-from unigym_rl.context import EpisodeEnd, TaskContext, TaskState, Transition
+from unigym_rl.context import (
+    ArticulationState,
+    EpisodeEnd,
+    TaskContext,
+    TaskState,
+    Transition,
+)
 from unigym_rl.errors import TaskConfigError, TaskContractError, TaskEnvError
 from unigym_rl.managers import (
     RewardManager,
@@ -36,6 +42,7 @@ from unigym_rl.spec import EnvSpec
 from unigym_rl.task import TaskEnv
 
 __all__ = [
+    "ArticulationState",
     "EnvSpec",
     "EpisodeEnd",
     "GymTaskEnv",

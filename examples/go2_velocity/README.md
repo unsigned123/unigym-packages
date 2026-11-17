@@ -10,8 +10,10 @@ What it proves:
   feet, actuation) after the Go2 foot-body fix;
 - explicit `OrderedActionSpec` / `PolicyBinding` constants for the 12 leg
   joints;
-- an `EnvSpec` over the downloaded Menagerie `scene.xml` flat ground;
+- an `EnvSpec` over the backend-neutral `World.flat()` ground, with the
+  profile-owned Go2 asset and a run-owned spawn;
 - a task-owned command buffer, observation, reward and episode clock;
+- typed `TaskState.articulation("go2")` access instead of string extra keys;
 - 1-env and 8-env reset/step;
 - a manual skrl PPO smoke with no trainer abstraction.
 
@@ -34,7 +36,8 @@ network.
 | Item | Value |
 | --- | --- |
 | Robot | `go2` pack profile, 12 leg joints, `standard_pd` kp=40 / kd=1 |
-| World | downloaded Menagerie `scene.xml` (floor + lights) |
+| World | `World.flat()` (backend-neutral ground, no robot) |
+| Spawn | run-owned `{"pos": (0.0, 0.0, 0.4)}` |
 | Action | 12 absolute position targets (radians) |
 | Observation | 48 columns (below) |
 | Command | `[vx, vy, yaw_rate]`, sampled per env on every reset |
@@ -43,7 +46,8 @@ network.
 | Truncated | env-local step counter |
 | Reasons | `tilt`, `low_height`, `time_limit` |
 
-Observation columns, all read from the core `state.extra` record:
+Observation columns, all read through the typed
+`state.articulation("go2")` accessor:
 
 ```text
 base_lin_vel_b (3) | base_ang_vel_b (3) | gravity_b (3)
@@ -51,7 +55,7 @@ base_lin_vel_b (3) | base_ang_vel_b (3) | gravity_b (3)
 | previous action (12) | command (3)
 ```
 
-`state.extra` is used instead of `state.obs_cache` because this smoke does not
+`TaskState.articulation` reads the extra record because this smoke does not
 request a core observation catalog; the extra record always publishes the
 namespaced articulation keys. Joint columns follow the profile joint order
 `GO2_JOINTS`; the task verifies every name on the live model at bind time.
@@ -71,17 +75,25 @@ base height is below 0.18 m. `truncated` fires when that env's own counter
 reaches `max_steps`. There is no runner auto-reset: `TaskEnv` resets only the
 done rows, and every episode's command/previous action/counter is task-owned.
 
-## World and profile notes
+## Ownership notes
 
-The MuJoCo backend requires an explicit `world_base`. A bare
-`World().flat_ground()` cannot build (this checkout also lacks the default
-inline material texture), so this example uses the flat ground already in the
-downloaded Menagerie `scene.xml`. Because that scene owns the Go2 MJCF, the
-profile passed to the run is a copy with `assets=None`; the pack profile is
-still the source of all joint/body/actuation metadata. The action group is
-named `legs` (`GO2_ACTION_GROUP`) on the `go2` articulation, matching the
-profile's physical actuation group. Recorded state keys are namespaced by the
-articulation (`articulation/go2/...`), not by the action-group name.
+The example follows the final ownership split:
+
+```text
+RobotProfile  -> robot identity (asset, joints, pose, bindings, actuation)
+World.flat()  -> environment only (ground); no robot, no explicit world_base
+EnvSpec/Run   -> robot instance + spawn + action_spec + policies
+TaskState     -> typed articulation observations
+```
+
+The profile keeps its `release:go2-mjcf` / `release:go2-usd` assets; the
+backend only selects the format it supports. The example no longer resolves
+`scene.xml`, calls `asset_path("go2-mjcf")`, wraps the world MJCF, or drops
+the profile asset with `assets=None`; the same MJCF is attached exactly once
+by the run layer. The action group is named `legs` (`GO2_ACTION_GROUP`) on the
+`go2` articulation, matching the profile's physical actuation group. Recorded
+state keys stay namespaced by the articulation (`articulation/go2/...`), not
+by the action-group name.
 
 ## Run
 

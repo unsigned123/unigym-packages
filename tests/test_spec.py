@@ -167,6 +167,36 @@ def test_non_integer_num_envs_is_rejected() -> None:
         )
 
 
+def test_spawn_is_run_owned_and_reaches_the_articulation() -> None:
+    """``spawn`` is an EnvSpec/Run field, never a World declaration."""
+    spec = EnvSpec(
+        world=World.base(mjcf=FIXTURE_MJCF),
+        robot=_tiny_profile(),
+        spawn={"pos": (0.0, 0.0, 0.75)},
+        action_spec=ACTION_SPEC,
+        policies=POLICIES,
+        inspect=True,
+    )
+    run = spec.make_run()
+    try:
+        entry = run.spec.cfg["articulations"][0]
+        assert entry["name"] == "tiny"
+        assert entry["spawn"] == {"pos": [0.0, 0.0, 0.75]}
+    finally:
+        run.close()
+
+
+def test_envspec_rejects_a_non_mapping_spawn() -> None:
+    with pytest.raises(TaskConfigError, match="spawn"):
+        EnvSpec(
+            world=World.base(mjcf=FIXTURE_MJCF),
+            robot=_tiny_profile(),
+            spawn=(0.0, 0.0, 0.5),  # type: ignore[arg-type]
+            action_spec=ACTION_SPEC,
+            policies=POLICIES,
+        )
+
+
 def test_envspec_requires_a_complete_robot_profile() -> None:
     """The robot field accepts only a RobotProfile, never a pack/name mapping."""
     with pytest.raises(TaskConfigError, match="RobotProfile"):
