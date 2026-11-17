@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unigym-rl:
+    name: unigym-rl (Python 3.11)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout packages repository
+        uses: actions/checkout@v4
+
+      - name: Checkout unigym core
+        uses: actions/checkout@v4
+        with:
+          repository: unsigned123/unigym
+          path: unigym-core
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install core and package (editable)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ./unigym-core
+          python -m pip install -e './packages/unigym-rl[gymnasium,skrl]'
+          python -m pip install 'ruff==0.8.6'
+
+      - name: Tests
+        env:
+          PYTHONPATH: ${{ github.workspace }}/unigym-core:${{ github.workspace }}/packages/unigym-rl/src
+        run: python -m pytest packages/unigym-rl/tests -q
+
+      - name: Ruff lint
+        run: python -m ruff check packages/unigym-rl/src packages/unigym-rl/tests packages/unigym-rl/examples
+
+      - name: Ruff format check
+        run: python -m ruff format --check packages/unigym-rl/src packages/unigym-rl/tests packages/unigym-rl/examples

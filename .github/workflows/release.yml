@@ -1,0 +1,94 @@
+name: Release
+
+# Tag `unigym-rl-v<version>` on main to build and publish to PyPI.
+# Example: git tag unigym-rl-v0.1.0 && git push origin unigym-rl-v0.1.0
+#
+# Manual dispatch defaults to build-only. Choose `testpypi` for a dry run or
+# `pypi` to publish. Both publishing jobs use PyPI Trusted Publishing
+# (OIDC, no API tokens); configure the `pypi` and `testpypi` environments in
+# the repository settings, with a manual approval gate on `pypi`.
+#
+# test-packs is intentionally not built or published here.
+
+on:
+  push:
+    tags: ["unigym-rl-v*"]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish target (build-only by default)"
+        type: choice
+        options:
+          - none
+          - testpypi
+          - pypi
+        default: none
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build unigym-rl
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout packages repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install build backend
+        run: python -m pip install --upgrade build
+
+      - name: Build sdist and wheel
+        run: python -m build packages/unigym-rl --outdir dist
+
+      - name: Upload distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: unigym-rl-dist
+          path: dist/*
+          if-no-files-found: error
+
+  publish-testpypi:
+    name: Publish to TestPyPI (manual)
+    needs: build
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'testpypi'
+    runs-on: ubuntu-latest
+    environment: testpypi
+    permissions:
+      id-token: write
+    steps:
+      - name: Download distributions
+        uses: actions/download-artifact@v4
+        with:
+          name: unigym-rl-dist
+          path: dist
+
+      - name: Publish to TestPyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: build
+    if: |
+      startsWith(github.ref, 'refs/tags/unigym-rl-v') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'pypi')
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - name: Download distributions
+        uses: actions/download-artifact@v4
+        with:
+          name: unigym-rl-dist
+          path: dist
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
