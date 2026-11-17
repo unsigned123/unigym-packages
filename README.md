@@ -199,6 +199,59 @@ Parameter ownership: `num_envs` / `device` / `seed` go to `EnvSpec`;
 an `EnvSpec`, `World`, robot, task, or trainer, and no CLI value is propagated
 to `TaskEnv.reset`.
 
+## Optional task managers
+
+R3 adds two optional, pure-Python helpers: `RewardManager` and
+`TerminationManager`. They are sugar only: users may import them, or ignore
+them and implement `reward` / `terminated` / `truncated` directly. There is no
+new env type, no manager config or registry, no automatic reset, and no
+training loop. Managers keep no per-step state; every call is a pure function
+of the `Transition` it receives.
+
+```python
+from unigym_rl import RewardManager, RewardTerm, TerminationManager, TerminationTerm
+
+
+class MyTask(TaskEnv):
+    def on_bind(self, context):
+        self.rewards = RewardManager(
+            (
+                RewardTerm("upright", upright_bonus, weight=1.0),
+                RewardTerm("effort", effort_penalty, weight=0.01),
+            ),
+            clip=(-10.0, 10.0),
+        )
+        self.terminations = TerminationManager(
+            (
+                TerminationTerm("fallen", fall_mask),
+                TerminationTerm("timeout", timeout_mask, mode="truncated"),
+            )
+        )
+
+    def reward(self, transition):
+        return self.rewards(transition)
+
+    def terminated(self, transition):
+        return self.terminations(transition).terminated
+
+    def truncated(self, transition):
+        return self.terminations(transition).truncated
+
+    def termination_reasons(self, transition, terminated, truncated):
+        return self.terminations(transition).reasons
+```
+
+- Reward terms must return a 1-D floating tensor and termination terms a 1-D
+  bool tensor. The managers do not know `num_envs`; `TaskEnv` still validates
+  the final `(N,)` shape.
+- `breakdown(transition)` returns the weighted tensor of each enabled reward
+  term for logging; `clip` affects only the total.
+- `TerminationResult.reasons` keeps every term's raw mask. The manager does
+  not merge core episode-clock due ids; `TaskEnv` still computes
+  `truncated = (core_due | task_truncated) & ~task_terminated`.
+- Names, terms, weights, `clip` and modes are validated at construction;
+  `unigym_rl.managers` imports only `torch` and `unigym_rl` itself.
+
 ## Examples
 
 - `examples/cartpole/` — a runnable fixed-base MuJoCo CartPole demo: a
@@ -315,6 +368,7 @@ src/unigym_rl/
   context.py        # TaskContext / TaskState / Transition / EpisodeEnd
   spec.py           # programmatic external-termination Run builder (R2.5)
   buffers.py        # per-env RingBuffer history (R2.5)
+  managers.py       # optional RewardManager / TerminationManager (R3)
   cli.py            # optional argparse option dataclasses (R2.6)
   task.py           # TaskEnv + reset/step driver
   gym.py            # optional Gymnasium VectorEnv wrapper (lazy)
@@ -333,4 +387,5 @@ tests/
   test_spec.py              # programmatic EnvSpec (R2.5)
   test_buffers.py           # RingBuffer history (R2.5)
   test_cli.py               # optional CLI option sugar (R2.6)
+  test_managers.py          # optional reward/termination managers (R3)
 ```
