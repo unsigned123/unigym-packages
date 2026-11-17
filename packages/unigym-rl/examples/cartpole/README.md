@@ -42,23 +42,24 @@ write them through `Run.set_joint_state` followed by `Run.settle`.
 The gymnasium and skrl extras are needed only for the training script:
 
 ```bash
-pip install -e '.[gymnasium,skrl]'
+pip install -e 'packages/unigym-rl[gymnasium,skrl]'
 ```
 
-From the repo root with the core checkout on `PYTHONPATH`:
+From the root of the `unigym-packages` repository, with the core checkout on
+`PYTHONPATH`:
 
 ```bash
-PYTHONPATH=/data1/code/dlx/unigym-core:/data1/code/dlx/unigym-rl/src \
-  /data1/code/dlx/unigym-core/.venv/bin/python \
-  examples/cartpole/train_skrl.py --max-iterations 10 --rollout-steps 16
+PYTHONPATH=../unigym-core:packages/unigym-rl/src \
+  python packages/unigym-rl/examples/cartpole/train_skrl.py \
+  --max-iterations 10 --rollout-steps 16
 ```
 
 A one-iteration smoke:
 
 ```bash
-PYTHONPATH=/data1/code/dlx/unigym-core:/data1/code/dlx/unigym-rl/src \
-  /data1/code/dlx/unigym-core/.venv/bin/python \
-  examples/cartpole/train_skrl.py --max-iterations 1 --rollout-steps 2
+PYTHONPATH=../unigym-core:packages/unigym-rl/src \
+  python packages/unigym-rl/examples/cartpole/train_skrl.py \
+  --max-iterations 1 --rollout-steps 2
 ```
 
 The script prints per-iteration mean reward and episode count. It does not
