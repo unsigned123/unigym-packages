@@ -1,0 +1,10 @@
+schema: unigym.pack/1
+name: gr1
+version: 1.0.0
+api: 1
+trust: content
+provides:
+  providers:
+    - id: gr1
+      kind: robot
+      resource: robots/gr1.yaml

@@ -1,0 +1,10 @@
+.venv/
+dist/
+build/
+__pycache__/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.import_linter_cache/
+.grimp_cache/
+.pyright/

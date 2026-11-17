@@ -1,0 +1,5 @@
+# Core checkout used by the pinned test-pack CI lanes.
+# The ref must be a pushed commit in the configured repository.
+[core]
+repository = "unsigned123/unigym"
+ref = "49558fdd278a44033367b158db33ee42c24b5b8f"

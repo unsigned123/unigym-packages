@@ -1,0 +1,13 @@
+schema: unigym.pack/1
+name: g1
+version: 1.0.0
+api: 1
+trust: content
+provides:
+  assets:
+    - id: g1.usd
+      resource: assets/g1.usd
+  providers:
+    - id: g1
+      kind: robot
+      resource: robots/g1.yaml

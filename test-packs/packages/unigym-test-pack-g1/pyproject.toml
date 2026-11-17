@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "unigym-test-pack-g1"
+version = "0.2.0"
+description = "43-DoF G1 content pack for unigym backend tests"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.entry-points."unigym.test_packs"]
+g1 = "unigym_test_pack_g1:pack_root"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+include-package-data = true
+license-files = ["THIRD_PARTY_NOTICES.md"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+unigym_test_pack_g1 = [
+    "py.typed",
+    "pack/*.yaml",
+    "pack/*/*.yaml",
+    "pack/*/*.usd",
+    "pack/*/*.usda",
+    "pack/*/*/*.usd",
+    "pack/*/*/*.usda",
+    "pack/*/*/*/*.usd",
+    "pack/*/*/*/*.usda",
+]
