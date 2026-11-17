@@ -1,0 +1,65 @@
+schema: unigym.robot/1
+name: go2
+joint_sets:
+  body: &id001
+  - FL_hip_joint
+  - FL_thigh_joint
+  - FL_calf_joint
+  - FR_hip_joint
+  - FR_thigh_joint
+  - FR_calf_joint
+  - RL_hip_joint
+  - RL_thigh_joint
+  - RL_calf_joint
+  - RR_hip_joint
+  - RR_thigh_joint
+  - RR_calf_joint
+  legs: *id001
+default_joint_pos:
+  FL_hip_joint: 0.0
+  FL_thigh_joint: 0.8
+  FL_calf_joint: -1.5
+  FR_hip_joint: 0.0
+  FR_thigh_joint: 0.8
+  FR_calf_joint: -1.5
+  RL_hip_joint: 0.0
+  RL_thigh_joint: 0.8
+  RL_calf_joint: -1.5
+  RR_hip_joint: 0.0
+  RR_thigh_joint: 0.8
+  RR_calf_joint: -1.5
+assets:
+  mjcf: release:go2-mjcf
+  usd: release:go2-usd
+base_body: base
+base_height: 0.3
+foot_bodies:
+- FL_foot
+- FR_foot
+- RL_foot
+- RR_foot
+body_sets: {}
+body_bindings:
+  base:
+    mjcf: base
+    usd: base
+  FL_foot:
+    mjcf: FL_foot
+    usd: FL_foot
+  FR_foot:
+    mjcf: FR_foot
+    usd: FR_foot
+  RL_foot:
+    mjcf: RL_foot
+    usd: RL_foot
+  RR_foot:
+    mjcf: RR_foot
+    usd: RR_foot
+extra_action_sets: {}
+actuation:
+- name: legs
+  law: standard_pd
+  joint_set: body
+  gains:
+    kp: 40.0
+    kd: 1.0

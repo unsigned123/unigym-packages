@@ -1,0 +1,16 @@
+schema: unigym.pack/1
+name: unigym_robots
+version: 1.0.0
+api: 1
+trust: content
+provides:
+  providers:
+  - id: go1
+    kind: robot
+    resource: robots/go1.yaml
+  - id: go2
+    kind: robot
+    resource: robots/go2.yaml
+  - id: g1
+    kind: robot
+    resource: robots/g1.yaml

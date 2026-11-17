@@ -15,6 +15,9 @@ dependencies = []
 [project.scripts]
 unigym-robots = "unigym_robots.cli:main"
 
+[project.entry-points."unigym.packs"]
+unigym_robots = "unigym_robots:pack_root"
+
 [project.urls]
 Homepage = "https://github.com/unsigned123/unigym-packages"
 Source = "https://github.com/unsigned123/unigym-packages/tree/main/packages/unigym-robots"
@@ -24,7 +27,11 @@ Releases = "https://github.com/unsigned123/unigym-packages/releases"
 where = ["src"]
 
 [tool.setuptools.package-data]
-unigym_robots = ["py.typed"]
+unigym_robots = [
+    "py.typed",
+    "pack/*.yaml",
+    "pack/*/*.yaml",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

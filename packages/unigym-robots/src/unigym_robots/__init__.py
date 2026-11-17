@@ -6,6 +6,8 @@ binaries live in GitHub Release tarballs; see :mod:`unigym_robots.download`.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from .download import (
     ASSET_SETS,
     AssetSet,
@@ -23,6 +25,17 @@ from .download import (
 from .manifest import ASSETS, ASSETS_BY_ID, RELEASE_TAG, Asset, get_asset
 
 __version__ = "0.1.0"
+
+
+def pack_root() -> Path:
+    """Return the ``unigym.packs`` root shipped inside this package.
+
+    The directory carries ``unigym.pack.yaml`` plus the Go1/Go2/G1 robot
+    profiles.  No robot binary lives here; the profiles reference the pinned
+    GitHub Release tarballs by ``release:`` id.
+    """
+    return Path(__file__).resolve().parent / "pack"
+
 
 __all__ = [
     "ASSETS",
@@ -43,4 +56,5 @@ __all__ = [
     "download_asset",
     "download_set",
     "get_asset",
+    "pack_root",
 ]
