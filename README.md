@@ -20,6 +20,10 @@ nested uv workspace and is intentionally excluded from the root workspace
 because of ~75 MB of tracked USD assets. A future migration to Git LFS or
 GitHub release assets is possible but is not part of this layout.
 
+`unigym-rl` is developed in `packages/unigym-rl` in this repository. The
+standalone `unigym-rl` checkout is archived; see `MIGRATION.md`. Core remains
+separate.
+
 ## Core is separate
 
 ```text
