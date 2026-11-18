@@ -5,7 +5,11 @@ task-owned ``Run`` programmatically and :class:`RingBuffer` stores per-env
 history.  The optional Gymnasium vector face is
 :class:`unigym_rl.gym.GymTaskEnv`.  The package deliberately does not import
 ``gymnasium`` at import time: the Gym wrapper is exported lazily, so a base
-``TaskEnv`` user needs no RL framework installed::
+``TaskEnv`` user needs no RL framework installed.  The optional
+:class:`RewardManager` / :class:`TerminationManager` helpers depend only on
+``torch`` and can be ignored entirely.
+
+The minimal task loop is::
 
     run = Run(..., termination_mode="external")
     env = MyTask(run)
@@ -19,8 +23,20 @@ history.  The optional Gymnasium vector face is
 from __future__ import annotations
 
 from unigym_rl.buffers import RingBuffer
-from unigym_rl.context import EpisodeEnd, TaskContext, TaskState, Transition
+from unigym_rl.context import (
+    EpisodeEnd,
+    TaskContext,
+    TaskState,
+    Transition,
+)
 from unigym_rl.errors import TaskConfigError, TaskContractError, TaskEnvError
+from unigym_rl.managers import (
+    RewardManager,
+    RewardTerm,
+    TerminationManager,
+    TerminationResult,
+    TerminationTerm,
+)
 from unigym_rl.spec import EnvSpec
 from unigym_rl.task import TaskEnv
 
@@ -29,12 +45,17 @@ __all__ = [
     "EpisodeEnd",
     "GymTaskEnv",
     "RingBuffer",
+    "RewardManager",
+    "RewardTerm",
     "TaskConfigError",
     "TaskContext",
     "TaskContractError",
     "TaskEnv",
     "TaskEnvError",
     "TaskState",
+    "TerminationManager",
+    "TerminationResult",
+    "TerminationTerm",
     "Transition",
 ]
 

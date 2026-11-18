@@ -42,6 +42,7 @@ class EnvOptions:
     num_envs: int = 8
     max_episode_steps: int = 500
     device: str = "cpu"
+    backend: str = "mujoco"
     seed: int = 0
 
     def __post_init__(self) -> None:
@@ -49,6 +50,8 @@ class EnvOptions:
         _require_int_ge_one(self.max_episode_steps, "EnvOptions.max_episode_steps")
         if not isinstance(self.device, str) or not self.device:
             raise ValueError(f"EnvOptions.device must be a non-empty string, got {self.device!r}")
+        if not isinstance(self.backend, str) or not self.backend:
+            raise ValueError(f"EnvOptions.backend must be a non-empty string, got {self.backend!r}")
         if isinstance(self.seed, bool) or not isinstance(self.seed, int):
             raise ValueError(f"EnvOptions.seed must be an int, got {type(self.seed).__name__}")
 
@@ -109,6 +112,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help='torch device string, e.g. "cpu" or "cuda:0" (default: cpu)',
     )
     parser.add_argument(
+        "--backend",
+        default="mujoco",
+        metavar="NAME",
+        help='simulation backend name, e.g. "mujoco" or "isaaclab2" (default: mujoco)',
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         default=0,
@@ -150,6 +159,7 @@ def parse_args(argv: list[str] | None = None) -> Options:
             num_envs=args.num_envs,
             max_episode_steps=args.max_episode_steps,
             device=args.device,
+            backend=args.backend,
             seed=args.seed,
         ),
         train=TrainOptions(

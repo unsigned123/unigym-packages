@@ -23,7 +23,6 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, Protocol
 
 import torch
-from unigym.runner.state import read_extra
 
 from unigym_rl.context import EpisodeEnd, TaskContext, TaskState, Transition
 from unigym_rl.errors import TaskConfigError, TaskContractError, TaskEnvError
@@ -176,9 +175,20 @@ class TaskEnv:
         self._ensure_open()
         result = self.runner.reset(None)
         all_ids = torch.arange(self.num_envs, dtype=torch.int64, device=self.device)
-        state = self._snapshot(t=int(result.t))
+        state = self._snapshot(
+            t=int(result.t),
+            obs=result.obs,
+            record=result.record,
+            reset_env_ids=result.reset_env_ids,
+        )
         self._reset_buffers(all_ids)
         self.on_reset(all_ids, state)
+        state = self._snapshot(
+            t=int(result.t),
+            obs=self.env.obs.snapshot(),
+            record=result.record,
+            reset_env_ids=result.reset_env_ids,
+        )
         obs = self._validate_obs(self.observe(state))
         self._last_obs = obs
         self._started = True
@@ -198,8 +208,19 @@ class TaskEnv:
         result = self.runner.step(named)
         self._validate_core_termination(result)
 
-        pre = self._snapshot(t=int(result.t), extra=result.extra)
+        pre = self._snapshot(
+            t=int(result.t),
+            obs=result.obs,
+            record=result.record,
+            reset_env_ids=result.reset_env_ids,
+        )
         self.on_step(flat, pre)
+        pre = self._snapshot(
+            t=int(result.t),
+            obs=self.env.obs.snapshot(),
+            record=result.record,
+            reset_env_ids=result.reset_env_ids,
+        )
         next_obs = self._validate_obs(self.observe(pre))
         zeros = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         transition = Transition(
@@ -246,10 +267,21 @@ class TaskEnv:
 
         if bool(done.any()):
             self.on_episode_end(done_ids, pre, transition)
-            self.runner.reset(done_ids)
-            post = self._snapshot(t=int(result.t) + 1)
+            reset_result = self.runner.reset(done_ids)
+            post = self._snapshot(
+                t=int(reset_result.t),
+                obs=reset_result.obs,
+                record=reset_result.record,
+                reset_env_ids=reset_result.reset_env_ids,
+            )
             self._reset_buffers(done_ids)
             self.on_reset(done_ids, post)
+            post = self._snapshot(
+                t=int(reset_result.t),
+                obs=self.env.obs.snapshot(),
+                record=reset_result.record,
+                reset_env_ids=reset_result.reset_env_ids,
+            )
             obs = self._validate_obs(self.observe(post))
         else:
             post = pre
@@ -369,20 +401,48 @@ class TaskEnv:
         self,
         *,
         t: int,
-        extra: Mapping[str, object] | None = None,
+        obs: object | None = None,
+        record: Mapping[str, object] | None = None,
+        reset_env_ids: object | None = None,
     ) -> TaskState:
-        if extra is None:
-            extra = read_extra(self.env)
-        obs_cache = getattr(self.env, "obs_cache", None)
-        if not isinstance(obs_cache, Mapping):
+        from unigym.env.obs import ObsSnapshot
+
+        if obs is None:
+            obs = self.env.obs.snapshot()
+        if not isinstance(obs, ObsSnapshot):
             raise TaskContractError(
-                f"TaskEnv: env.obs_cache must be a mapping, got {type(obs_cache).__name__}"
+                f"TaskEnv: env.obs.snapshot() must return an ObsSnapshot, "
+                f"got {type(obs).__name__}"
             )
+        if record is None:
+            record = self.env.record()
+        if not isinstance(record, Mapping):
+            raise TaskContractError(
+                f"TaskEnv: env.record() must be a mapping, got {type(record).__name__}"
+            )
+        if reset_env_ids is None:
+            reset_ids = torch.zeros(0, dtype=torch.int64, device=self.device)
+        elif not isinstance(reset_env_ids, torch.Tensor):
+            raise TaskContractError(
+                "TaskEnv: core StepResult.reset_env_ids must be a tensor or None, "
+                f"got {type(reset_env_ids).__name__}"
+            )
+        else:
+            reset_ids = reset_env_ids.to(device=self.device, dtype=torch.int64)
+        episode_id = record.get("episode_id")
+        if isinstance(episode_id, torch.Tensor):
+            episode_id = episode_id.to(self.device)
+        time_in_episode = record.get("time_in_episode")
+        if isinstance(time_in_episode, torch.Tensor):
+            time_in_episode = time_in_episode.to(self.device)
         return TaskState(
             t=int(t),
             num_envs=self.num_envs,
-            extra=extra,
-            obs_cache=dict(obs_cache),
+            obs=obs,
+            episode_id=episode_id,
+            time_in_episode=time_in_episode,
+            reset_env_ids=reset_ids,
+            should_reset=bool(reset_ids.numel()),
         )
 
     def _validate_obs(self, obs: object) -> torch.Tensor:

@@ -173,7 +173,7 @@ class _NoObsDimTask(TaskEnv):
     """Task that never declares ``obs_dim`` (only infers it on first reset)."""
 
     def observe(self, state):
-        return state.obs_cache["proprio"].clone()
+        return state.obs.robot("robot").joint_pos.clone()
 
     def reward(self, transition):
         return torch.zeros(self.num_envs, device=self.device)

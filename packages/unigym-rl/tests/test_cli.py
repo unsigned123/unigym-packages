@@ -14,7 +14,9 @@ from unigym_rl.cli import EnvOptions, Options, TrainOptions, parse_args
 def test_defaults_from_empty_argv() -> None:
     opts = parse_args([])
 
-    assert opts.env == EnvOptions(num_envs=8, max_episode_steps=500, device="cpu", seed=0)
+    assert opts.env == EnvOptions(
+        num_envs=8, max_episode_steps=500, device="cpu", backend="mujoco", seed=0
+    )
     assert opts.train == TrainOptions(max_iterations=1000, rollout_steps=64)
 
 
@@ -27,6 +29,8 @@ def test_hyphenated_flags_override_every_field() -> None:
             "250",
             "--device",
             "cuda:0",
+            "--backend",
+            "isaaclab2",
             "--seed",
             "-5",
             "--max-iterations",
@@ -36,7 +40,13 @@ def test_hyphenated_flags_override_every_field() -> None:
         ]
     )
 
-    assert opts.env == EnvOptions(num_envs=16, max_episode_steps=250, device="cuda:0", seed=-5)
+    assert opts.env == EnvOptions(
+        num_envs=16,
+        max_episode_steps=250,
+        device="cuda:0",
+        backend="isaaclab2",
+        seed=-5,
+    )
     assert opts.train == TrainOptions(max_iterations=20, rollout_steps=32)
 
 
@@ -76,6 +86,7 @@ def test_supplied_argv_is_used_instead_of_sys_argv(monkeypatch: pytest.MonkeyPat
 
     assert opts.env.num_envs == 3
     assert opts.env.device == "cpu"
+    assert opts.env.backend == "mujoco"
 
 
 def test_none_argv_falls_back_to_sys_argv(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -123,6 +134,21 @@ def test_empty_device_is_rejected() -> None:
         EnvOptions(device="")
 
 
+def test_backend_default_and_override() -> None:
+    assert parse_args([]).env.backend == "mujoco"
+    assert EnvOptions().backend == "mujoco"
+    assert parse_args(["--backend", "isaaclab2"]).env.backend == "isaaclab2"
+    assert EnvOptions(backend="isaaclab2").backend == "isaaclab2"
+
+
+def test_empty_backend_is_rejected() -> None:
+    with pytest.raises(ValueError, match="backend"):
+        parse_args(["--backend", ""])
+
+    with pytest.raises(ValueError, match="backend"):
+        EnvOptions(backend="")
+
+
 @pytest.mark.parametrize(
     ("field", "bad_value"),
     [
@@ -152,6 +178,7 @@ def test_train_options_reject_non_positive_ints(field: str, bad_value: int) -> N
         ("max_episode_steps", 8.0),
         ("seed", "0"),
         ("device", 0),
+        ("backend", 0),
     ],
 )
 def test_env_options_reject_wrong_types(field: str, bad_value: object) -> None:

@@ -6,7 +6,8 @@ adds no package API.
 
 What it proves:
 
-- a demo `RobotProfile` registered programmatically for a self-contained MJCF;
+- a demo `RobotProfile` (with explicit actuation) for a self-contained MJCF;
+- explicit `OrderedActionSpec` / `PolicyBinding` constants;
 - an `EnvSpec` over `World.base(mjcf=...)` with task-owned termination;
 - a fixed-base articulation with exactly one action column (`slider`);
 - a passive, observed pole joint (`hinge_1`);
@@ -26,11 +27,15 @@ What it proves:
 | Truncated | env-local step counter reaches `max_steps` |
 | Reasons | `cart_limit`, `pole_limit`, `time_limit` |
 
-The policy-order `articulation/cartpole/joint_pos` slice only covers the
-actuated `body` joint set, so it contains the cart but not the passive pole.
-The demo therefore reads the cart and pole joints by name from the live core
-model (`run.build().live.joints[...]`), which keeps the column order explicit.
-No `set_root_state` is used: the CartPole base is fixed.
+`make_cartpole_spec()` passes an explicit `RobotProfile`, an explicit
+`OrderedActionSpec` and explicit `PolicyBinding` policies to `EnvSpec`; the
+action layout is never inferred from the `body` joint set. `EnvSpec` also
+requires an explicit `World`; it never constructs one.
+
+The run declares `observations: {robot: [cartpole]}`. Positions and velocities
+come from the typed full-order `joint_pos_rel` and `joint_vel_full` views, so
+the passive pole joint is covered without reading the live model. No
+`set_root_state` is used: the CartPole base is fixed.
 
 Randomized resets are off by default. Pass `randomize_reset=True` (and
 optionally `reset_position_scale=...`, `seed=...`) to
@@ -42,28 +47,38 @@ write them through `Run.set_joint_state` followed by `Run.settle`.
 The gymnasium and skrl extras are needed only for the training script:
 
 ```bash
-pip install -e 'packages/unigym-rl[gymnasium,skrl]'
+pip install -e '.[gymnasium,skrl]'
 ```
 
-From the root of the `unigym-packages` repository, with the core checkout on
-`PYTHONPATH`:
+From `packages/unigym-rl` with the core checkout on `PYTHONPATH`:
 
 ```bash
-PYTHONPATH=../unigym-core:packages/unigym-rl/src \
-  python packages/unigym-rl/examples/cartpole/train_skrl.py \
-  --max-iterations 10 --rollout-steps 16
+PYTHONPATH=../unigym-core:src \
+  python \
+  examples/cartpole/train_skrl.py --max-iterations 10 --rollout-steps 16
 ```
 
 A one-iteration smoke:
 
 ```bash
-PYTHONPATH=../unigym-core:packages/unigym-rl/src \
-  python packages/unigym-rl/examples/cartpole/train_skrl.py \
-  --max-iterations 1 --rollout-steps 2
+PYTHONPATH=../unigym-core:src \
+  python \
+  examples/cartpole/train_skrl.py --max-iterations 1 --rollout-steps 2
 ```
 
 The script prints per-iteration mean reward and episode count. It does not
 checkpoint, log to a service, or claim convergence.
+
+`--backend` defaults to `mujoco`. CartPole is MuJoCo-only: the flag is forwarded
+to `EnvSpec`, so selecting another backend (e.g. `--backend isaaclab2`) fails in
+the core layer with its own teaching error rather than being silently ignored.
+
+```bash
+# default backend
+--backend mujoco --device cpu
+# rejected by core for this MuJoCo-only demo
+--backend isaaclab2 --device cuda:0
+```
 
 ## Known limitations
 
@@ -74,8 +89,9 @@ checkpoint, log to a service, or claim convergence.
   not hidden by the demo.
 - No trainer, checkpoint format, evaluation harness, or convergence guarantee.
 - Fixed-base, single-articulation, one-action cart only.
-- Observation reads the live model rather than the policy-order `extra` slice,
-  because the passive pole is absent from that slice.
+- Observation reads typed `state.obs.robot("cartpole")` positions and the
+  full-order `joint_vel_full` velocities; the passive pole joint is covered by
+  the typed view, not a live model read.
 
 ## Asset provenance
 

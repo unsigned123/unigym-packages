@@ -4,13 +4,12 @@ from __future__ import annotations
 
 import subprocess
 import sys
-from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 import torch
-from unigym.robots import register_robot, restore_robot_registry, snapshot_robot_registry
 from unigym.robots.base import BodyBinding, RobotProfile
+from unigym.runtime.actions import OrderedActionSpec, PolicyBinding
 from unigym.world import World
 
 from unigym_rl import EnvSpec, TaskConfigError, TaskEnv, TaskState, Transition
@@ -39,23 +38,31 @@ def _tiny_profile() -> RobotProfile:
         foot_bodies=(),
         body_sets={},
         body_bindings={"base": BodyBinding("base", {"mjcf": "base"})},
+        actuation=ACTUATION,
     )
 
 
-@pytest.fixture(autouse=True)
-def _registered_tiny_robot() -> Iterator[None]:
-    snapshot = snapshot_robot_registry()
-    register_robot("tiny", _tiny_profile)
-    try:
-        yield
-    finally:
-        restore_robot_registry(snapshot)
+ACTION_SPEC = OrderedActionSpec.from_mapping(
+    [
+        {
+            "name": "tiny",
+            "articulation": "tiny",
+            "joints": ["shoulder", "elbow"],
+            "target": "position",
+            "role": "body",
+        }
+    ]
+)
+POLICIES = (PolicyBinding.from_mapping({"adapter": "manual", "groups": [["tiny", "tiny"]]}),)
 
 
 def _spec(*, num_envs: int = 1) -> EnvSpec:
     return EnvSpec(
         world=World.base(mjcf=FIXTURE_MJCF),
-        robot={"name": "tiny", "actuation": ACTUATION},
+        robot=_tiny_profile(),
+        action_spec=ACTION_SPEC,
+        policies=POLICIES,
+        observations={"robot": ["tiny"]},
         num_envs=num_envs,
         inspect=True,
     )
@@ -67,7 +74,7 @@ class TinySpecTask(TaskEnv):
     obs_dim = 2
 
     def observe(self, state: TaskState) -> torch.Tensor:
-        return state.extra["articulation/tiny/joint_pos"]
+        return state.robot("tiny").joint_pos
 
     def reward(self, transition: Transition) -> torch.Tensor:
         return -transition.next_obs[:, 0].abs()
@@ -83,6 +90,45 @@ def test_make_run_is_lazy_with_task_owned_termination_and_no_yaml() -> None:
         assert run.spec.runner["auto_reset"] is False
         assert run.spec.runner["reset_on_termination"] is False
         assert run.spec.config_path == "<memory>"
+    finally:
+        run.close()
+
+
+def test_observations_declaration_reaches_the_run_config() -> None:
+    spec = _spec()
+    assert spec.observations["robot"] == ["tiny"]
+    run = spec.make_run()
+    try:
+        assert run.spec.cfg["observations"]["robot"] == ["tiny"]
+    finally:
+        run.close()
+
+
+def test_envspec_rejects_malformed_observations() -> None:
+    with pytest.raises(TaskConfigError, match="observations"):
+        EnvSpec(
+            world=World.base(mjcf=FIXTURE_MJCF),
+            robot=_tiny_profile(),
+            action_spec=ACTION_SPEC,
+            policies=POLICIES,
+            observations=[("tiny",)],  # type: ignore[arg-type]
+        )
+    with pytest.raises(TaskConfigError, match="observations.robot"):
+        EnvSpec(
+            world=World.base(mjcf=FIXTURE_MJCF),
+            robot=_tiny_profile(),
+            action_spec=ACTION_SPEC,
+            policies=POLICIES,
+            observations={"contact": ["base"]},
+        )
+
+
+def test_make_run_uses_null_episode_length_as_no_core_clock() -> None:
+    """External mode turns the default ``None`` into an explicit null clock."""
+    run = _spec().make_run()
+    try:
+        assert run.spec.termination_mode == "external"
+        assert run.spec.cfg["env"]["episode_length_s"] is None
     finally:
         run.close()
 
@@ -133,7 +179,10 @@ def test_num_envs_below_one_is_rejected(num_envs: int) -> None:
     with pytest.raises(TaskConfigError, match="num_envs"):
         EnvSpec(
             world=World.base(mjcf=FIXTURE_MJCF),
-            robot={"name": "tiny", "actuation": ACTUATION},
+            robot=_tiny_profile(),
+            action_spec=ACTION_SPEC,
+            policies=POLICIES,
+            observations={"robot": ["tiny"]},
             num_envs=num_envs,
         )
 
@@ -142,9 +191,171 @@ def test_non_integer_num_envs_is_rejected() -> None:
     with pytest.raises(TaskConfigError, match="num_envs"):
         EnvSpec(
             world=World.base(mjcf=FIXTURE_MJCF),
-            robot={"name": "tiny", "actuation": ACTUATION},
+            robot=_tiny_profile(),
+            action_spec=ACTION_SPEC,
+            policies=POLICIES,
+            observations={"robot": ["tiny"]},
             num_envs=True,  # type: ignore[arg-type]
         )
+
+
+def test_spawn_is_run_owned_and_reaches_the_articulation() -> None:
+    """``spawn`` is an EnvSpec/Run field, never a World declaration."""
+    spec = EnvSpec(
+        world=World.base(mjcf=FIXTURE_MJCF),
+        robot=_tiny_profile(),
+        spawn={"pos": (0.0, 0.0, 0.75)},
+        action_spec=ACTION_SPEC,
+        policies=POLICIES,
+        observations={"robot": ["tiny"]},
+        inspect=True,
+    )
+    run = spec.make_run()
+    try:
+        entry = run.spec.cfg["articulations"][0]
+        assert entry["name"] == "tiny"
+        assert entry["spawn"] == {"pos": [0.0, 0.0, 0.75]}
+    finally:
+        run.close()
+
+
+def test_envspec_rejects_a_non_mapping_spawn() -> None:
+    with pytest.raises(TaskConfigError, match="spawn"):
+        EnvSpec(
+            world=World.base(mjcf=FIXTURE_MJCF),
+            robot=_tiny_profile(),
+            spawn=(0.0, 0.0, 0.5),  # type: ignore[arg-type]
+            action_spec=ACTION_SPEC,
+            policies=POLICIES,
+            observations={"robot": ["tiny"]},
+        )
+
+
+def test_envspec_requires_a_complete_robot_profile() -> None:
+    """The robot field accepts only a RobotProfile, never a pack/name mapping."""
+    with pytest.raises(TaskConfigError, match="RobotProfile"):
+        EnvSpec(
+            world=World.base(mjcf=FIXTURE_MJCF),
+            robot={"name": "tiny"},  # type: ignore[arg-type]
+            action_spec=ACTION_SPEC,
+            policies=POLICIES,
+            observations={"robot": ["tiny"]},
+        )
+
+
+def test_envspec_requires_an_explicit_action_spec() -> None:
+    """The action layout is explicit; it is never inferred from the body set."""
+    with pytest.raises(TaskConfigError, match="action_spec"):
+        EnvSpec(
+            world=World.base(mjcf=FIXTURE_MJCF),
+            robot=_tiny_profile(),
+            action_spec=[],  # type: ignore[arg-type]
+            policies=POLICIES,
+            observations={"robot": ["tiny"]},
+        )
+
+
+def test_envspec_requires_explicit_policy_bindings() -> None:
+    """Policies are explicit PolicyBinding records, not derived defaults."""
+    with pytest.raises(TaskConfigError, match="policies"):
+        EnvSpec(
+            world=World.base(mjcf=FIXTURE_MJCF),
+            robot=_tiny_profile(),
+            action_spec=ACTION_SPEC,
+            policies=(),  # type: ignore[arg-type]
+            observations={"robot": ["tiny"]},
+        )
+
+
+BASE_CONTACT_GROUP = {
+    "name": "base",
+    "sensor_bodies": ["base"],
+    "frame": "world",
+    "format": "contact",
+    "threshold": 1.0,
+}
+
+
+def test_envspec_contacts_default_to_no_declaration() -> None:
+    """The default contact tuple is empty and adds no contact section or keys."""
+    spec = _spec()
+    assert spec.contacts == ()
+    run = spec.make_run()
+    try:
+        assert run.spec.cfg.get("contacts") is None
+        assert run.spec.contacts is None
+    finally:
+        run.close()
+
+    task = spec.make_task(TinySpecTask)
+    try:
+        _, info = task.reset()
+        assert not [key for key in info["state"].obs.keys() if key.startswith("contact/")]
+    finally:
+        task.close()
+        task.run.close()
+
+
+def test_envspec_rejects_a_non_tuple_contact_declaration() -> None:
+    with pytest.raises(TaskConfigError, match="contacts"):
+        EnvSpec(
+            world=World.base(mjcf=FIXTURE_MJCF),
+            robot=_tiny_profile(),
+            action_spec=ACTION_SPEC,
+            policies=POLICIES,
+            observations={"robot": ["tiny"]},
+            contacts=[BASE_CONTACT_GROUP],  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        {},
+        {"sensor_bodies": ["base"], "frame": "world"},
+        {"name": "base", "sensor_bodies": ["base"]},
+        dict(BASE_CONTACT_GROUP, unknown_key=True),
+    ],
+)
+def test_envspec_rejects_invalid_contact_entries(entry: dict) -> None:
+    with pytest.raises(TaskConfigError, match=r"contacts\[0\]"):
+        EnvSpec(
+            world=World.base(mjcf=FIXTURE_MJCF),
+            robot=_tiny_profile(),
+            action_spec=ACTION_SPEC,
+            policies=POLICIES,
+            observations={"robot": ["tiny"]},
+            contacts=(entry,),
+        )
+
+
+def test_envspec_contact_declaration_reaches_the_run_and_is_published() -> None:
+    """A valid group lands in the run ``contacts:`` list and its record key."""
+    spec = EnvSpec(
+        world=World.base(mjcf=FIXTURE_MJCF),
+        robot=_tiny_profile(),
+        action_spec=ACTION_SPEC,
+        policies=POLICIES,
+        observations={"robot": ["tiny"], "contact": ["base"]},
+        contacts=(BASE_CONTACT_GROUP,),
+        inspect=True,
+    )
+    run = spec.make_run()
+    try:
+        assert run.spec.cfg["contacts"] == [BASE_CONTACT_GROUP]
+        assert run.spec.contacts == [BASE_CONTACT_GROUP]
+    finally:
+        run.close()
+
+    task = spec.make_task(TinySpecTask)
+    try:
+        _, info = task.reset()
+        value = info["state"].obs.contact("base").value
+        assert value.shape == (1, 1)
+        assert value.dtype is torch.bool
+    finally:
+        task.close()
+        task.run.close()
 
 
 def test_make_gym_wraps_a_task() -> None:

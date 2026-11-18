@@ -17,12 +17,18 @@ from unigym_rl.errors import TaskContractError
 
 if TYPE_CHECKING:
     from unigym.env.backends.base import EnvBackend
+    from unigym.env.obs import ObsSnapshot, RobotObs
     from unigym.run.api import Run
     from unigym.run.instance import RunInstance
     from unigym.runtime.actions import OrderedActionSpec
     from unigym.runtime.controllers import ControlRuntime
 
-__all__ = ["EpisodeEnd", "TaskContext", "TaskState", "Transition"]
+__all__ = [
+    "EpisodeEnd",
+    "TaskContext",
+    "TaskState",
+    "Transition",
+]
 
 
 def _require_int(value: object, name: str, *, minimum: int) -> int:
@@ -46,6 +52,39 @@ def _require_mask(value: object, name: str, num_envs: int) -> torch.Tensor:
         raise TaskContractError(f"{name} must be bool, got {value.dtype}")
     if value.shape != (num_envs,):
         raise TaskContractError(f"{name} must have shape ({num_envs},), got {tuple(value.shape)}")
+    return value
+
+
+def _require_row_tensor(
+    value: object,
+    name: str,
+    num_envs: int,
+) -> torch.Tensor:
+    if not isinstance(value, torch.Tensor):
+        raise TaskContractError(f"{name} must be a torch.Tensor, got {type(value).__name__}")
+    if value.ndim != 1 or value.shape[0] != num_envs:
+        raise TaskContractError(f"{name} must have shape ({num_envs},), got {tuple(value.shape)}")
+    return value
+
+
+def _require_ids(value: object, name: str, num_envs: int) -> torch.Tensor:
+    if not isinstance(value, torch.Tensor):
+        raise TaskContractError(f"{name} must be a torch.Tensor, got {type(value).__name__}")
+    if value.ndim != 1 or value.dtype not in (
+        torch.int8,
+        torch.int16,
+        torch.int32,
+        torch.int64,
+        torch.uint8,
+    ):
+        raise TaskContractError(
+            f"{name} must be a 1-D integer tensor, got {value.dtype} shape {tuple(value.shape)}"
+        )
+    if value.numel():
+        if int(value.min()) < 0 or int(value.max()) >= num_envs:
+            raise TaskContractError(f"{name} must be in [0, {num_envs}), got {value.tolist()}")
+        if int(torch.unique(value).numel()) != int(value.numel()):
+            raise TaskContractError(f"{name} must be unique, got {value.tolist()}")
     return value
 
 
@@ -101,23 +140,53 @@ class TaskState:
     Attributes:
         t: Policy tick index the snapshot belongs to (non-negative).
         num_envs: Batch size ``N``.
-        extra: The backend ``extra`` record (including ``reset_env_ids`` /
-            ``should_reset`` defaults).
-        obs_cache: The backend observation cache after the step/reset.
+        obs: The typed observation snapshot published by this tick.
+        episode_id: Per-env episode counter (``(N,)`` int64), when published.
+        time_in_episode: Per-env episode time in seconds (``(N,)``), when
+            published.
+        reset_env_ids: Env ids the core marked due for reset (``(K,)`` int64).
+        should_reset: Whether ``reset_env_ids`` is non-empty.
     """
 
     t: int
     num_envs: int
-    extra: Mapping[str, object]
-    obs_cache: Mapping[str, object]
+    obs: ObsSnapshot
+    episode_id: torch.Tensor | None = None
+    time_in_episode: torch.Tensor | None = None
+    reset_env_ids: torch.Tensor | None = None
+    should_reset: bool = False
 
     def __post_init__(self) -> None:
+        from unigym.env.obs import ObsSnapshot
+
         _require_int(self.t, "TaskState.t", minimum=0)
         _require_int(self.num_envs, "TaskState.num_envs", minimum=1)
-        extra = _require_mapping(self.extra, "TaskState.extra")
-        obs_cache = _require_mapping(self.obs_cache, "TaskState.obs_cache")
-        object.__setattr__(self, "extra", dict(extra))
-        object.__setattr__(self, "obs_cache", dict(obs_cache))
+        if not isinstance(self.obs, ObsSnapshot):
+            raise TaskContractError(
+                f"TaskState.obs must be an ObsSnapshot, got {type(self.obs).__name__}"
+            )
+        if self.obs.num_envs != self.num_envs:
+            raise TaskContractError(
+                f"TaskState.obs has {self.obs.num_envs} rows, expected {self.num_envs}"
+            )
+        if self.episode_id is not None:
+            _require_row_tensor(self.episode_id, "TaskState.episode_id", self.num_envs)
+        if self.time_in_episode is not None:
+            _require_row_tensor(self.time_in_episode, "TaskState.time_in_episode", self.num_envs)
+        if self.reset_env_ids is None:
+            reset_ids = torch.zeros(0, dtype=torch.int64, device=self.obs.device)
+            object.__setattr__(self, "reset_env_ids", reset_ids)
+        else:
+            _require_ids(self.reset_env_ids, "TaskState.reset_env_ids", self.num_envs)
+        if not isinstance(self.should_reset, bool):
+            raise TaskContractError(
+                f"TaskState.should_reset must be a bool, got {type(self.should_reset).__name__}"
+            )
+        object.__setattr__(self, "should_reset", bool(self.should_reset))
+
+    def robot(self, name: str) -> RobotObs:
+        """Return the typed observation view of one articulation."""
+        return self.obs.robot(name)
 
 
 @dataclass(frozen=True)

@@ -32,7 +32,7 @@ class MinimalTask(TaskEnv):
     def observe(self, state):
         self._log("task.observe")
         self.observed.append(state)
-        return state.obs_cache["proprio"].clone()
+        return state.obs.robot("robot").joint_pos.clone()
 
     def reward(self, transition):
         self._log("task.reward")
@@ -77,7 +77,7 @@ class QueuedTask(MinimalTask):
 
 class ObserveOnly(TaskEnv):
     def observe(self, state):
-        return state.obs_cache["proprio"].clone()
+        return state.obs.robot("robot").joint_pos.clone()
 
 
 class RewardOnly(TaskEnv):
@@ -167,8 +167,8 @@ def test_ordering_reward_termination_and_final_obs_before_reset() -> None:
 
     pre_reset_state = task.observed[observed_before]
     post_reset_state = task.observed[observed_before + 1]
-    pre_reset_obs = pre_reset_state.obs_cache["proprio"]
-    post_reset_obs = post_reset_state.obs_cache["proprio"]
+    pre_reset_obs = pre_reset_state.obs.robot("robot").joint_pos
+    post_reset_obs = post_reset_state.obs.robot("robot").joint_pos
     assert info["final_observation"].shape == (1, 3)
     assert torch.equal(info["final_observation"], pre_reset_obs[[0]])
     assert torch.equal(obs[0], post_reset_obs[0])
@@ -327,7 +327,7 @@ def test_runner_reset_on_termination_must_be_caller_owned() -> None:
         MinimalTask(run)
 
 
-def test_step_state_t_and_extra_keys_match_core_semantics() -> None:
+def test_step_state_clock_and_typed_obs_match_core_semantics() -> None:
     run = FakeRun(num_envs=2, obs_dim=3)
     task = MinimalTask(run)
     task.reset()
@@ -336,13 +336,13 @@ def test_step_state_t_and_extra_keys_match_core_semantics() -> None:
     _, _, _, _, info = task.step(torch.zeros(2, 2))
     state = info["state"]
     assert state.t == 0
-    assert {"step", "episode", "clock", "reset_env_ids", "should_reset"} <= set(state.extra)
-    assert state.extra["step"].shape == (2,)
-    assert state.extra["episode"].shape == (2,)
-    assert state.extra["clock"].shape == (2,)
-    assert state.extra["reset_env_ids"].dtype is torch.int64
-    assert state.extra["reset_env_ids"].shape == (0,)
-    assert state.extra["should_reset"] is False
+    assert state.episode_id.tolist() == [1, 1]
+    assert state.time_in_episode.shape == (2,)
+    assert state.reset_env_ids.dtype is torch.int64
+    assert state.reset_env_ids.shape == (0,)
+    assert state.should_reset is False
+    assert state.obs.robot("robot").joint_pos.shape == (2, 3)
+    assert state.robot("robot").joint_pos is state.obs.robot("robot").joint_pos
 
     _, _, _, _, info = task.step(torch.zeros(2, 2))
     assert info["state"].t == 1
@@ -391,16 +391,16 @@ def test_core_terminated_must_be_all_false() -> None:
         task.step(torch.zeros(2, 2))
 
 
-def test_state_extra_and_obs_cache_are_observed() -> None:
+def test_typed_state_and_obs_are_observed() -> None:
     run = FakeRun(num_envs=2, obs_dim=3)
     task = MinimalTask(run)
     task.reset()
     task.step(torch.zeros(2, 2))
 
     first = task.observed[0]
-    assert first.extra["step"].shape == (2,)
-    assert first.extra["episode"].tolist() == [1, 1]
-    assert first.obs_cache["proprio"].shape == (2, 3)
+    assert first.episode_id.tolist() == [1, 1]
+    assert first.time_in_episode.shape == (2,)
+    assert first.obs.robot("robot").joint_pos.shape == (2, 3)
     assert first.t == 0
     with pytest.raises(FrozenInstanceError):
         first.t = 5  # type: ignore[misc]
@@ -500,7 +500,10 @@ def test_on_step_runs_once_before_observe_with_pre_reset_state() -> None:
     assert len(task.step_calls) == 1
     action, state = task.step_calls[0]
     assert torch.equal(action, flat)
-    assert state is task.observed[-1]
+    assert torch.equal(
+        state.obs.robot("robot").joint_pos,
+        task.observed[-1].obs.robot("robot").joint_pos,
+    )
     assert log == ["runner.step", "env.advance", "task.on_step", "task.observe", "task.reward"]
 
 
@@ -519,7 +522,10 @@ def test_on_step_is_not_called_on_reset_and_precedes_post_reset_observe() -> Non
 
     assert len(task.step_calls) == 1
     _, state = task.step_calls[0]
-    assert state is task.observed[observed_before]
+    assert torch.equal(
+        state.obs.robot("robot").joint_pos,
+        task.observed[observed_before].obs.robot("robot").joint_pos,
+    )
     assert len(task.observed) == observed_before + 2
     assert log == [
         "runner.step",
@@ -604,7 +610,7 @@ def test_registering_a_buffer_without_pushing_changes_nothing() -> None:
     task = BufferTask(run, buffer=buffer, log=log)
 
     obs, _ = task.reset()
-    assert torch.equal(obs, run.env.obs_cache["proprio"])
+    assert torch.equal(obs, run.env.obs.robot("robot").joint_pos)
     log.clear()
 
     task.step(torch.zeros(2, 2))

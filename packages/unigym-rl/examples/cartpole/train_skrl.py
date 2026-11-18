@@ -1,7 +1,9 @@
 """Manual skrl PPO demo loop for the fixed-base CartPole task.
 
 This script is deliberately not a trainer: it parses the shared CLI options,
-builds the real MuJoCo env through :func:`task.make_cartpole_gym`, wraps it with
+builds the real env through :func:`task.make_cartpole_gym` (MuJoCo-only; the
+``--backend`` flag is forwarded so a non-MuJoCo choice fails in core with its own
+teaching error), wraps it with
 ``skrl.envs.wrappers.torch.wrap_env``, and runs a hand-written
 ``act`` / ``record_transition`` / ``update`` loop with a tiny PPO policy and
 value net.  There is no checkpointing, logging framework or convergence promise.
@@ -118,6 +120,7 @@ def main(argv: list[str] | None = None) -> int:
         max_steps=options.env.max_episode_steps,
         device=options.env.device,
         seed=options.env.seed,
+        backend=options.env.backend,
     )
     env = wrap_env(gym_env, wrapper="gymnasium", verbose=False)
     try:

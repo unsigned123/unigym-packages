@@ -1,7 +1,10 @@
 # unigym-rl
 
 L2 task-environment layer over [`unigym`](https://github.com/unsigned123/unigym)
-core.
+core. This package is developed and released in
+`packages/unigym-rl` of
+[`unigym-packages`](https://github.com/unsigned123/unigym-packages); core stays
+in its own repository.
 
 ```text
 core Run / ExternalRunner / reset / state
@@ -103,12 +106,18 @@ file. Termination ownership is fixed: every run declares
 exposes no way to override either.
 
 ```python
+from unigym.robots.base import RobotProfile
+from unigym.runtime.actions import OrderedActionSpec, PolicyBinding
 from unigym.world import World
 from unigym_rl import EnvSpec
 
 spec = EnvSpec(
-    world=World.base(mjcf="robot.xml"),
-    robot={"name": "my_robot", "actuation": [...]},
+    world=World.flat(),                      # environment only: no robot, no world_base
+    robot=RobotProfile(...),                 # complete profile (joints/assets/actuation)
+    spawn={"pos": (0.0, 0.0, 0.4)},          # run-owned robot root spawn
+    action_spec=OrderedActionSpec(...),      # explicit; never inferred from body
+    policies=(PolicyBinding(...),),          # explicit adapter ownership
+    observations={"robot": ["go2"]},         # config-declared typed sources
     num_envs=4,
     inspect=True,
 )
@@ -119,8 +128,30 @@ task = spec.make_task(MyTask)       # fresh run + task; caller closes both
 
 `make_task` validates that its argument is a `TaskEnv` subclass.
 `make_gym` imports `GymTaskEnv` lazily, so importing `unigym_rl` or using
+`EnvSpec` requires an explicit `World`, `RobotProfile`, `OrderedActionSpec`,
+`PolicyBinding` tuple and `observations` declaration; it never constructs a
+World, infers an action layout or guesses observation sources.
 `EnvSpec` never imports `gymnasium`. `make_run` returns a fresh `Run` on every
 call and never builds the backend.
+
+### Typed observation state
+
+`TaskState.obs` is the core immutable `ObsSnapshot`; `TaskState.robot(name)` is
+a convenience for `state.obs.robot(name)`. Task code reads typed views and
+never parses artifact strings:
+
+```python
+robot = state.obs.robot("go2")
+obs = torch.cat((robot.base_lin_vel_b, robot.base_ang_vel_b, robot.gravity_b), dim=1)
+feet = state.obs.contact("feet").any()
+command = state.obs.command.value
+prev_action = state.obs.prev_action.value
+```
+
+The observation sources are declared once by `EnvSpec(observations=...)` (or
+the core run config) and the core resolves the names. `TaskState` also carries
+`episode_id`, `time_in_episode`, `reset_env_ids` and `should_reset`; there is
+no raw observation cache or `extra` record.
 
 ### Action history: `RingBuffer` + `on_step`
 
@@ -165,8 +196,12 @@ opts = parse_args()  # or parse_args(["--num-envs", "4"])
 spec = EnvSpec(
     world=world,
     robot=robot,
+    action_spec=action_spec,
+    policies=policies,
+    observations={"robot": [robot.name]},
     num_envs=opts.env.num_envs,
     device=opts.env.device,
+    backend=opts.env.backend,
     seed=opts.env.seed,
 )
 task = spec.make_task(MyTask, max_steps=opts.env.max_episode_steps)
@@ -175,21 +210,85 @@ task = spec.make_task(MyTask, max_steps=opts.env.max_episode_steps)
 
 ```bash
 python train.py --num-envs 8 --max-episode-steps 500 --device cpu \
-  --seed 0 --max-iterations 1000 --rollout-steps 64
+  --backend mujoco --seed 0 --max-iterations 1000 --rollout-steps 64
 ```
 
 Hyphenated flags are canonical; underscore aliases (`--num_envs`,
 `--max_episode_steps`, `--max_iterations`, `--rollout_steps`) behave
 identically. Defaults: `num_envs=8`, `max_episode_steps=500`, `device="cpu"`,
-`seed=0`, `max_iterations=1000`, `rollout_steps=64`. Positive-int fields reject
-values below 1 both on the CLI and in direct dataclass construction; an empty
-`device` is rejected.
+`backend="mujoco"`, `seed=0`, `max_iterations=1000`, `rollout_steps=64`.
+Positive-int fields reject values below 1 both on the CLI and in direct
+dataclass construction; empty `device` and `backend` strings are rejected.
 
-Parameter ownership: `num_envs` / `device` / `seed` go to `EnvSpec`;
-`max_episode_steps` is the task truncation budget; `max_iterations` /
+`--backend` selects the simulation backend (`mujoco`, `isaaclab2`,
+`isaaclab3`); the core layer validates the backend name, while engine
+import/availability is checked later at backend build time. IsaacLab2 still
+requires its Kit/AppLauncher bootstrap before importing the backend. For
+example:
+
+```bash
+--backend mujoco --device cpu
+--backend isaaclab2 --device cuda:0
+```
+
+Parameter ownership: `num_envs` / `device` / `backend` / `seed` go to
+`EnvSpec`; `max_episode_steps` is the task truncation budget; `max_iterations` /
 `rollout_steps` are reserved for a future trainer. The parser never constructs
 an `EnvSpec`, `World`, robot, task, or trainer, and no CLI value is propagated
 to `TaskEnv.reset`.
+
+## Optional task managers
+
+R3 adds two optional, pure-Python helpers: `RewardManager` and
+`TerminationManager`. They are sugar only: users may import them, or ignore
+them and implement `reward` / `terminated` / `truncated` directly. There is no
+new env type, no manager config or registry, no automatic reset, and no
+training loop. Managers keep no per-step state; every call is a pure function
+of the `Transition` it receives.
+
+```python
+from unigym_rl import RewardManager, RewardTerm, TerminationManager, TerminationTerm
+
+
+class MyTask(TaskEnv):
+    def on_bind(self, context):
+        self.rewards = RewardManager(
+            (
+                RewardTerm("upright", upright_bonus, weight=1.0),
+                RewardTerm("effort", effort_penalty, weight=0.01),
+            ),
+            clip=(-10.0, 10.0),
+        )
+        self.terminations = TerminationManager(
+            (
+                TerminationTerm("fallen", fall_mask),
+                TerminationTerm("timeout", timeout_mask, mode="truncated"),
+            )
+        )
+
+    def reward(self, transition):
+        return self.rewards(transition)
+
+    def terminated(self, transition):
+        return self.terminations(transition).terminated
+
+    def truncated(self, transition):
+        return self.terminations(transition).truncated
+
+    def termination_reasons(self, transition, terminated, truncated):
+        return self.terminations(transition).reasons
+```
+
+- Reward terms must return a 1-D floating tensor and termination terms a 1-D
+  bool tensor. The managers do not know `num_envs`; `TaskEnv` still validates
+  the final `(N,)` shape.
+- `breakdown(transition)` returns the weighted tensor of each enabled reward
+  term for logging; `clip` affects only the total.
+- `TerminationResult.reasons` keeps every term's raw mask. The manager does
+  not merge core episode-clock due ids; `TaskEnv` still computes
+  `truncated = (core_due | task_truncated) & ~task_terminated`.
+- Names, terms, weights, `clip` and modes are validated at construction;
+  `unigym_rl.managers` imports only `torch` and `unigym_rl` itself.
 
 ## Examples
 
@@ -198,11 +297,21 @@ to `TaskEnv.reset`.
   with a passive observed pole, optional randomized resets via
   `set_joint_state` + `settle`, and a manual skrl PPO loop. It is repo-only and
   is not installed into the wheel; see `examples/cartpole/README.md`.
+- `examples/go2_velocity/` — a flat-ground Go2 velocity-tracking smoke: the
+  installed `unigym-robots` pack profile, a 48-column observation, per-env
+  commands, tracking/alive rewards, task-owned tilt/height/time termination,
+  and an 8-env manual skrl PPO loop. It requires
+  `unigym-robots download --set mjcf-v0` for MuJoCo (or
+  `--set usd-go2-v0` for `--backend isaaclab2`); assets are never
+  auto-downloaded. See `examples/go2_velocity/README.md`.
 
 ## Installing / testing
 
-Core is not on PyPI yet. Install `unigym` from a checkout and install this
-package against it:
+`unigym-rl` is developed and released from
+`packages/unigym-rl` in the
+[`unigym-packages`](https://github.com/unsigned123/unigym-packages)
+repository. Core is not on PyPI yet, so install `unigym` from a checkout and
+install this package against it from `packages/unigym-rl`:
 
 ```bash
 git clone https://github.com/unsigned123/unigym ../unigym-core
@@ -226,7 +335,8 @@ python -m ruff format --check packages/unigym-rl/src packages/unigym-rl/tests pa
 ```
 
 Releases declare a core range in `pyproject.toml`
-(`unigym>=0.106,<0.107`); see `COMPATIBILITY.md` at the repository root.
+(`unigym>=0.106,<0.107`) and are tagged `unigym-rl-v<version>`; see
+`COMPATIBILITY.md` at the repository root.
 
 ## External termination mode
 
@@ -257,7 +367,7 @@ a safe default.
 ```python
 class MyTask(TaskEnv):
     def observe(self, state):            # required -> (N, obs_dim) tensor
-        return state.obs_cache["proprio"]
+        return state.obs.robot("go2").joint_pos
 
     def reward(self, transition):        # required -> (N,) tensor
         return torch.zeros(self.num_envs)
@@ -317,6 +427,7 @@ src/unigym_rl/
   context.py        # TaskContext / TaskState / Transition / EpisodeEnd
   spec.py           # programmatic external-termination Run builder (R2.5)
   buffers.py        # per-env RingBuffer history (R2.5)
+  managers.py       # optional RewardManager / TerminationManager (R3)
   cli.py            # optional argparse option dataclasses (R2.6)
   task.py           # TaskEnv + reset/step driver
   gym.py            # optional Gymnasium VectorEnv wrapper (lazy)
@@ -335,4 +446,5 @@ tests/
   test_spec.py              # programmatic EnvSpec (R2.5)
   test_buffers.py           # RingBuffer history (R2.5)
   test_cli.py               # optional CLI option sugar (R2.6)
+  test_managers.py          # optional reward/termination managers (R3)
 ```

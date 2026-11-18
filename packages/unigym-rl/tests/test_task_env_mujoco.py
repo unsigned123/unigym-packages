@@ -68,6 +68,7 @@ def _make_run(num_envs: int) -> Run:
     return Run(
         world=World.base(mjcf=FIXTURE_MJCF),
         robot={"name": ARTICULATION, "actuation": ACTUATION},
+        observations={"robot": [ARTICULATION]},
         backend="mujoco",
         num_envs=num_envs,
         termination_mode="external",
@@ -82,7 +83,7 @@ class TinyArmTask(TaskEnv):
     """Deterministic task over the real tiny-arm articulation.
 
     ``observe`` concatenates the policy-ordered joint position and velocity
-    rows from ``state.extra``.  ``terminated`` fires when the shoulder angle
+    rows from ``state.obs``.  ``terminated`` fires when the shoulder angle
     crosses ``shoulder_limit``; ``truncated`` fires only when a test declares
     a per-env tick limit.
     """
@@ -101,13 +102,12 @@ class TinyArmTask(TaskEnv):
         self._shoulder_limit = float(shoulder_limit)
         self._truncate_env = truncate_env
         self._truncate_tick = truncate_tick
-        self._pos_key = f"articulation/{ARTICULATION}/joint_pos"
-        self._vel_key = f"articulation/{ARTICULATION}/joint_vel"
         super().__init__(run)
 
     def observe(self, state: TaskState) -> torch.Tensor:
         """Flat ``(N, 4)`` = joint positions then joint velocities."""
-        return torch.cat([state.extra[self._pos_key], state.extra[self._vel_key]], dim=-1)
+        robot = state.robot(ARTICULATION)
+        return torch.cat([robot.joint_pos, robot.joint_vel], dim=-1)
 
     def reward(self, transition: Transition) -> torch.Tensor:
         """Deterministic cost: the negative absolute joint positions."""
@@ -115,7 +115,7 @@ class TinyArmTask(TaskEnv):
 
     def terminated(self, transition: Transition) -> torch.Tensor:
         """Terminate when the shoulder leaves the configured band."""
-        shoulder = transition.info.extra[self._pos_key][:, 0]
+        shoulder = transition.info.robot(ARTICULATION).joint_pos[:, 0]
         return shoulder.abs() > self._shoulder_limit
 
     def truncated(self, transition: Transition) -> torch.Tensor:
