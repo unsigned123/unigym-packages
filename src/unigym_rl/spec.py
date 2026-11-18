@@ -9,6 +9,7 @@ lazy: ``make_run`` only declares intent and never builds the backend.
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -43,6 +44,12 @@ class EnvSpec:
     owns its lifecycle.  ``episode_length_s=None`` (the default) disables the
     core episode clock: task code, normally ``max_steps``, is the only time
     authority.
+
+    ``contacts`` is an explicit tuple of run-level contact group mappings.  It
+    is passed through unchanged to the core ``Run`` top-level ``contacts:``
+    schema (``list(self.contacts)``), which publishes one ``contact/<name>``
+    record key per group.  An empty tuple (the default) declares no contact
+    groups, so no contact keys are produced.
     """
 
     world: World
@@ -50,6 +57,7 @@ class EnvSpec:
     action_spec: OrderedActionSpec
     policies: tuple[PolicyBinding, ...]
     spawn: Mapping[str, object] | None = None
+    contacts: tuple[Mapping[str, object], ...] = ()
     num_envs: int = 1
     device: str | None = None
     backend: str = "mujoco"
@@ -89,12 +97,58 @@ class EnvSpec:
                 f"{type(self.spawn).__name__} | hint: the run owns the robot "
                 "spawn; the world never declares one"
             )
+        object.__setattr__(self, "contacts", self._validate_contacts())
         if isinstance(self.num_envs, bool) or not isinstance(self.num_envs, int):
             raise TaskConfigError(
                 f"EnvSpec: num_envs must be an int, got {type(self.num_envs).__name__}"
             )
         if self.num_envs < 1:
             raise TaskConfigError(f"EnvSpec: num_envs must be >= 1, got {self.num_envs}")
+
+    def _validate_contacts(self) -> tuple[dict[str, object], ...]:
+        """Validate the contact declaration against the core contact schema.
+
+        The outer container must be a tuple (no silent list coercion) and every
+        entry must be a non-empty mapping.  Entries with plain body lists are
+        parsed by the core ``ContactGroupSpec`` immediately; entries still in
+        the declarative reference form (``{contact_group: ...}`` /
+        ``{prop: ...}``) are only shape-checked here because they can only be
+        resolved against the built run's body inventory.
+        """
+        from unigym.contacts.base import ContactGroupSpec
+
+        if not isinstance(self.contacts, tuple):
+            raise TaskConfigError(
+                "EnvSpec: contacts must be a tuple of mappings, got "
+                f"{type(self.contacts).__name__} | hint: this is the run "
+                "top-level `contacts:` list (one mapping per contact group)"
+            )
+        normalized: list[dict[str, object]] = []
+        for index, entry in enumerate(self.contacts):
+            if not isinstance(entry, Mapping):
+                raise TaskConfigError(
+                    f"EnvSpec: contacts[{index}] must be a mapping (one run "
+                    f"top-level `contacts:` entry), got {type(entry).__name__}"
+                )
+            if not entry:
+                raise TaskConfigError(
+                    f"EnvSpec: contacts[{index}] must not be empty | hint: a "
+                    "contact group needs at least name, sensor_bodies and frame"
+                )
+            payload = copy.deepcopy(dict(entry))
+            reference_form = any(
+                isinstance(payload.get(key), Mapping) for key in ("sensor_bodies", "filter_bodies")
+            )
+            if not reference_form:
+                try:
+                    ContactGroupSpec.from_yaml(payload)
+                except (TypeError, ValueError) as exc:
+                    raise TaskConfigError(
+                        f"EnvSpec: contacts[{index}] is not a valid run "
+                        f"top-level `contacts:` entry: {exc}"
+                    ) from exc
+            normalized.append(payload)
+        return tuple(normalized)
 
     def make_run(self) -> Run:
         """Build a fresh, lazy ``Run`` with task-owned termination and resets."""
@@ -104,6 +158,7 @@ class EnvSpec:
             world=self.world,
             robot=self.robot,
             spawn=self.spawn,
+            contacts=list(self.contacts) if self.contacts else None,
             action_spec=self.action_spec,
             policies=self.policies,
             backend=self.backend,

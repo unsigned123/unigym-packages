@@ -39,10 +39,14 @@ if TYPE_CHECKING:
 __all__ = [
     "ACTION_JOINTS",
     "COMMAND_RANGES",
+    "FEET_AIR_TIME_THRESHOLD",
+    "FEET_AIR_TIME_WEIGHT",
     "GO2_ACTION_GROUP",
     "GO2_ACTION_SPEC",
     "GO2_ARTICULATION",
+    "GO2_CONTACTS",
     "GO2_DEFAULT_JOINT_POS",
+    "GO2_FEET_BODIES",
     "GO2_JOINTS",
     "GO2_POLICIES",
     "GO2_PROFILE_ID",
@@ -99,6 +103,34 @@ COMMAND_RANGES = ((-0.6, 0.8), (-0.4, 0.4), (-0.8, 0.8))
 TILT_GRAVITY_Z = -0.5
 LOW_HEIGHT_LIMIT = 0.18
 
+#: Canonical Go2 foot bodies: the four calf links (``profile.foot_bodies``).
+GO2_FEET_BODIES = ("FL_calf", "FR_calf", "RL_calf", "RR_calf")
+
+#: Explicit run-level contact groups.  Every group owns the ``go2``
+#: articulation, reports boolean contact in the world frame against a 1 N
+#: threshold, and publishes ``contact/feet`` (N, 4) / ``contact/base`` (N, 1).
+GO2_CONTACTS = (
+    {
+        "name": "feet",
+        "articulation": GO2_ARTICULATION,
+        "sensor_bodies": list(GO2_FEET_BODIES),
+        "frame": "world",
+        "format": "contact",
+        "threshold": 1.0,
+    },
+    {
+        "name": "base",
+        "articulation": GO2_ARTICULATION,
+        "sensor_bodies": ["base"],
+        "frame": "world",
+        "format": "contact",
+        "threshold": 1.0,
+    },
+)
+
+FEET_CONTACT_KEY = "contact/feet"
+BASE_CONTACT_KEY = "contact/base"
+
 #: Run-owned robot root spawn (metres); the world never declares one.
 GO2_SPAWN = {"pos": (0.0, 0.0, 0.4)}
 
@@ -108,6 +140,12 @@ ALIVE_WEIGHT = 0.5
 ACTION_RATE_WEIGHT = 0.01
 LIN_TRACKING_SIGMA = 0.25
 YAW_TRACKING_SIGMA = 0.25
+
+#: Official-style air-time shaping: one bonus per first touchdown, only while
+#: the planar command is non-trivial.
+FEET_AIR_TIME_WEIGHT = 0.25
+FEET_AIR_TIME_THRESHOLD = 0.5
+COMMAND_XY_EPS = 0.1
 
 # The action group keeps its physical name (``legs``) while the articulation is
 # ``go2``: recorded state keys are namespaced by the articulation
@@ -153,6 +191,7 @@ def make_go2_velocity_spec(
         spawn=GO2_SPAWN,
         action_spec=GO2_ACTION_SPEC,
         policies=GO2_POLICIES,
+        contacts=GO2_CONTACTS,
         num_envs=num_envs,
         device=device,
         backend=backend,
@@ -179,10 +218,13 @@ class Go2VelocityTask(TaskEnv):
     - command ``[vx, vy, yaw_rate]`` (3)
 
     Reward is an exponential linear-velocity tracker plus an exponential
-    yaw-rate tracker, a constant alive bonus and an action-rate penalty.
-    ``terminated`` fires on a gravity tilt or a low base height; ``truncated``
-    fires when this env's own step counter reaches ``max_steps``.  The runner
-    never auto-resets; ``TaskEnv`` resets only the done rows.
+    yaw-rate tracker, a constant alive bonus, an action-rate penalty and the
+    official-style ``feet_air_time`` first-touchdown bonus (weight ``0.25``,
+    threshold ``0.5`` s, zero while ``||command_xy|| <= 0.1``).
+    ``terminated`` fires on a gravity tilt, a low base height or any ``base``
+    contact; ``truncated`` fires when this env's own step counter reaches
+    ``max_steps``.  The runner never auto-resets; ``TaskEnv`` resets only the
+    done rows.  This is not a convergence or official-parity claim.
     """
 
     obs_dim = OBS_DIM
@@ -208,6 +250,26 @@ class Go2VelocityTask(TaskEnv):
         )
         self._action_rate = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
         self._step_count = torch.zeros(self.num_envs, dtype=torch.int64, device=self.device)
+        self._init_contact_state()
+
+    def _init_contact_state(self) -> None:
+        """Allocate the task-local per-foot contact timers (seconds)."""
+        width = len(GO2_FEET_BODIES)
+        self._air_time = torch.zeros(
+            (self.num_envs, width), dtype=torch.float32, device=self.device
+        )
+        self._contact_time = torch.zeros(
+            (self.num_envs, width), dtype=torch.float32, device=self.device
+        )
+        self._last_air_time = torch.zeros(
+            (self.num_envs, width), dtype=torch.float32, device=self.device
+        )
+        self._prev_contact = torch.zeros(
+            (self.num_envs, width), dtype=torch.bool, device=self.device
+        )
+        self._first_contact = torch.zeros(
+            (self.num_envs, width), dtype=torch.bool, device=self.device
+        )
 
     # ------------------------------------------------------------------ #
     # read-only task state (tests/debugging)
@@ -221,6 +283,26 @@ class Go2VelocityTask(TaskEnv):
     def step_count(self) -> torch.Tensor:
         """The env-local truncation counters."""
         return self._step_count
+
+    @property
+    def air_time(self) -> torch.Tensor:
+        """Seconds each foot has been airborne (``(num_envs, 4)``)."""
+        return self._air_time
+
+    @property
+    def contact_time(self) -> torch.Tensor:
+        """Seconds each foot has been in contact (``(num_envs, 4)``)."""
+        return self._contact_time
+
+    @property
+    def last_air_time(self) -> torch.Tensor:
+        """Air time of each foot's most recent completed flight phase."""
+        return self._last_air_time
+
+    @property
+    def first_contact(self) -> torch.Tensor:
+        """Per-foot mask of the touchdowns observed in the last step."""
+        return self._first_contact
 
     # ------------------------------------------------------------------ #
     # hooks
@@ -295,7 +377,7 @@ class Go2VelocityTask(TaskEnv):
         )
 
     def reward(self, transition: Transition) -> torch.Tensor:
-        """Velocity/yaw tracking, alive bonus and action-rate penalty."""
+        """Velocity/yaw tracking, alive bonus, action-rate and air-time terms."""
         articulation = transition.info.articulation(GO2_ARTICULATION)
         base_lin_vel = self._vector(articulation, "base_lin_vel_b")
         base_ang_vel = self._vector(articulation, "base_ang_vel_b")
@@ -306,11 +388,27 @@ class Go2VelocityTask(TaskEnv):
             + YAW_TRACKING_WEIGHT * torch.exp(-yaw_error / YAW_TRACKING_SIGMA)
             + ALIVE_WEIGHT
             - ACTION_RATE_WEIGHT * self._action_rate
+            + FEET_AIR_TIME_WEIGHT * self._feet_air_time_reward()
         )
 
+    def _feet_air_time_reward(self) -> torch.Tensor:
+        """Official-style first-touchdown air-time bonus, zero on zero command.
+
+        Reads the per-step ``_last_air_time`` / ``_first_contact`` state
+        computed in :meth:`on_step`; it never re-reads the simulator.
+        """
+        reward = (self._last_air_time - FEET_AIR_TIME_THRESHOLD) * self._first_contact
+        reward = reward.sum(dim=1)
+        moving = self._command[:, :2].norm(dim=1) > COMMAND_XY_EPS
+        return reward * moving.to(reward.dtype)
+
     def terminated(self, transition: Transition) -> torch.Tensor:
-        """Terminate on a gravity tilt or a low base height."""
-        return self._tilt_mask(transition) | self._low_height_mask(transition)
+        """Terminate on a gravity tilt, a low base or any base contact."""
+        return (
+            self._tilt_mask(transition)
+            | self._low_height_mask(transition)
+            | (self._base_contact_mask(transition))
+        )
 
     def truncated(self, transition: Transition) -> torch.Tensor:
         """Truncate when this env's own step counter reaches ``max_steps``."""
@@ -323,20 +421,22 @@ class Go2VelocityTask(TaskEnv):
         terminated: torch.Tensor,
         truncated: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        """Named masks for tilt, low height and the time limit."""
+        """Named masks for tilt, low height, base contact and the time limit."""
         return {
             "tilt": self._tilt_mask(transition) & terminated,
             "low_height": self._low_height_mask(transition) & terminated,
+            "base_contact": self._base_contact_mask(transition) & terminated,
             "time_limit": truncated,
         }
 
     def on_step(self, action: torch.Tensor, state: TaskState) -> None:
-        """Record the action-rate penalty, previous action and step clock."""
-        del state
+        """Record action rate, previous action, step clock and foot timers."""
         delta = action - self._prev_action
         self._action_rate = (delta * delta).sum(dim=1)
         self._prev_action = action.detach().clone().to(self.device, torch.float32)
         self._step_count += 1
+        contact = self._contact_tensor(state, FEET_CONTACT_KEY, len(GO2_FEET_BODIES))
+        self._update_contact_timers(contact)
 
     def on_reset(self, env_ids: torch.Tensor, state: TaskState) -> None:
         """Sample a new command and clear this env's task-owned episode state."""
@@ -355,6 +455,53 @@ class Go2VelocityTask(TaskEnv):
             self._prev_action[env_ids] = 0.0
             self._action_rate[env_ids] = 0.0
             self._step_count[env_ids] = 0
+            self._air_time[env_ids] = 0.0
+            self._contact_time[env_ids] = 0.0
+            self._last_air_time[env_ids] = 0.0
+            self._prev_contact[env_ids] = False
+            self._first_contact[env_ids] = False
+
+    # ------------------------------------------------------------------ #
+    # contact timers
+    # ------------------------------------------------------------------ #
+    def _contact_tensor(self, state: TaskState, key: str, width: int) -> torch.Tensor:
+        """Read one published ``contact/<name>`` group as a bool ``(N, width)``."""
+        if key not in state.extra:
+            raise TaskConfigError(
+                f"Go2VelocityTask: TaskState.extra is missing {key!r} | hint: "
+                "declare the matching group through EnvSpec(contacts=...) so "
+                "the run publishes it every step"
+            )
+        value = state.extra[key]
+        if not isinstance(value, torch.Tensor):
+            raise TaskConfigError(
+                f"Go2VelocityTask: extra[{key!r}] must be a torch.Tensor, "
+                f"got {type(value).__name__}"
+            )
+        if value.dtype is not torch.bool:
+            raise TaskConfigError(
+                f"Go2VelocityTask: extra[{key!r}] must be bool (contact "
+                f"format), got {value.dtype}"
+            )
+        expected = (self.num_envs, width)
+        if tuple(value.shape) != expected:
+            raise TaskConfigError(
+                f"Go2VelocityTask: extra[{key!r}] must have shape {expected}, "
+                f"got {tuple(value.shape)}"
+            )
+        return value
+
+    def _update_contact_timers(self, contact: torch.Tensor) -> None:
+        """Advance the air/contact timers from this step's foot contact mask."""
+        first_contact = contact & ~self._prev_contact
+        dt = self.control_dt
+        self._last_air_time[first_contact] = self._air_time[first_contact] + dt
+        self._air_time = torch.where(contact, torch.zeros_like(self._air_time), self._air_time + dt)
+        self._contact_time = torch.where(
+            contact, self._contact_time + dt, torch.zeros_like(self._contact_time)
+        )
+        self._prev_contact = contact
+        self._first_contact = first_contact
 
     # ------------------------------------------------------------------ #
     # masks
@@ -366,6 +513,10 @@ class Go2VelocityTask(TaskEnv):
     def _low_height_mask(self, transition: Transition) -> torch.Tensor:
         articulation = transition.info.articulation(GO2_ARTICULATION)
         return self._vector(articulation, "base_pos_w")[:, 2] < LOW_HEIGHT_LIMIT
+
+    def _base_contact_mask(self, transition: Transition) -> torch.Tensor:
+        contact = self._contact_tensor(transition.info, BASE_CONTACT_KEY, 1)
+        return contact.any(dim=1)
 
 
 def make_go2_velocity_task(

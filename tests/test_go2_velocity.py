@@ -174,7 +174,12 @@ def test_one_env_reset_and_step_are_finite(one_env: Any) -> None:
         assert torch.isfinite(reward).all()
         assert terminated.shape == (1,) and terminated.dtype is torch.bool
         assert truncated.shape == (1,) and truncated.dtype is torch.bool
-        assert set(info["termination_reasons"]) == {"tilt", "low_height", "time_limit"}
+        assert set(info["termination_reasons"]) == {
+            "tilt",
+            "low_height",
+            "base_contact",
+            "time_limit",
+        }
 
 
 def test_command_is_resampled_and_visible_on_reset(one_env: Any) -> None:
@@ -244,6 +249,7 @@ def test_env_local_step_budget_truncates_with_time_limit_reason() -> None:
         assert info["termination_reasons"]["time_limit"].tolist() == [True, True]
         assert info["termination_reasons"]["tilt"].tolist() == [False, False]
         assert info["termination_reasons"]["low_height"].tolist() == [False, False]
+        assert info["termination_reasons"]["base_contact"].tolist() == [False, False]
 
         # Done rows were reset, so their own counter starts over.
         _, _, terminated, truncated, _ = env.step(_standby(2))
@@ -267,9 +273,249 @@ def test_eight_env_construction_and_one_step() -> None:
         assert torch.isfinite(reward).all()
         assert terminated.shape == (8,) and terminated.dtype is torch.bool
         assert truncated.shape == (8,) and truncated.dtype is torch.bool
-        assert set(info["termination_reasons"]) == {"tilt", "low_height", "time_limit"}
+        assert set(info["termination_reasons"]) == {
+            "tilt",
+            "low_height",
+            "base_contact",
+            "time_limit",
+        }
     finally:
         _close(env)
+
+
+# --------------------------------------------------------------------------- #
+# contact declaration, timers, air-time reward and base termination
+# --------------------------------------------------------------------------- #
+GO2_FEET_BODIES = go2_task.GO2_FEET_BODIES
+
+
+def _timer_task(*, num_envs: int = 2, control_dt: float = 0.1) -> Any:
+    """A task shell with only the task-local contact timers allocated."""
+    task = object.__new__(go2_task.Go2VelocityTask)
+    task.device = torch.device("cpu")
+    task.num_envs = int(num_envs)
+    task.control_dt = float(control_dt)
+    task._init_contact_state()
+    return task
+
+
+def _fake_transition(
+    *,
+    num_envs: int = 2,
+    feet: torch.Tensor | None = None,
+    base: torch.Tensor | None = None,
+    gravity_z: float = -1.0,
+    base_height: float = 0.4,
+) -> Any:
+    """A ``Transition`` carrying the ten articulation leaves plus contacts."""
+    zeros_joint = torch.zeros((num_envs, len(GO2_JOINTS)), dtype=torch.float32)
+    zeros_vec = torch.zeros((num_envs, 3), dtype=torch.float32)
+    gravity = zeros_vec.clone()
+    gravity[:, 2] = gravity_z
+    base_pos = zeros_vec.clone()
+    base_pos[:, 2] = base_height
+    extra: dict[str, Any] = {
+        "articulation/go2/joint_pos": zeros_joint.clone(),
+        "articulation/go2/joint_vel": zeros_joint.clone(),
+        "articulation/go2/applied_torque": zeros_joint.clone(),
+        "articulation/go2/base_pos_w": base_pos,
+        "articulation/go2/base_quat_w": torch.tensor(
+            [1.0, 0.0, 0.0, 0.0], dtype=torch.float32
+        ).repeat(num_envs, 1),
+        "articulation/go2/base_lin_vel_w": zeros_vec.clone(),
+        "articulation/go2/base_ang_vel_w": zeros_vec.clone(),
+        "articulation/go2/base_lin_vel_b": zeros_vec.clone(),
+        "articulation/go2/base_ang_vel_b": zeros_vec.clone(),
+        "articulation/go2/gravity_b": gravity,
+    }
+    if feet is not None:
+        extra["contact/feet"] = feet
+    if base is not None:
+        extra["contact/base"] = base
+    info = go2_task.TaskState(t=0, num_envs=num_envs, extra=extra, obs_cache={})
+    zeros = torch.zeros(num_envs, dtype=torch.bool)
+    return go2_task.Transition(
+        obs=torch.zeros((num_envs, 3), dtype=torch.float32),
+        action=torch.zeros((num_envs, len(GO2_JOINTS)), dtype=torch.float32),
+        next_obs=torch.zeros((num_envs, 3), dtype=torch.float32),
+        terminated=zeros,
+        truncated=zeros.clone(),
+        info=info,
+    )
+
+
+def test_contact_groups_are_explicit_and_reach_the_run_config() -> None:
+    """Go2 declares ``feet``/``base`` with explicit calf/base body names."""
+    assert [group["name"] for group in go2_task.GO2_CONTACTS] == ["feet", "base"]
+    feet, base = go2_task.GO2_CONTACTS
+    assert feet["articulation"] == GO2_ARTICULATION
+    assert feet["sensor_bodies"] == list(GO2_FEET_BODIES)
+    assert base["sensor_bodies"] == ["base"]
+    for group in go2_task.GO2_CONTACTS:
+        assert group["frame"] == "world"
+        assert group["format"] == "contact"
+        assert group["threshold"] == 1.0
+
+    _require_go2_assets()
+    spec = go2_task.make_go2_velocity_spec(num_envs=1)
+    assert spec.contacts == go2_task.GO2_CONTACTS
+    run = spec.make_run()
+    try:
+        assert run.spec.cfg["contacts"] == [dict(group) for group in go2_task.GO2_CONTACTS]
+    finally:
+        run.close()
+
+
+def test_contact_keys_and_shapes_on_reset_and_step(one_env: Any) -> None:
+    """MuJoCo publishes bool ``contact/feet`` (1, 4) and ``contact/base`` (1, 1)."""
+    _, info = one_env.reset()
+    for state in (info["state"], one_env.step(_standby(1))[4]["state"]):
+        feet = state.extra["contact/feet"]
+        base = state.extra["contact/base"]
+        assert feet.shape == (1, len(GO2_FEET_BODIES))
+        assert feet.dtype is torch.bool
+        assert base.shape == (1, 1)
+        assert base.dtype is torch.bool
+    assert one_env.air_time.shape == (1, len(GO2_FEET_BODIES))
+    assert one_env.last_air_time.shape == (1, len(GO2_FEET_BODIES))
+
+
+def test_air_time_marks_first_contact_once_and_keeps_contact_time() -> None:
+    """Two airborne ticks then contact: one first-contact, no refresh after."""
+    task = _timer_task(num_envs=2, control_dt=0.1)
+    airborne = torch.zeros((2, len(GO2_FEET_BODIES)), dtype=torch.bool)
+    in_contact = torch.ones_like(airborne)
+
+    task._update_contact_timers(airborne)
+    task._update_contact_timers(airborne)
+    torch.testing.assert_close(task.air_time, torch.full_like(task.air_time, 0.2))
+
+    task._update_contact_timers(in_contact)
+    assert task.first_contact.all()
+    # The flight phase spans the previous two ticks plus the contact tick.
+    torch.testing.assert_close(task.last_air_time, torch.full_like(task.last_air_time, 0.3))
+    torch.testing.assert_close(task.air_time, torch.zeros_like(task.air_time))
+    torch.testing.assert_close(task.contact_time, torch.full_like(task.contact_time, 0.1))
+
+    task._update_contact_timers(in_contact)
+    assert not task.first_contact.any()
+    torch.testing.assert_close(task.last_air_time, torch.full_like(task.last_air_time, 0.3))
+    torch.testing.assert_close(task.contact_time, torch.full_like(task.contact_time, 0.2))
+
+
+def test_air_time_on_step_reads_feet_contact_and_rejects_bad_shapes() -> None:
+    """``on_step`` reads ``contact/feet`` only, failing fast on bad input."""
+    task = _timer_task(num_envs=2, control_dt=0.05)
+    task._prev_action = torch.zeros((2, len(GO2_JOINTS)), dtype=torch.float32)
+    task._action_rate = torch.zeros(2, dtype=torch.float32)
+    task._step_count = torch.zeros(2, dtype=torch.int64)
+    feet = torch.ones((2, len(GO2_FEET_BODIES)), dtype=torch.bool)
+    state = go2_task.TaskState(t=0, num_envs=2, extra={"contact/feet": feet}, obs_cache={})
+
+    task.on_step(torch.zeros((2, len(GO2_JOINTS))), state)
+    assert task.first_contact.all()
+    torch.testing.assert_close(task.last_air_time, torch.full_like(task.last_air_time, 0.05))
+
+    with pytest.raises(go2_task.TaskConfigError, match="contact/feet"):
+        task.on_step(
+            torch.zeros((2, len(GO2_JOINTS))),
+            go2_task.TaskState(t=0, num_envs=2, extra={}, obs_cache={}),
+        )
+    with pytest.raises(go2_task.TaskConfigError, match="bool"):
+        task.on_step(
+            torch.zeros((2, len(GO2_JOINTS))),
+            go2_task.TaskState(t=0, num_envs=2, extra={"contact/feet": feet.float()}, obs_cache={}),
+        )
+    with pytest.raises(go2_task.TaskConfigError, match="shape"):
+        task.on_step(
+            torch.zeros((2, len(GO2_JOINTS))),
+            go2_task.TaskState(
+                t=0,
+                num_envs=2,
+                extra={"contact/feet": torch.ones((2, 3), dtype=torch.bool)},
+                obs_cache={},
+            ),
+        )
+
+
+def test_reset_clears_only_the_selected_contact_rows() -> None:
+    """``on_reset`` zeroes timers for ``env_ids`` and leaves other rows alone."""
+    task = _timer_task(num_envs=2, control_dt=0.1)
+    task._rng = torch.Generator().manual_seed(0)
+    task._command = torch.zeros((2, 3), dtype=torch.float32)
+    task._prev_action = torch.zeros((2, len(GO2_JOINTS)), dtype=torch.float32)
+    task._action_rate = torch.zeros(2, dtype=torch.float32)
+    task._step_count = torch.zeros(2, dtype=torch.int64)
+    airborne = torch.zeros((2, len(GO2_FEET_BODIES)), dtype=torch.bool)
+    for _ in range(2):
+        task._update_contact_timers(airborne)
+
+    state = go2_task.TaskState(t=0, num_envs=2, extra={}, obs_cache={})
+    task.on_reset(torch.tensor([1]), state)
+
+    torch.testing.assert_close(task.air_time[0], torch.full((4,), 0.2))
+    torch.testing.assert_close(task.air_time[1], torch.zeros(4))
+    torch.testing.assert_close(task.last_air_time[1], torch.zeros(4))
+    assert not task.first_contact[1].any()
+
+
+def test_feet_air_time_reward_signs_and_zero_command() -> None:
+    """First-contact bonus is signed, one-shot and zero on a near-zero command."""
+    task = _timer_task(num_envs=1, control_dt=0.1)
+    task._action_rate = torch.zeros(1, dtype=torch.float32)
+    task._command = torch.tensor([[0.5, 0.0, 0.0]], dtype=torch.float32)
+
+    task._last_air_time = torch.tensor([[0.8, 0.0, 0.0, 0.0]], dtype=torch.float32)
+    task._first_contact = torch.tensor([[True, False, False, False]])
+    torch.testing.assert_close(task._feet_air_time_reward(), torch.tensor([0.3]))
+
+    task._last_air_time = torch.tensor([[0.2, 0.0, 0.0, 0.0]], dtype=torch.float32)
+    torch.testing.assert_close(task._feet_air_time_reward(), torch.tensor([-0.3]))
+
+    task._last_air_time = torch.tensor([[0.8, 0.2, 0.0, 0.0]], dtype=torch.float32)
+    task._first_contact = torch.tensor([[True, True, False, False]])
+    torch.testing.assert_close(task._feet_air_time_reward(), torch.tensor([0.0]))
+
+    task._last_air_time = torch.tensor([[0.8, 0.0, 0.0, 0.0]], dtype=torch.float32)
+    task._first_contact = torch.tensor([[True, False, False, False]])
+    torch.testing.assert_close(task._feet_air_time_reward(), torch.tensor([0.3]))
+
+    task._first_contact = torch.zeros_like(task._first_contact)
+    torch.testing.assert_close(task._feet_air_time_reward(), torch.zeros(1))
+
+    task._first_contact = torch.tensor([[True, False, False, False]])
+    task._command = torch.tensor([[0.05, 0.05, 0.5]], dtype=torch.float32)
+    torch.testing.assert_close(task._feet_air_time_reward(), torch.zeros(1))
+
+    reward = task.reward(_fake_transition(num_envs=1, gravity_z=-1.0))
+    assert reward.shape == (1,) and torch.isfinite(reward).all()
+
+
+def test_base_contact_terminates_with_named_reason() -> None:
+    """Any true ``contact/base`` terminates and is reported as base_contact."""
+    task = _timer_task(num_envs=2)
+    task._command = torch.zeros((2, 3), dtype=torch.float32)
+    base = torch.tensor([[True], [False]])
+    transition = _fake_transition(num_envs=2, base=base)
+
+    terminated = task.terminated(transition)
+    assert terminated.tolist() == [True, False]
+    reasons = task.termination_reasons(
+        transition,
+        terminated,
+        torch.zeros(2, dtype=torch.bool),
+    )
+    assert reasons["base_contact"].tolist() == [True, False]
+    assert reasons["tilt"].tolist() == [False, False]
+    assert reasons["low_height"].tolist() == [False, False]
+
+
+def test_missing_base_contact_fails_fast() -> None:
+    """A task built without the base group must not silently ignore it."""
+    task = _timer_task(num_envs=1)
+    transition = _fake_transition(num_envs=1, base_height=0.4)
+    with pytest.raises(go2_task.TaskConfigError, match="contact/base"):
+        task.terminated(transition)
 
 
 def test_train_skrl_forwards_backend(monkeypatch: pytest.MonkeyPatch) -> None:
