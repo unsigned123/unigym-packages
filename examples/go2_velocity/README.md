@@ -121,6 +121,12 @@ PYTHONPATH=/data1/code/dlx/unigym-core:/data1/code/dlx/unigym-rl/src \
   --num-envs 1024 --max-iterations 1 --rollout-steps 4
 ```
 
+IsaacLab2 still needs its Kit/AppLauncher bootstrap before the backend is
+imported. This script does not start Kit itself; launch it through the IsaacLab
+environment/launcher wrapper (for example the dog `unigym-isaaclab232` entry
+point). A plain `python ... --backend isaaclab2` without that bootstrap fails
+with `No module named 'omni'`.
+
 The default is 8 envs, 500 max episode steps, 1000 iterations and 64 rollout
 steps. The script prints per-iteration mean reward and episode count. It does
 not checkpoint, log to a service, or claim convergence.

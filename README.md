@@ -211,7 +211,9 @@ Positive-int fields reject values below 1 both on the CLI and in direct
 dataclass construction; empty `device` and `backend` strings are rejected.
 
 `--backend` selects the simulation backend (`mujoco`, `isaaclab2`,
-`isaaclab3`); the core layer validates the name and its availability. For
+`isaaclab3`); the core layer validates the backend name, while engine
+import/availability is checked later at backend build time. IsaacLab2 still
+requires its Kit/AppLauncher bootstrap before importing the backend. For
 example:
 
 ```bash
