@@ -45,17 +45,23 @@ class EnvSpec:
     core episode clock: task code, normally ``max_steps``, is the only time
     authority.
 
+    ``observations`` is the run's top-level ``observations:`` declaration
+    (``{"robot": ["go2"], "contact": ["feet"], "command": True, ...}``).  Its
+    shape is validated here; names are resolved by the core builder against
+    the declared articulations/contacts/props/cameras/sites.
+
     ``contacts`` is an explicit tuple of run-level contact group mappings.  It
     is passed through unchanged to the core ``Run`` top-level ``contacts:``
-    schema (``list(self.contacts)``), which publishes one ``contact/<name>``
-    record key per group.  An empty tuple (the default) declares no contact
-    groups, so no contact keys are produced.
+    schema (``list(self.contacts)``), which declares the contact groups a
+    ``observations.contact`` selection can name.  An empty tuple (the default)
+    declares no contact groups.
     """
 
     world: World
     robot: RobotProfile
     action_spec: OrderedActionSpec
     policies: tuple[PolicyBinding, ...]
+    observations: Mapping[str, object]
     spawn: Mapping[str, object] | None = None
     contacts: tuple[Mapping[str, object], ...] = ()
     num_envs: int = 1
@@ -91,6 +97,7 @@ class EnvSpec:
                     f"EnvSpec: policies[{index}] must be a PolicyBinding, got "
                     f"{type(binding).__name__}"
                 )
+        object.__setattr__(self, "observations", self._validate_observations())
         if self.spawn is not None and not isinstance(self.spawn, Mapping):
             raise TaskConfigError(
                 "EnvSpec: spawn must be a mapping ({pos, yaw?}) or None, got "
@@ -104,6 +111,25 @@ class EnvSpec:
             )
         if self.num_envs < 1:
             raise TaskConfigError(f"EnvSpec: num_envs must be >= 1, got {self.num_envs}")
+
+    def _validate_observations(self) -> dict[str, object]:
+        """Validate the ``observations:`` declaration shape, not its names.
+
+        Name resolution is the core run builder's job: it knows the declared
+        articulations, contacts, props, cameras and sites.
+        """
+        from unigym.env.obs import ObsConfigError, ObservationConfig
+
+        if not isinstance(self.observations, Mapping):
+            raise TaskConfigError(
+                "EnvSpec: observations must be a mapping such as "
+                f"{{'robot': ['go2']}}, got {type(self.observations).__name__}"
+            )
+        try:
+            config = ObservationConfig.from_mapping(self.observations)
+        except ObsConfigError as exc:
+            raise TaskConfigError(f"EnvSpec: invalid observations declaration: {exc}") from exc
+        return config.to_mapping()
 
     def _validate_contacts(self) -> tuple[dict[str, object], ...]:
         """Validate the contact declaration against the core contact schema.
@@ -158,6 +184,7 @@ class EnvSpec:
             world=self.world,
             robot=self.robot,
             spawn=self.spawn,
+            observations=self.observations,
             contacts=list(self.contacts) if self.contacts else None,
             action_spec=self.action_spec,
             policies=self.policies,

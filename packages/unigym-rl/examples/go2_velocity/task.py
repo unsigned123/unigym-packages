@@ -21,7 +21,6 @@ from unigym.runtime.actions import OrderedActionGroup, OrderedActionSpec, Policy
 from unigym.world import World
 
 from unigym_rl import (
-    ArticulationState,
     EnvSpec,
     TaskConfigError,
     TaskContext,
@@ -31,6 +30,7 @@ from unigym_rl import (
 )
 
 if TYPE_CHECKING:
+    from unigym.env.obs import RobotObs
     from unigym.robots.base import RobotProfile
     from unigym.run.api import Run
 
@@ -128,9 +128,6 @@ GO2_CONTACTS = (
     },
 )
 
-FEET_CONTACT_KEY = "contact/feet"
-BASE_CONTACT_KEY = "contact/base"
-
 #: Run-owned robot root spawn (metres); the world never declares one.
 GO2_SPAWN = {"pos": (0.0, 0.0, 0.4)}
 
@@ -191,6 +188,12 @@ def make_go2_velocity_spec(
         spawn=GO2_SPAWN,
         action_spec=GO2_ACTION_SPEC,
         policies=GO2_POLICIES,
+        observations={
+            "robot": [GO2_ARTICULATION],
+            "contact": ["feet", "base"],
+            "command": True,
+            "prev_action": True,
+        },
         contacts=GO2_CONTACTS,
         num_envs=num_envs,
         device=device,
@@ -207,7 +210,7 @@ def make_go2_velocity_spec(
 class Go2VelocityTask(TaskEnv):
     """Flat-ground Go2 velocity tracking with task-owned episode state.
 
-    Observation (48 columns, all read from the core ``state.extra`` record):
+    Observation (48 columns, all read from the typed ``state.obs`` views):
 
     - base linear velocity in the body frame (3)
     - base angular velocity in the body frame (3)
@@ -339,9 +342,9 @@ class Go2VelocityTask(TaskEnv):
             device=self.device,
         )
 
-    def _joints(self, state: ArticulationState, leaf: str) -> torch.Tensor:
+    def _joints(self, robot: RobotObs, leaf: str) -> torch.Tensor:
         """One joint leaf, checked against the Go2 joint count and moved to device."""
-        value = getattr(state, leaf)
+        value = getattr(robot, leaf)
         if value.shape[1] != len(GO2_JOINTS):
             raise TaskConfigError(
                 f"Go2VelocityTask: articulation {GO2_ARTICULATION!r} {leaf!r} "
@@ -349,18 +352,30 @@ class Go2VelocityTask(TaskEnv):
             )
         return value.to(device=self.device, dtype=torch.float32)
 
-    def _vector(self, state: ArticulationState, leaf: str) -> torch.Tensor:
+    def _vector(self, robot: RobotObs, leaf: str) -> torch.Tensor:
         """One base/gravity leaf moved to the task device."""
-        return getattr(state, leaf).to(device=self.device, dtype=torch.float32)
+        return getattr(robot, leaf).to(device=self.device, dtype=torch.float32)
+
+    def _slot(self, slot, name: str) -> torch.Tensor:
+        """One typed runtime slot moved to the task device."""
+        value = slot.value
+        if value is None:
+            raise TaskConfigError(
+                f"Go2VelocityTask: observation slot {name!r} was not published | hint: "
+                "declare it in EnvSpec(observations=...) and publish it from the task"
+            )
+        return value.to(device=self.device, dtype=torch.float32)
 
     def observe(self, state: TaskState) -> torch.Tensor:
         """Return the 48-column observation described in the class docstring."""
-        articulation = state.articulation(GO2_ARTICULATION)
-        base_lin_vel = self._vector(articulation, "base_lin_vel_b")
-        base_ang_vel = self._vector(articulation, "base_ang_vel_b")
-        gravity = self._vector(articulation, "gravity_b")
-        joint_pos = self._joints(articulation, "joint_pos")
-        joint_vel = self._joints(articulation, "joint_vel")
+        robot = state.robot(GO2_ARTICULATION)
+        base_lin_vel = self._vector(robot, "base_lin_vel_b")
+        base_ang_vel = self._vector(robot, "base_ang_vel_b")
+        gravity = self._vector(robot, "gravity_b")
+        joint_pos = self._joints(robot, "joint_pos")
+        joint_vel = self._joints(robot, "joint_vel")
+        prev_action = self._slot(state.obs.prev_action, "prev_action")
+        command = self._slot(state.obs.command, "command")
         if self._default_joint_pos is None:  # pragma: no cover - on_bind always runs
             raise TaskConfigError("Go2VelocityTask: standby pose was never resolved")
         return torch.cat(
@@ -370,17 +385,17 @@ class Go2VelocityTask(TaskEnv):
                 gravity,
                 joint_pos - self._default_joint_pos,
                 joint_vel,
-                self._prev_action,
-                self._command,
+                prev_action,
+                command,
             ),
             dim=1,
         )
 
     def reward(self, transition: Transition) -> torch.Tensor:
         """Velocity/yaw tracking, alive bonus, action-rate and air-time terms."""
-        articulation = transition.info.articulation(GO2_ARTICULATION)
-        base_lin_vel = self._vector(articulation, "base_lin_vel_b")
-        base_ang_vel = self._vector(articulation, "base_ang_vel_b")
+        robot = transition.info.robot(GO2_ARTICULATION)
+        base_lin_vel = self._vector(robot, "base_lin_vel_b")
+        base_ang_vel = self._vector(robot, "base_ang_vel_b")
         linear_error = ((base_lin_vel[:, :2] - self._command[:, :2]) ** 2).sum(dim=1)
         yaw_error = (base_ang_vel[:, 2] - self._command[:, 2]) ** 2
         return (
@@ -435,7 +450,9 @@ class Go2VelocityTask(TaskEnv):
         self._action_rate = (delta * delta).sum(dim=1)
         self._prev_action = action.detach().clone().to(self.device, torch.float32)
         self._step_count += 1
-        contact = self._contact_tensor(state, FEET_CONTACT_KEY, len(GO2_FEET_BODIES))
+        self.env.obs.set_command(self._command)
+        self.env.obs.set_prev_action(self._prev_action)
+        contact = self._contact_tensor(state, "feet", len(GO2_FEET_BODIES))
         self._update_contact_timers(contact)
 
     def on_reset(self, env_ids: torch.Tensor, state: TaskState) -> None:
@@ -460,33 +477,33 @@ class Go2VelocityTask(TaskEnv):
             self._last_air_time[env_ids] = 0.0
             self._prev_contact[env_ids] = False
             self._first_contact[env_ids] = False
+        self.env.obs.set_command(self._command)
+        self.env.obs.set_prev_action(self._prev_action)
 
     # ------------------------------------------------------------------ #
     # contact timers
     # ------------------------------------------------------------------ #
-    def _contact_tensor(self, state: TaskState, key: str, width: int) -> torch.Tensor:
-        """Read one published ``contact/<name>`` group as a bool ``(N, width)``."""
-        if key not in state.extra:
+    def _contact_tensor(self, state: TaskState, name: str, width: int) -> torch.Tensor:
+        """Read one declared contact group as a bool ``(N, width)``."""
+        from unigym.env.obs import ObsContractError
+
+        try:
+            value = state.obs.contact(name).value
+        except ObsContractError as exc:
             raise TaskConfigError(
-                f"Go2VelocityTask: TaskState.extra is missing {key!r} | hint: "
-                "declare the matching group through EnvSpec(contacts=...) so "
-                "the run publishes it every step"
-            )
-        value = state.extra[key]
-        if not isinstance(value, torch.Tensor):
-            raise TaskConfigError(
-                f"Go2VelocityTask: extra[{key!r}] must be a torch.Tensor, "
-                f"got {type(value).__name__}"
-            )
+                f"Go2VelocityTask: contact/{name} is not "
+                "declared/published | hint: declare the matching group through "
+                "EnvSpec(contacts=...) and EnvSpec(observations={'contact': [...]})"
+            ) from exc
         if value.dtype is not torch.bool:
             raise TaskConfigError(
-                f"Go2VelocityTask: extra[{key!r}] must be bool (contact "
+                f"Go2VelocityTask: contact/{name} must be bool (contact "
                 f"format), got {value.dtype}"
             )
         expected = (self.num_envs, width)
         if tuple(value.shape) != expected:
             raise TaskConfigError(
-                f"Go2VelocityTask: extra[{key!r}] must have shape {expected}, "
+                f"Go2VelocityTask: contact/{name} must have shape {expected}, "
                 f"got {tuple(value.shape)}"
             )
         return value
@@ -507,15 +524,15 @@ class Go2VelocityTask(TaskEnv):
     # masks
     # ------------------------------------------------------------------ #
     def _tilt_mask(self, transition: Transition) -> torch.Tensor:
-        articulation = transition.info.articulation(GO2_ARTICULATION)
-        return self._vector(articulation, "gravity_b")[:, 2] > TILT_GRAVITY_Z
+        robot = transition.info.robot(GO2_ARTICULATION)
+        return self._vector(robot, "gravity_b")[:, 2] > TILT_GRAVITY_Z
 
     def _low_height_mask(self, transition: Transition) -> torch.Tensor:
-        articulation = transition.info.articulation(GO2_ARTICULATION)
-        return self._vector(articulation, "base_pos_w")[:, 2] < LOW_HEIGHT_LIMIT
+        robot = transition.info.robot(GO2_ARTICULATION)
+        return self._vector(robot, "base_pos_w")[:, 2] < LOW_HEIGHT_LIMIT
 
     def _base_contact_mask(self, transition: Transition) -> torch.Tensor:
-        contact = self._contact_tensor(transition.info, BASE_CONTACT_KEY, 1)
+        contact = self._contact_tensor(transition.info, "base", 1)
         return contact.any(dim=1)
 
 

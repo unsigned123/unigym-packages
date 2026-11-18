@@ -17,43 +17,18 @@ from unigym_rl.errors import TaskContractError
 
 if TYPE_CHECKING:
     from unigym.env.backends.base import EnvBackend
+    from unigym.env.obs import ObsSnapshot, RobotObs
     from unigym.run.api import Run
     from unigym.run.instance import RunInstance
     from unigym.runtime.actions import OrderedActionSpec
     from unigym.runtime.controllers import ControlRuntime
 
 __all__ = [
-    "ArticulationState",
     "EpisodeEnd",
     "TaskContext",
     "TaskState",
     "Transition",
 ]
-
-#: fixed-width articulation leaves: leaf -> expected trailing dimension.
-_ARTICULATION_WIDTHS = {
-    "base_pos_w": 3,
-    "base_quat_w": 4,
-    "base_lin_vel_w": 3,
-    "base_ang_vel_w": 3,
-    "base_lin_vel_b": 3,
-    "base_ang_vel_b": 3,
-    "gravity_b": 3,
-}
-#: joint leaves: their width must agree with each other, not a constant.
-_ARTICULATION_JOINTS = ("joint_pos", "joint_vel", "applied_torque")
-_ARTICULATION_LEAVES = (
-    "joint_pos",
-    "joint_vel",
-    "applied_torque",
-    "base_pos_w",
-    "base_quat_w",
-    "base_lin_vel_w",
-    "base_ang_vel_w",
-    "base_lin_vel_b",
-    "base_ang_vel_b",
-    "gravity_b",
-)
 
 
 def _require_int(value: object, name: str, *, minimum: int) -> int:
@@ -77,6 +52,39 @@ def _require_mask(value: object, name: str, num_envs: int) -> torch.Tensor:
         raise TaskContractError(f"{name} must be bool, got {value.dtype}")
     if value.shape != (num_envs,):
         raise TaskContractError(f"{name} must have shape ({num_envs},), got {tuple(value.shape)}")
+    return value
+
+
+def _require_row_tensor(
+    value: object,
+    name: str,
+    num_envs: int,
+) -> torch.Tensor:
+    if not isinstance(value, torch.Tensor):
+        raise TaskContractError(f"{name} must be a torch.Tensor, got {type(value).__name__}")
+    if value.ndim != 1 or value.shape[0] != num_envs:
+        raise TaskContractError(f"{name} must have shape ({num_envs},), got {tuple(value.shape)}")
+    return value
+
+
+def _require_ids(value: object, name: str, num_envs: int) -> torch.Tensor:
+    if not isinstance(value, torch.Tensor):
+        raise TaskContractError(f"{name} must be a torch.Tensor, got {type(value).__name__}")
+    if value.ndim != 1 or value.dtype not in (
+        torch.int8,
+        torch.int16,
+        torch.int32,
+        torch.int64,
+        torch.uint8,
+    ):
+        raise TaskContractError(
+            f"{name} must be a 1-D integer tensor, got {value.dtype} shape {tuple(value.shape)}"
+        )
+    if value.numel():
+        if int(value.min()) < 0 or int(value.max()) >= num_envs:
+            raise TaskContractError(f"{name} must be in [0, {num_envs}), got {value.tolist()}")
+        if int(torch.unique(value).numel()) != int(value.numel()):
+            raise TaskContractError(f"{name} must be unique, got {value.tolist()}")
     return value
 
 
@@ -126,155 +134,59 @@ class TaskContext:
 
 
 @dataclass(frozen=True)
-class ArticulationState:
-    """The typed, per-articulation projection of one state snapshot.
-
-    Every tensor is ``(num_envs, width)`` on the backend device, in policy
-    joint order for the joint leaves.  Build one through
-    :meth:`TaskState.articulation`; the accessor validates the published
-    ``articulation/<name>/...`` keys instead of asking task code to parse
-    string paths.
-    """
-
-    joint_pos: torch.Tensor
-    joint_vel: torch.Tensor
-    applied_torque: torch.Tensor
-    base_pos_w: torch.Tensor
-    base_quat_w: torch.Tensor
-    base_lin_vel_w: torch.Tensor
-    base_ang_vel_w: torch.Tensor
-    base_lin_vel_b: torch.Tensor
-    base_ang_vel_b: torch.Tensor
-    gravity_b: torch.Tensor
-
-
-def _articulation_names(extra: Mapping[str, object]) -> list[str]:
-    """Articulation names present in the namespaced extra record."""
-    names: set[str] = set()
-    for key in extra:
-        if not isinstance(key, str) or not key.startswith("articulation/"):
-            continue
-        parts = key.split("/")
-        if len(parts) >= 3 and parts[1]:
-            names.add(parts[1])
-    return sorted(names)
-
-
-def _require_articulation_tensor(
-    value: object,
-    key: str,
-    num_envs: int,
-    *,
-    width: int | None,
-) -> torch.Tensor:
-    """Validate one published articulation tensor and return it unchanged."""
-    if not isinstance(value, torch.Tensor):
-        raise TaskContractError(
-            f"TaskState.articulation: extra[{key!r}] must be a torch.Tensor, "
-            f"got {type(value).__name__}"
-        )
-    if not value.is_floating_point():
-        raise TaskContractError(
-            f"TaskState.articulation: extra[{key!r}] must be floating point, " f"got {value.dtype}"
-        )
-    if value.ndim != 2:
-        raise TaskContractError(
-            f"TaskState.articulation: extra[{key!r}] must be (num_envs, width), "
-            f"got shape {tuple(value.shape)}"
-        )
-    if value.shape[0] != num_envs:
-        raise TaskContractError(
-            f"TaskState.articulation: extra[{key!r}] must have {num_envs} rows, "
-            f"got {value.shape[0]}"
-        )
-    if value.shape[1] == 0:
-        raise TaskContractError(
-            f"TaskState.articulation: extra[{key!r}] must not have an empty " "feature dimension"
-        )
-    if width is not None and value.shape[1] != width:
-        raise TaskContractError(
-            f"TaskState.articulation: extra[{key!r}] must have width {width}, "
-            f"got {value.shape[1]}"
-        )
-    return value
-
-
-@dataclass(frozen=True)
 class TaskState:
     """One engine-state snapshot, pre-reset unless documented otherwise.
 
     Attributes:
         t: Policy tick index the snapshot belongs to (non-negative).
         num_envs: Batch size ``N``.
-        extra: The backend ``extra`` record (including ``reset_env_ids`` /
-            ``should_reset`` defaults).
-        obs_cache: The backend observation cache after the step/reset.
+        obs: The typed observation snapshot published by this tick.
+        episode_id: Per-env episode counter (``(N,)`` int64), when published.
+        time_in_episode: Per-env episode time in seconds (``(N,)``), when
+            published.
+        reset_env_ids: Env ids the core marked due for reset (``(K,)`` int64).
+        should_reset: Whether ``reset_env_ids`` is non-empty.
     """
 
     t: int
     num_envs: int
-    extra: Mapping[str, object]
-    obs_cache: Mapping[str, object]
+    obs: ObsSnapshot
+    episode_id: torch.Tensor | None = None
+    time_in_episode: torch.Tensor | None = None
+    reset_env_ids: torch.Tensor | None = None
+    should_reset: bool = False
 
     def __post_init__(self) -> None:
+        from unigym.env.obs import ObsSnapshot
+
         _require_int(self.t, "TaskState.t", minimum=0)
         _require_int(self.num_envs, "TaskState.num_envs", minimum=1)
-        extra = _require_mapping(self.extra, "TaskState.extra")
-        obs_cache = _require_mapping(self.obs_cache, "TaskState.obs_cache")
-        object.__setattr__(self, "extra", dict(extra))
-        object.__setattr__(self, "obs_cache", dict(obs_cache))
-
-    def articulation(self, name: str) -> ArticulationState:
-        """Return the typed state of one articulation.
-
-        Args:
-            name: The core articulation name (the ``articulation/<name>/...``
-                key namespace).
-
-        Returns:
-            An :class:`ArticulationState` carrying the ten published leaves.
-
-        Raises:
-            TaskContractError: The name is malformed, the articulation is not
-                published, or a leaf is missing/malformed (wrong type, not
-                floating point, not 2-D, wrong row count or width).
-        """
-        if not isinstance(name, str) or not name.strip():
+        if not isinstance(self.obs, ObsSnapshot):
             raise TaskContractError(
-                "TaskState.articulation: name must be a non-empty string, " f"got {name!r}"
+                f"TaskState.obs must be an ObsSnapshot, got {type(self.obs).__name__}"
             )
-        prefix = f"articulation/{name}/"
-        available = _articulation_names(self.extra)
-        values: dict[str, torch.Tensor] = {}
-        joint_width: int | None = None
-        for leaf in _ARTICULATION_LEAVES:
-            key = f"{prefix}{leaf}"
-            if key not in self.extra:
-                hint = (
-                    f" | available articulations: {available}"
-                    if available
-                    else " | hint: the run publishes these keys only for a " "declared articulation"
-                )
-                raise TaskContractError(
-                    f"TaskState.articulation({name!r}): missing extra[{key!r}]" f"{hint}"
-                )
-            width = _ARTICULATION_WIDTHS.get(leaf)
-            if leaf in _ARTICULATION_JOINTS:
-                if joint_width is None:
-                    value = _require_articulation_tensor(
-                        self.extra[key], key, self.num_envs, width=None
-                    )
-                    joint_width = int(value.shape[1])
-                else:
-                    value = _require_articulation_tensor(
-                        self.extra[key], key, self.num_envs, width=joint_width
-                    )
-            else:
-                value = _require_articulation_tensor(
-                    self.extra[key], key, self.num_envs, width=width
-                )
-            values[leaf] = value
-        return ArticulationState(**values)
+        if self.obs.num_envs != self.num_envs:
+            raise TaskContractError(
+                f"TaskState.obs has {self.obs.num_envs} rows, expected {self.num_envs}"
+            )
+        if self.episode_id is not None:
+            _require_row_tensor(self.episode_id, "TaskState.episode_id", self.num_envs)
+        if self.time_in_episode is not None:
+            _require_row_tensor(self.time_in_episode, "TaskState.time_in_episode", self.num_envs)
+        if self.reset_env_ids is None:
+            reset_ids = torch.zeros(0, dtype=torch.int64, device=self.obs.device)
+            object.__setattr__(self, "reset_env_ids", reset_ids)
+        else:
+            _require_ids(self.reset_env_ids, "TaskState.reset_env_ids", self.num_envs)
+        if not isinstance(self.should_reset, bool):
+            raise TaskContractError(
+                f"TaskState.should_reset must be a bool, got {type(self.should_reset).__name__}"
+            )
+        object.__setattr__(self, "should_reset", bool(self.should_reset))
+
+    def robot(self, name: str) -> RobotObs:
+        """Return the typed observation view of one articulation."""
+        return self.obs.robot(name)
 
 
 @dataclass(frozen=True)

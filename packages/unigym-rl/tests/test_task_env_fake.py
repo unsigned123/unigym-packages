@@ -5,7 +5,6 @@ from __future__ import annotations
 import pytest
 import torch
 from unigym.runner.base import StepResult
-from unigym.runner.state import read_extra
 
 from unigym_rl import TaskConfigError, TaskEnv
 from unigym_rl.testing.fakes import (
@@ -18,7 +17,7 @@ from unigym_rl.testing.fakes import (
 
 class EchoTask(TaskEnv):
     def observe(self, state):
-        return state.obs_cache["proprio"].clone()
+        return state.obs.robot("robot").joint_pos.clone()
 
     def reward(self, transition):
         return torch.zeros(self.num_envs, device=self.device)
@@ -31,12 +30,14 @@ def test_fake_action_spec_is_one_explicit_group() -> None:
     assert spec.groups[0].joints == ("a", "b", "c")
 
 
-def test_fake_env_extra_has_read_extra_defaults() -> None:
+def test_fake_env_record_has_core_bookkeeping_defaults() -> None:
     env = FakeEnv(num_envs=2, obs_dim=3)
-    extra = read_extra(env)
-    assert extra["reset_env_ids"].shape == (0,)
-    assert extra["should_reset"] is False
-    assert extra["step"].tolist() == [0, 0]
+    record = env.record()
+    assert record["episode_id"].tolist() == [0, 0]
+    assert record["time_in_episode"].tolist() == [0.0, 0.0]
+    assert record["reset_env_ids"].shape == (0,)
+    assert record["should_reset"] is False
+    assert env.obs.robot("robot").joint_pos.shape == (2, 3)
 
 
 def test_fake_env_due_clock_and_reset_calls() -> None:
@@ -69,32 +70,30 @@ def test_fake_runner_step_t_is_pre_increment() -> None:
     assert runner.ticks_done == 2
 
 
-def test_step_extra_carries_reset_control_keys() -> None:
+def test_step_state_carries_reset_control_fields() -> None:
     run = FakeRun(num_envs=2, obs_dim=3, due_every=0)
     task = EchoTask(run)
     task.reset()
 
     _, _, _, _, info = task.step(torch.zeros(2, 2))
-    extra = info["state"].extra
+    state = info["state"]
 
-    assert "reset_env_ids" in extra
-    assert "should_reset" in extra
-    assert extra["reset_env_ids"].dtype is torch.int64
-    assert extra["reset_env_ids"].shape == (0,)
-    assert extra["should_reset"] is False
+    assert state.reset_env_ids.dtype is torch.int64
+    assert state.reset_env_ids.shape == (0,)
+    assert state.should_reset is False
 
 
-def test_due_step_extra_reports_typed_due_ids() -> None:
+def test_due_step_state_reports_typed_due_ids() -> None:
     run = FakeRun(num_envs=2, obs_dim=3, due_every=1)
     task = EchoTask(run)
     task.reset()
 
     _, _, _, _, info = task.step(torch.zeros(2, 2))
-    extra = info["episode_end"].state.extra
+    state = info["episode_end"].state
 
-    assert extra["reset_env_ids"].dtype is torch.int64
-    assert extra["reset_env_ids"].tolist() == [0, 1]
-    assert extra["should_reset"] is True
+    assert state.reset_env_ids.dtype is torch.int64
+    assert state.reset_env_ids.tolist() == [0, 1]
+    assert state.should_reset is True
 
 
 def test_fake_runner_reset_none_resets_all() -> None:
@@ -121,7 +120,7 @@ def test_fake_run_drives_a_task_env() -> None:
     task = EchoTask(run)
     obs, info = task.reset()
     assert obs.shape == (2, 3)
-    assert info["state"].extra["episode"].tolist() == [1, 1]
+    assert info["state"].episode_id.tolist() == [1, 1]
 
     obs, reward, terminated, truncated, info = task.step(torch.zeros(2, 2))
     assert obs.shape == (2, 3)

@@ -12,13 +12,14 @@ What it proves:
   joints;
 - an `EnvSpec` over the backend-neutral `World.flat()` ground, with the
   profile-owned Go2 asset and a run-owned spawn;
-- explicit run-level contact groups (`feet`, `base`) publishing
-  `contact/feet` / `contact/base` through `TaskState.extra`;
+- explicit run-level contact groups (`feet`, `base`) selected by
+  `observations.contact` and read through `TaskState.obs.contact(...)`;
 - a task-owned command buffer, observation, reward and episode clock;
 - task-local per-foot air/contact timers and an official-style
   `feet_air_time` first-touchdown reward;
 - a `base_contact` termination reason;
-- typed `TaskState.articulation("go2")` access instead of string extra keys;
+- typed `TaskState.robot("go2")` / `state.obs.command` / `state.obs.prev_action`
+  access instead of string keys;
 - 1-env and 8-env reset/step;
 - a manual skrl PPO smoke with no trainer abstraction.
 
@@ -53,8 +54,7 @@ network.
 | Truncated | env-local step counter |
 | Reasons | `tilt`, `low_height`, `base_contact`, `time_limit` |
 
-Observation columns, all read through the typed
-`state.articulation("go2")` accessor:
+Observation columns, all read through the typed `state.obs` views:
 
 ```text
 base_lin_vel_b (3) | base_ang_vel_b (3) | gravity_b (3)
@@ -62,12 +62,13 @@ base_lin_vel_b (3) | base_ang_vel_b (3) | gravity_b (3)
 | previous action (12) | command (3)
 ```
 
-`TaskState.articulation` reads the extra record because this smoke does not
-request a core observation catalog; the extra record always publishes the
-namespaced articulation keys. Joint columns follow the profile joint order
-`GO2_JOINTS`; at bind time the task verifies every name against the live model
-on backends that expose one (`mujoco`, `mjwarp`) and otherwise falls back to the
-validated profile joint order (`isaaclab2` publishes no live proxy).
+The run declares `observations: {robot: [go2], contact: [feet, base],
+command: true, prev_action: true}`. `TaskState.robot("go2")` is the core
+`RobotObs` view; the task publishes its sampled command and previous action
+into the env-owned typed slots on reset/step. Joint columns follow the profile
+joint order `GO2_JOINTS`; at bind time the task verifies every name against the
+live model on backends that expose one (`mujoco`, `mjwarp`) and otherwise falls
+back to the validated profile joint order (`isaaclab2` publishes no live proxy).
 
 Reward terms (no `RewardManager`/`TerminationManager`; direct hooks keep the
 task-owned command/action/clock state in one place):
@@ -90,8 +91,9 @@ base -> base
 
 Both groups report `frame: world`, `format: contact`, `threshold: 1.0` N on the
 `go2` articulation. The core publishes `contact/feet` as a bool `(N, 4)` and
-`contact/base` as a bool `(N, 1)` in `TaskState.extra`; the task validates the
-dtype and shape and fails fast when a key is missing or malformed.
+`contact/base` as a bool `(N, 1)` typed views; the task reads
+`state.obs.contact("feet")` / `state.obs.contact("base")`, validates the dtype
+and shape, and fails fast when a group is missing or malformed.
 
 The air/contact timers (`_air_time`, `_contact_time`, `_last_air_time`,
 `_prev_contact`, `_first_contact`) are **task-local** and advance once per

@@ -17,7 +17,10 @@ from typing import Any
 
 import pytest
 import torch
+from unigym.env.obs import ObsSnapshot
 from unigym.runtime.actions import OrderedActionSpec, PolicyBinding
+
+from unigym_rl.testing.fakes import make_fake_obs_registry
 
 _EXAMPLE_DIR = Path(__file__).resolve().parents[1] / "examples" / "go2_velocity"
 
@@ -161,9 +164,9 @@ def test_one_env_reset_and_step_are_finite(one_env: Any) -> None:
     assert torch.isfinite(obs).all()
     state = info["state"]
     assert state.t == 0
-    articulation = state.articulation(GO2_ARTICULATION)
-    assert articulation.joint_pos.shape == (1, len(GO2_JOINTS))
-    assert articulation.gravity_b.shape == (1, 3)
+    robot = state.robot(GO2_ARTICULATION)
+    assert robot.joint_pos.shape == (1, len(GO2_JOINTS))
+    assert robot.gravity_b.shape == (1, 3)
     torch.testing.assert_close(obs[:, -3:], one_env.command)
 
     for _ in range(3):
@@ -290,13 +293,42 @@ GO2_FEET_BODIES = go2_task.GO2_FEET_BODIES
 
 
 def _timer_task(*, num_envs: int = 2, control_dt: float = 0.1) -> Any:
-    """A task shell with only the task-local contact timers allocated."""
+    """A task shell with the task-local timers and a typed obs registry."""
+    from types import SimpleNamespace
+
     task = object.__new__(go2_task.Go2VelocityTask)
     task.device = torch.device("cpu")
     task.num_envs = int(num_envs)
     task.control_dt = float(control_dt)
+    task.env = SimpleNamespace(
+        obs=make_fake_obs_registry(
+            num_envs=task.num_envs,
+            robot=GO2_ARTICULATION,
+            joints=GO2_JOINTS,
+            contacts={"feet": ((len(GO2_FEET_BODIES),), "bool"), "base": ((1,), "bool")},
+            command=True,
+            prev_action=True,
+        )
+    )
+    task._command = torch.zeros((task.num_envs, 3), dtype=torch.float32)
     task._init_contact_state()
     return task
+
+
+def _typed_state(registry: Any, *, values: dict[str, Any] | None = None) -> Any:
+    """A TaskState over a fake typed registry (optionally raw values)."""
+    base = registry.snapshot()
+    snapshot = (
+        base
+        if values is None
+        else ObsSnapshot(
+            values,
+            schema=registry.schema,
+            num_envs=base.num_envs,
+            device=base.device,
+        )
+    )
+    return go2_task.TaskState(t=0, num_envs=snapshot.num_envs, obs=snapshot)
 
 
 def _fake_transition(
@@ -314,25 +346,32 @@ def _fake_transition(
     gravity[:, 2] = gravity_z
     base_pos = zeros_vec.clone()
     base_pos[:, 2] = base_height
-    extra: dict[str, Any] = {
-        "articulation/go2/joint_pos": zeros_joint.clone(),
-        "articulation/go2/joint_vel": zeros_joint.clone(),
-        "articulation/go2/applied_torque": zeros_joint.clone(),
-        "articulation/go2/base_pos_w": base_pos,
-        "articulation/go2/base_quat_w": torch.tensor(
-            [1.0, 0.0, 0.0, 0.0], dtype=torch.float32
-        ).repeat(num_envs, 1),
-        "articulation/go2/base_lin_vel_w": zeros_vec.clone(),
-        "articulation/go2/base_ang_vel_w": zeros_vec.clone(),
-        "articulation/go2/base_lin_vel_b": zeros_vec.clone(),
-        "articulation/go2/base_ang_vel_b": zeros_vec.clone(),
-        "articulation/go2/gravity_b": gravity,
-    }
+    registry = make_fake_obs_registry(
+        num_envs=num_envs,
+        robot=GO2_ARTICULATION,
+        joints=GO2_JOINTS,
+        contacts={"feet": ((len(GO2_FEET_BODIES),), "bool"), "base": ((1,), "bool")},
+    )
+    registry.set_robot(GO2_ARTICULATION, "joint_pos", zeros_joint.clone())
+    registry.set_robot(GO2_ARTICULATION, "joint_pos_rel", zeros_joint.clone())
+    registry.set_robot(GO2_ARTICULATION, "joint_vel", zeros_joint.clone())
+    registry.set_robot(GO2_ARTICULATION, "applied_torque", zeros_joint.clone())
+    registry.set_robot(GO2_ARTICULATION, "base_pos_w", base_pos)
+    registry.set_robot(
+        GO2_ARTICULATION,
+        "base_quat_w",
+        torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=torch.float32).repeat(num_envs, 1),
+    )
+    registry.set_robot(GO2_ARTICULATION, "base_lin_vel_w", zeros_vec.clone())
+    registry.set_robot(GO2_ARTICULATION, "base_ang_vel_w", zeros_vec.clone())
+    registry.set_robot(GO2_ARTICULATION, "base_lin_vel_b", zeros_vec.clone())
+    registry.set_robot(GO2_ARTICULATION, "base_ang_vel_b", zeros_vec.clone())
+    registry.set_robot(GO2_ARTICULATION, "gravity_b", gravity)
     if feet is not None:
-        extra["contact/feet"] = feet
+        registry.set_contact("feet", feet)
     if base is not None:
-        extra["contact/base"] = base
-    info = go2_task.TaskState(t=0, num_envs=num_envs, extra=extra, obs_cache={})
+        registry.set_contact("base", base)
+    info = go2_task.TaskState(t=0, num_envs=num_envs, obs=registry.snapshot())
     zeros = torch.zeros(num_envs, dtype=torch.bool)
     return go2_task.Transition(
         obs=torch.zeros((num_envs, 3), dtype=torch.float32),
@@ -370,8 +409,8 @@ def test_contact_keys_and_shapes_on_reset_and_step(one_env: Any) -> None:
     """MuJoCo publishes bool ``contact/feet`` (1, 4) and ``contact/base`` (1, 1)."""
     _, info = one_env.reset()
     for state in (info["state"], one_env.step(_standby(1))[4]["state"]):
-        feet = state.extra["contact/feet"]
-        base = state.extra["contact/base"]
+        feet = state.obs.contact("feet").value
+        base = state.obs.contact("base").value
         assert feet.shape == (1, len(GO2_FEET_BODIES))
         assert feet.dtype is torch.bool
         assert base.shape == (1, 1)
@@ -410,7 +449,14 @@ def test_air_time_on_step_reads_feet_contact_and_rejects_bad_shapes() -> None:
     task._action_rate = torch.zeros(2, dtype=torch.float32)
     task._step_count = torch.zeros(2, dtype=torch.int64)
     feet = torch.ones((2, len(GO2_FEET_BODIES)), dtype=torch.bool)
-    state = go2_task.TaskState(t=0, num_envs=2, extra={"contact/feet": feet}, obs_cache={})
+    registry = make_fake_obs_registry(
+        num_envs=2,
+        robot=GO2_ARTICULATION,
+        joints=GO2_JOINTS,
+        contacts={"feet": ((len(GO2_FEET_BODIES),), "bool")},
+    )
+    registry.set_contact("feet", feet)
+    state = _typed_state(registry)
 
     task.on_step(torch.zeros((2, len(GO2_JOINTS))), state)
     assert task.first_contact.all()
@@ -419,21 +465,19 @@ def test_air_time_on_step_reads_feet_contact_and_rejects_bad_shapes() -> None:
     with pytest.raises(go2_task.TaskConfigError, match="contact/feet"):
         task.on_step(
             torch.zeros((2, len(GO2_JOINTS))),
-            go2_task.TaskState(t=0, num_envs=2, extra={}, obs_cache={}),
+            _typed_state(registry, values={}),
         )
     with pytest.raises(go2_task.TaskConfigError, match="bool"):
         task.on_step(
             torch.zeros((2, len(GO2_JOINTS))),
-            go2_task.TaskState(t=0, num_envs=2, extra={"contact/feet": feet.float()}, obs_cache={}),
+            _typed_state(registry, values={"contact/feet": feet.float()}),
         )
     with pytest.raises(go2_task.TaskConfigError, match="shape"):
         task.on_step(
             torch.zeros((2, len(GO2_JOINTS))),
-            go2_task.TaskState(
-                t=0,
-                num_envs=2,
-                extra={"contact/feet": torch.ones((2, 3), dtype=torch.bool)},
-                obs_cache={},
+            _typed_state(
+                registry,
+                values={"contact/feet": torch.ones((2, 3), dtype=torch.bool)},
             ),
         )
 
@@ -450,7 +494,15 @@ def test_reset_clears_only_the_selected_contact_rows() -> None:
     for _ in range(2):
         task._update_contact_timers(airborne)
 
-    state = go2_task.TaskState(t=0, num_envs=2, extra={}, obs_cache={})
+    state = _typed_state(
+        make_fake_obs_registry(
+            num_envs=2,
+            robot=GO2_ARTICULATION,
+            joints=GO2_JOINTS,
+            command=True,
+            prev_action=True,
+        )
+    )
     task.on_reset(torch.tensor([1]), state)
 
     torch.testing.assert_close(task.air_time[0], torch.full((4,), 0.2))

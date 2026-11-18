@@ -18,13 +18,15 @@ from unigym_rl import (
     TerminationTerm,
     Transition,
 )
+from unigym_rl.testing.fakes import make_fake_obs_registry
 
 
 def _transition(rows: tuple[float, ...]) -> Transition:
     num_envs = len(rows)
     values = torch.tensor(rows, dtype=torch.float32).unsqueeze(1)
     obs = torch.cat([values, torch.zeros(num_envs, 1)], dim=1)
-    state = TaskState(t=0, num_envs=num_envs, extra={}, obs_cache={})
+    registry = make_fake_obs_registry(num_envs=num_envs)
+    state = TaskState(t=0, num_envs=num_envs, obs=registry.snapshot())
     mask = torch.zeros(num_envs, dtype=torch.bool)
     return Transition(
         obs=obs,

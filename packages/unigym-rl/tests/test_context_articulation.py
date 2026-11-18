@@ -1,16 +1,19 @@
-"""Typed ``TaskState.articulation(name)`` tests (no engine required)."""
+"""Typed ``TaskState.robot(name)`` tests (no engine required)."""
 
 from __future__ import annotations
 
 import pytest
 import torch
+from unigym.env.obs import ObsContractError, RobotObs
 
-from unigym_rl import ArticulationState, TaskContractError, TaskState
+from unigym_rl import TaskContractError, TaskState
+from unigym_rl.testing.fakes import make_fake_obs_registry
 
 NUM_ENVS = 2
-JOINTS = 3
+JOINTS = ("j0", "j1", "j2")
 LEAVES = (
     "joint_pos",
+    "joint_pos_rel",
     "joint_vel",
     "applied_torque",
     "gravity_b",
@@ -22,9 +25,10 @@ LEAVES = (
     "base_ang_vel_b",
 )
 WIDTHS = {
-    "joint_pos": JOINTS,
-    "joint_vel": JOINTS,
-    "applied_torque": JOINTS,
+    "joint_pos": len(JOINTS),
+    "joint_pos_rel": len(JOINTS),
+    "joint_vel": len(JOINTS),
+    "applied_torque": len(JOINTS),
     "gravity_b": 3,
     "base_pos_w": 3,
     "base_quat_w": 4,
@@ -35,92 +39,76 @@ WIDTHS = {
 }
 
 
-def _extra(name: str = "go2") -> dict[str, torch.Tensor]:
-    """One complete namespaced articulation record."""
-    return {
-        f"articulation/{name}/{leaf}": torch.arange(
-            NUM_ENVS * WIDTHS[leaf], dtype=torch.float32
-        ).reshape(NUM_ENVS, WIDTHS[leaf])
-        for leaf in LEAVES
-    }
+def _registry(*, name: str = "go2", leaves: tuple[str, ...] = LEAVES):
+    registry = make_fake_obs_registry(num_envs=NUM_ENVS, robot=name, joints=JOINTS)
+    for leaf in leaves:
+        value = torch.arange(NUM_ENVS * WIDTHS[leaf], dtype=torch.float32).reshape(
+            NUM_ENVS, WIDTHS[leaf]
+        )
+        registry.set_robot(name, leaf, value)
+    return registry
 
 
-def _state(extra: dict[str, object]) -> TaskState:
-    return TaskState(t=0, num_envs=NUM_ENVS, extra=extra, obs_cache={})
+def _state(registry=None) -> TaskState:
+    registry = registry or _registry()
+    return TaskState(t=0, num_envs=NUM_ENVS, obs=registry.snapshot())
 
 
 def test_accessor_returns_the_published_values_with_shapes() -> None:
-    extra = _extra()
-    state = _state(extra)
+    registry = _registry()
+    state = _state(registry)
 
-    articulation = state.articulation("go2")
+    robot = state.robot("go2")
 
-    assert isinstance(articulation, ArticulationState)
+    assert isinstance(robot, RobotObs)
+    assert state.robot("go2").key == "articulation/go2"
     for leaf in LEAVES:
-        returned = getattr(articulation, leaf)
-        assert returned is extra[f"articulation/go2/{leaf}"]
+        returned = getattr(robot, leaf)
+        torch.testing.assert_close(returned, registry.snapshot().value(f"articulation/go2/{leaf}"))
         assert returned.shape == (NUM_ENVS, WIDTHS[leaf])
 
 
+def test_joint_gather_uses_the_served_order() -> None:
+    state = _state()
+
+    selected = state.robot("go2").joints(("j2", "j0"), leaf="joint_pos")
+
+    expected = state.obs.value("articulation/go2/joint_pos")[:, [2, 0]]
+    torch.testing.assert_close(selected, expected)
+
+
 def test_missing_articulation_is_a_teaching_error() -> None:
-    extra = _extra("other")
-    state = _state(extra)
+    state = _state()
 
-    with pytest.raises(TaskContractError, match="missing extra") as excinfo:
-        state.articulation("go2")
+    with pytest.raises(ObsContractError, match="robot observation 'other'") as excinfo:
+        state.robot("other")
 
-    message = str(excinfo.value)
-    assert "articulation/go2/joint_pos" in message
-    assert "other" in message
+    assert "go2" in str(excinfo.value)
 
 
 def test_missing_leaf_is_a_teaching_error() -> None:
-    extra = _extra()
-    del extra["articulation/go2/gravity_b"]
-    state = _state(extra)
+    registry = _registry(leaves=tuple(leaf for leaf in LEAVES if leaf != "gravity_b"))
+    state = _state(registry)
 
-    with pytest.raises(TaskContractError, match="gravity_b"):
-        state.articulation("go2")
-
-
-@pytest.mark.parametrize(
-    ("leaf", "value", "match"),
-    [
-        ("joint_pos", torch.zeros(NUM_ENVS, JOINTS, dtype=torch.int64), "floating point"),
-        ("joint_pos", torch.zeros(NUM_ENVS, JOINTS, 1), "must be \\(num_envs, width\\)"),
-        ("joint_pos", torch.zeros(NUM_ENVS + 1, JOINTS), "must have 2 rows"),
-        ("joint_vel", torch.zeros(NUM_ENVS, JOINTS + 1), "must have width 3"),
-        ("base_quat_w", torch.zeros(NUM_ENVS, 3), "must have width 4"),
-        ("gravity_b", torch.zeros(NUM_ENVS, 3), None),  # control: valid
-    ],
-)
-def test_malformed_leaf_is_a_teaching_error(
-    leaf: str,
-    value: torch.Tensor,
-    match: str | None,
-) -> None:
-    extra = _extra()
-    extra[f"articulation/go2/{leaf}"] = value
-    state = _state(extra)
-
-    if match is None:
-        state.articulation("go2")
-        return
-    with pytest.raises(TaskContractError, match=match):
-        state.articulation("go2")
+    with pytest.raises(ObsContractError, match="gravity_b"):
+        _ = state.robot("go2").gravity_b
 
 
-def test_non_tensor_leaf_is_rejected() -> None:
-    extra: dict[str, object] = dict(_extra())
-    extra["articulation/go2/applied_torque"] = [[0.0] * JOINTS] * NUM_ENVS
-    state = _state(extra)
+def test_unknown_joint_name_is_a_teaching_error() -> None:
+    state = _state()
 
-    with pytest.raises(TaskContractError, match="torch.Tensor"):
-        state.articulation("go2")
+    with pytest.raises(ObsContractError, match="missing"):
+        state.robot("go2").joints(("missing",), leaf="joint_pos")
 
 
-def test_empty_articulation_name_is_rejected() -> None:
-    state = _state(_extra())
+def test_task_state_requires_an_obs_snapshot() -> None:
+    with pytest.raises(TaskContractError, match="ObsSnapshot"):
+        TaskState(t=0, num_envs=NUM_ENVS, obs={})  # type: ignore[arg-type]
 
-    with pytest.raises(TaskContractError, match="non-empty string"):
-        state.articulation("")
+
+def test_task_state_validates_bookkeeping_tensors() -> None:
+    registry = _registry()
+    with pytest.raises(TaskContractError, match="episode_id"):
+        TaskState(t=0, num_envs=NUM_ENVS, obs=registry.snapshot(), episode_id=torch.zeros(3))
+    with pytest.raises(TaskContractError, match="reset_env_ids"):
+        TaskState(t=0, num_envs=NUM_ENVS, obs=registry.snapshot(), reset_env_ids=torch.tensor([9]))

@@ -123,7 +123,8 @@ def test_observation_columns_are_named_joint_state(task: CartPoleTask) -> None:
     task.run.settle(ids)
 
     expected = torch.cat([position, velocity], dim=1)
-    obs = task.observe(info["state"])
+    state = task._snapshot(t=info["state"].t, obs=task.env.obs.snapshot())
+    obs = task.observe(state)
     torch.testing.assert_close(obs, expected, atol=1e-5, rtol=0)
 
 

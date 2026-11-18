@@ -5,9 +5,10 @@ self-contained MuJoCo Playground ``cartpole.xml`` asset.  The cart slider is the
 only action column (a ``standard_pd`` position target); the pole hinge is
 passive and observed.  The action layout and policy binding are explicit
 module constants (``CARTPOLE_ACTION_SPEC`` / ``CARTPOLE_POLICIES``); nothing is
-inferred from the ``body`` joint set.  Observations are read from the live core model by joint
-name, because the policy-order ``articulation/.../joint_pos`` slice only covers
-the actuated ``body`` joint set and the passive pole is not part of it.
+inferred from the ``body`` joint set.  The typed observation declares
+``observations: {robot: [cartpole]}``; positions come from the full-order
+``joint_pos_rel`` view and both velocities from the full-order
+``joint_vel_full`` view (covering the passive pole joint).
 
 This module is a demo, not package API: ``examples`` is repo-only and is never
 installed into the ``unigym-rl`` wheel.
@@ -17,7 +18,7 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import torch
 from unigym.actuators.ir import ActuationGroup
@@ -25,7 +26,7 @@ from unigym.robots.base import BodyBinding, RobotProfile
 from unigym.runtime.actions import OrderedActionSpec, PolicyBinding
 from unigym.world import World
 
-from unigym_rl import EnvSpec, TaskConfigError, TaskContext, TaskEnv, TaskState, Transition
+from unigym_rl import EnvSpec, TaskConfigError, TaskEnv, TaskState, Transition
 
 if TYPE_CHECKING:
     from unigym.run.api import Run
@@ -151,8 +152,6 @@ class CartPoleTask(TaskEnv):
         self._randomize_reset = bool(randomize_reset)
         self._reset_scale = self._positive_limit(reset_position_scale, "reset_position_scale")
         self._rng = torch.Generator().manual_seed(int(seed))
-        self._cart_joint: Any = None
-        self._pole_joint: Any = None
         super().__init__(run)
         self._step_count = torch.zeros(self.num_envs, dtype=torch.int64, device=self.device)
 
@@ -166,31 +165,16 @@ class CartPoleTask(TaskEnv):
             raise TaskConfigError(f"CartPoleTask: {name} must be finite and > 0, got {number!r}")
         return number
 
-    def on_bind(self, context: TaskContext) -> None:
-        """Resolve the cart and pole joints by name on the live core model."""
-        del context
-        joints = self.instance.live.joints
-        try:
-            self._cart_joint = joints[ACTION_JOINT]
-            self._pole_joint = joints[POLE_JOINT]
-        except KeyError as exc:
-            raise TaskConfigError(
-                f"CartPoleTask: joint {exc.args[0]!r} is not in the compiled model "
-                f"of articulation {CARTPOLE_ARTICULATION!r}"
-            ) from exc
-
-    def _joint_columns(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Live ``(cart_x, pole_theta, cart_dx, pole_dtheta)`` columns."""
-        cart = torch.tensor(self._cart_joint.qpos(), dtype=torch.float32, device=self.device)
-        pole = torch.tensor(self._pole_joint.qpos(), dtype=torch.float32, device=self.device)
-        cart_dx = torch.tensor(self._cart_joint.qvel(), dtype=torch.float32, device=self.device)
-        pole_dtheta = torch.tensor(self._pole_joint.qvel(), dtype=torch.float32, device=self.device)
-        return cart, pole, cart_dx, pole_dtheta
-
     def observe(self, state: TaskState) -> torch.Tensor:
-        """Return the live ``(N, 4)`` cart/pole position and velocity block."""
-        del state
-        return torch.cat(self._joint_columns(), dim=1)
+        """Return the ``(N, 4)`` cart/pole position and velocity block.
+
+        Both positions and velocities come from the typed full-order leaves;
+        the passive pole joint is covered by ``joint_vel_full``.
+        """
+        robot = state.robot(CARTPOLE_ARTICULATION)
+        position = robot.joints(CARTPOLE_JOINTS, leaf="joint_pos_rel")
+        velocity = robot.joints(CARTPOLE_JOINTS, leaf="joint_vel_full")
+        return torch.cat((position, velocity), dim=1)
 
     def reward(self, transition: Transition) -> torch.Tensor:
         """Bounded alive reward; the exact formula is in the class docstring."""
@@ -269,6 +253,7 @@ def make_cartpole_spec(
         robot=make_cartpole_profile(),
         action_spec=CARTPOLE_ACTION_SPEC,
         policies=CARTPOLE_POLICIES,
+        observations={"robot": [CARTPOLE_ARTICULATION]},
         num_envs=num_envs,
         device=device,
         backend=backend,

@@ -117,6 +117,7 @@ spec = EnvSpec(
     spawn={"pos": (0.0, 0.0, 0.4)},          # run-owned robot root spawn
     action_spec=OrderedActionSpec(...),      # explicit; never inferred from body
     policies=(PolicyBinding(...),),          # explicit adapter ownership
+    observations={"robot": ["go2"]},         # config-declared typed sources
     num_envs=4,
     inspect=True,
 )
@@ -127,25 +128,30 @@ task = spec.make_task(MyTask)       # fresh run + task; caller closes both
 
 `make_task` validates that its argument is a `TaskEnv` subclass.
 `make_gym` imports `GymTaskEnv` lazily, so importing `unigym_rl` or using
-`EnvSpec` requires an explicit `World`, `RobotProfile`, `OrderedActionSpec` and
-`PolicyBinding` tuple; it never constructs a World or infers an action layout.
+`EnvSpec` requires an explicit `World`, `RobotProfile`, `OrderedActionSpec`,
+`PolicyBinding` tuple and `observations` declaration; it never constructs a
+World, infers an action layout or guesses observation sources.
 `EnvSpec` never imports `gymnasium`. `make_run` returns a fresh `Run` on every
 call and never builds the backend.
 
-### Typed articulation state
+### Typed observation state
 
-`TaskState.articulation(name)` resolves the core's
-`articulation/<name>/...` keys into a frozen `ArticulationState`:
+`TaskState.obs` is the core immutable `ObsSnapshot`; `TaskState.robot(name)` is
+a convenience for `state.obs.robot(name)`. Task code reads typed views and
+never parses artifact strings:
 
 ```python
-s = state.articulation("go2")
-obs = torch.cat((s.base_lin_vel_b, s.base_ang_vel_b, s.gravity_b), dim=1)
+robot = state.obs.robot("go2")
+obs = torch.cat((robot.base_lin_vel_b, robot.base_ang_vel_b, robot.gravity_b), dim=1)
+feet = state.obs.contact("feet").any()
+command = state.obs.command.value
+prev_action = state.obs.prev_action.value
 ```
 
-It validates tensor type, 2-D shape, batch rows and fixed widths (joint leaves
-share one width; base/gravity leaves have their declared widths) and raises a
-teaching `TaskContractError` for missing or malformed fields. Task code never
-parses the namespaced strings directly.
+The observation sources are declared once by `EnvSpec(observations=...)` (or
+the core run config) and the core resolves the names. `TaskState` also carries
+`episode_id`, `time_in_episode`, `reset_env_ids` and `should_reset`; there is
+no raw observation cache or `extra` record.
 
 ### Action history: `RingBuffer` + `on_step`
 
@@ -192,6 +198,7 @@ spec = EnvSpec(
     robot=robot,
     action_spec=action_spec,
     policies=policies,
+    observations={"robot": [robot.name]},
     num_envs=opts.env.num_envs,
     device=opts.env.device,
     backend=opts.env.backend,
@@ -360,7 +367,7 @@ a safe default.
 ```python
 class MyTask(TaskEnv):
     def observe(self, state):            # required -> (N, obs_dim) tensor
-        return state.obs_cache["proprio"]
+        return state.obs.robot("go2").joint_pos
 
     def reward(self, transition):        # required -> (N,) tensor
         return torch.zeros(self.num_envs)

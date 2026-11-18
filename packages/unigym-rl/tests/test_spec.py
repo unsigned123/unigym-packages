@@ -62,6 +62,7 @@ def _spec(*, num_envs: int = 1) -> EnvSpec:
         robot=_tiny_profile(),
         action_spec=ACTION_SPEC,
         policies=POLICIES,
+        observations={"robot": ["tiny"]},
         num_envs=num_envs,
         inspect=True,
     )
@@ -73,7 +74,7 @@ class TinySpecTask(TaskEnv):
     obs_dim = 2
 
     def observe(self, state: TaskState) -> torch.Tensor:
-        return state.extra["articulation/tiny/joint_pos"]
+        return state.robot("tiny").joint_pos
 
     def reward(self, transition: Transition) -> torch.Tensor:
         return -transition.next_obs[:, 0].abs()
@@ -91,6 +92,35 @@ def test_make_run_is_lazy_with_task_owned_termination_and_no_yaml() -> None:
         assert run.spec.config_path == "<memory>"
     finally:
         run.close()
+
+
+def test_observations_declaration_reaches_the_run_config() -> None:
+    spec = _spec()
+    assert spec.observations["robot"] == ["tiny"]
+    run = spec.make_run()
+    try:
+        assert run.spec.cfg["observations"]["robot"] == ["tiny"]
+    finally:
+        run.close()
+
+
+def test_envspec_rejects_malformed_observations() -> None:
+    with pytest.raises(TaskConfigError, match="observations"):
+        EnvSpec(
+            world=World.base(mjcf=FIXTURE_MJCF),
+            robot=_tiny_profile(),
+            action_spec=ACTION_SPEC,
+            policies=POLICIES,
+            observations=[("tiny",)],  # type: ignore[arg-type]
+        )
+    with pytest.raises(TaskConfigError, match="observations.robot"):
+        EnvSpec(
+            world=World.base(mjcf=FIXTURE_MJCF),
+            robot=_tiny_profile(),
+            action_spec=ACTION_SPEC,
+            policies=POLICIES,
+            observations={"contact": ["base"]},
+        )
 
 
 def test_make_run_uses_null_episode_length_as_no_core_clock() -> None:
@@ -152,6 +182,7 @@ def test_num_envs_below_one_is_rejected(num_envs: int) -> None:
             robot=_tiny_profile(),
             action_spec=ACTION_SPEC,
             policies=POLICIES,
+            observations={"robot": ["tiny"]},
             num_envs=num_envs,
         )
 
@@ -163,6 +194,7 @@ def test_non_integer_num_envs_is_rejected() -> None:
             robot=_tiny_profile(),
             action_spec=ACTION_SPEC,
             policies=POLICIES,
+            observations={"robot": ["tiny"]},
             num_envs=True,  # type: ignore[arg-type]
         )
 
@@ -175,6 +207,7 @@ def test_spawn_is_run_owned_and_reaches_the_articulation() -> None:
         spawn={"pos": (0.0, 0.0, 0.75)},
         action_spec=ACTION_SPEC,
         policies=POLICIES,
+        observations={"robot": ["tiny"]},
         inspect=True,
     )
     run = spec.make_run()
@@ -194,6 +227,7 @@ def test_envspec_rejects_a_non_mapping_spawn() -> None:
             spawn=(0.0, 0.0, 0.5),  # type: ignore[arg-type]
             action_spec=ACTION_SPEC,
             policies=POLICIES,
+            observations={"robot": ["tiny"]},
         )
 
 
@@ -205,6 +239,7 @@ def test_envspec_requires_a_complete_robot_profile() -> None:
             robot={"name": "tiny"},  # type: ignore[arg-type]
             action_spec=ACTION_SPEC,
             policies=POLICIES,
+            observations={"robot": ["tiny"]},
         )
 
 
@@ -216,6 +251,7 @@ def test_envspec_requires_an_explicit_action_spec() -> None:
             robot=_tiny_profile(),
             action_spec=[],  # type: ignore[arg-type]
             policies=POLICIES,
+            observations={"robot": ["tiny"]},
         )
 
 
@@ -227,6 +263,7 @@ def test_envspec_requires_explicit_policy_bindings() -> None:
             robot=_tiny_profile(),
             action_spec=ACTION_SPEC,
             policies=(),  # type: ignore[arg-type]
+            observations={"robot": ["tiny"]},
         )
 
 
@@ -253,7 +290,7 @@ def test_envspec_contacts_default_to_no_declaration() -> None:
     task = spec.make_task(TinySpecTask)
     try:
         _, info = task.reset()
-        assert not [key for key in info["state"].extra if key.startswith("contact/")]
+        assert not [key for key in info["state"].obs.keys() if key.startswith("contact/")]
     finally:
         task.close()
         task.run.close()
@@ -266,6 +303,7 @@ def test_envspec_rejects_a_non_tuple_contact_declaration() -> None:
             robot=_tiny_profile(),
             action_spec=ACTION_SPEC,
             policies=POLICIES,
+            observations={"robot": ["tiny"]},
             contacts=[BASE_CONTACT_GROUP],  # type: ignore[arg-type]
         )
 
@@ -286,6 +324,7 @@ def test_envspec_rejects_invalid_contact_entries(entry: dict) -> None:
             robot=_tiny_profile(),
             action_spec=ACTION_SPEC,
             policies=POLICIES,
+            observations={"robot": ["tiny"]},
             contacts=(entry,),
         )
 
@@ -297,6 +336,7 @@ def test_envspec_contact_declaration_reaches_the_run_and_is_published() -> None:
         robot=_tiny_profile(),
         action_spec=ACTION_SPEC,
         policies=POLICIES,
+        observations={"robot": ["tiny"], "contact": ["base"]},
         contacts=(BASE_CONTACT_GROUP,),
         inspect=True,
     )
@@ -310,7 +350,7 @@ def test_envspec_contact_declaration_reaches_the_run_and_is_published() -> None:
     task = spec.make_task(TinySpecTask)
     try:
         _, info = task.reset()
-        value = info["state"].extra["contact/base"]
+        value = info["state"].obs.contact("base").value
         assert value.shape == (1, 1)
         assert value.dtype is torch.bool
     finally:

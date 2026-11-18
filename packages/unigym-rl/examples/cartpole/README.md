@@ -32,11 +32,10 @@ What it proves:
 action layout is never inferred from the `body` joint set. `EnvSpec` also
 requires an explicit `World`; it never constructs one.
 
-The policy-order `articulation/cartpole/joint_pos` slice only covers the
-actuated `body` joint set, so it contains the cart but not the passive pole.
-The demo therefore reads the cart and pole joints by name from the live core
-model (`run.build().live.joints[...]`), which keeps the column order explicit.
-No `set_root_state` is used: the CartPole base is fixed.
+The run declares `observations: {robot: [cartpole]}`. Positions and velocities
+come from the typed full-order `joint_pos_rel` and `joint_vel_full` views, so
+the passive pole joint is covered without reading the live model. No
+`set_root_state` is used: the CartPole base is fixed.
 
 Randomized resets are off by default. Pass `randomize_reset=True` (and
 optionally `reset_position_scale=...`, `seed=...`) to
@@ -90,8 +89,9 @@ the core layer with its own teaching error rather than being silently ignored.
   not hidden by the demo.
 - No trainer, checkpoint format, evaluation harness, or convergence guarantee.
 - Fixed-base, single-articulation, one-action cart only.
-- Observation reads the live model rather than the policy-order `extra` slice,
-  because the passive pole is absent from that slice.
+- Observation reads typed `state.obs.robot("cartpole")` positions and the
+  full-order `joint_vel_full` velocities; the passive pole joint is covered by
+  the typed view, not a live model read.
 
 ## Asset provenance
 
