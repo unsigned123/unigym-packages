@@ -191,6 +191,7 @@ spec = EnvSpec(
     policies=policies,
     num_envs=opts.env.num_envs,
     device=opts.env.device,
+    backend=opts.env.backend,
     seed=opts.env.seed,
 )
 task = spec.make_task(MyTask, max_steps=opts.env.max_episode_steps)
@@ -199,18 +200,27 @@ task = spec.make_task(MyTask, max_steps=opts.env.max_episode_steps)
 
 ```bash
 python train.py --num-envs 8 --max-episode-steps 500 --device cpu \
-  --seed 0 --max-iterations 1000 --rollout-steps 64
+  --backend mujoco --seed 0 --max-iterations 1000 --rollout-steps 64
 ```
 
 Hyphenated flags are canonical; underscore aliases (`--num_envs`,
 `--max_episode_steps`, `--max_iterations`, `--rollout_steps`) behave
 identically. Defaults: `num_envs=8`, `max_episode_steps=500`, `device="cpu"`,
-`seed=0`, `max_iterations=1000`, `rollout_steps=64`. Positive-int fields reject
-values below 1 both on the CLI and in direct dataclass construction; an empty
-`device` is rejected.
+`backend="mujoco"`, `seed=0`, `max_iterations=1000`, `rollout_steps=64`.
+Positive-int fields reject values below 1 both on the CLI and in direct
+dataclass construction; empty `device` and `backend` strings are rejected.
 
-Parameter ownership: `num_envs` / `device` / `seed` go to `EnvSpec`;
-`max_episode_steps` is the task truncation budget; `max_iterations` /
+`--backend` selects the simulation backend (`mujoco`, `isaaclab2`,
+`isaaclab3`); the core layer validates the name and its availability. For
+example:
+
+```bash
+--backend mujoco --device cpu
+--backend isaaclab2 --device cuda:0
+```
+
+Parameter ownership: `num_envs` / `device` / `backend` / `seed` go to
+`EnvSpec`; `max_episode_steps` is the task truncation budget; `max_iterations` /
 `rollout_steps` are reserved for a future trainer. The parser never constructs
 an `EnvSpec`, `World`, robot, task, or trainer, and no CLI value is propagated
 to `TaskEnv.reset`.
@@ -279,8 +289,9 @@ class MyTask(TaskEnv):
   installed `unigym-robots` pack profile, a 48-column observation, per-env
   commands, tracking/alive rewards, task-owned tilt/height/time termination,
   and an 8-env manual skrl PPO loop. It requires
-  `unigym-robots download --set mjcf-v0` first (never auto-downloaded); see
-  `examples/go2_velocity/README.md`.
+  `unigym-robots download --set mjcf-v0` for MuJoCo (or
+  `--set usd-go2-v0` for `--backend isaaclab2`); assets are never
+  auto-downloaded. See `examples/go2_velocity/README.md`.
 
 ## Installing / testing
 

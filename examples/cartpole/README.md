@@ -70,6 +70,17 @@ PYTHONPATH=/data1/code/dlx/unigym-core:/data1/code/dlx/unigym-rl/src \
 The script prints per-iteration mean reward and episode count. It does not
 checkpoint, log to a service, or claim convergence.
 
+`--backend` defaults to `mujoco`. CartPole is MuJoCo-only: the flag is forwarded
+to `EnvSpec`, so selecting another backend (e.g. `--backend isaaclab2`) fails in
+the core layer with its own teaching error rather than being silently ignored.
+
+```bash
+# default backend
+--backend mujoco --device cpu
+# rejected by core for this MuJoCo-only demo
+--backend isaaclab2 --device cuda:0
+```
+
 ## Known limitations
 
 - **Action clipping vs log-probability.** The Gaussian policy samples

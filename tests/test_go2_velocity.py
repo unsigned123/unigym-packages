@@ -272,6 +272,30 @@ def test_eight_env_construction_and_one_step() -> None:
         _close(env)
 
 
+def test_train_skrl_forwards_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``--backend`` reaches the task builder unchanged."""
+    previous_task = sys.modules.get("task")
+    sys.modules["task"] = go2_task
+    try:
+        train_skrl = _load_module("go2_velocity_train_skrl_backend", "train_skrl.py")
+        seen: dict[str, Any] = {}
+
+        def _capture(**kwargs: Any) -> Any:
+            seen.update(kwargs)
+            raise RuntimeError("stop-after-forward")
+
+        monkeypatch.setattr(train_skrl, "make_go2_velocity_gym", _capture)
+        with pytest.raises(RuntimeError, match="stop-after-forward"):
+            train_skrl.main(["--backend", "isaaclab2", "--num-envs", "2"])
+    finally:
+        if previous_task is None:
+            sys.modules.pop("task", None)
+        else:
+            sys.modules["task"] = previous_task
+    assert seen["backend"] == "isaaclab2"
+    assert seen["num_envs"] == 2
+
+
 def test_skrl_eight_env_smoke() -> None:
     """One manual-PPO iteration on eight Go2 envs when skrl is installed."""
     pytest.importorskip("skrl")

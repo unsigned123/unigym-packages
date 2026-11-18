@@ -1,7 +1,8 @@
 """Manual skrl PPO smoke loop for the flat-ground Go2 velocity task.
 
 This script is deliberately not a trainer: it parses the shared CLI options,
-builds the real MuJoCo task through :func:`task.make_go2_velocity_gym`, wraps it
+builds the real task through :func:`task.make_go2_velocity_gym` (MuJoCo by
+default, or the backend named by ``--backend``), wraps it
 with ``skrl.envs.wrappers.torch.wrap_env``, and runs a hand-written
 ``act`` / ``record_transition`` / ``update`` loop with the same small PPO
 policy/value nets as the CartPole smoke.  There is no checkpointing, logging
@@ -124,6 +125,7 @@ def main(argv: list[str] | None = None) -> int:
         max_steps=options.env.max_episode_steps,
         device=options.env.device,
         seed=options.env.seed,
+        backend=options.env.backend,
     )
     env = wrap_env(gym_env, wrapper="gymnasium", verbose=False)
     standby = torch.tensor(GO2_DEFAULT_JOINT_POS, dtype=torch.float32, device=device)

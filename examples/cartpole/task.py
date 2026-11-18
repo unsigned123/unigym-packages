@@ -256,8 +256,14 @@ class CartPoleTask(TaskEnv):
         return transition.next_obs[:, 1].abs() > self._pole_limit
 
 
-def make_cartpole_spec(*, num_envs: int, device: str | None = None, seed: int = 0) -> EnvSpec:
-    """Build the demo ``EnvSpec`` over the bundled absolute MJCF path."""
+def make_cartpole_spec(
+    *, num_envs: int, device: str | None = None, seed: int = 0, backend: str = "mujoco"
+) -> EnvSpec:
+    """Build the demo ``EnvSpec`` over the bundled absolute MJCF path.
+
+    CartPole is MuJoCo-only; other backends are passed through so the core
+    layer can reject them with its own teaching error.
+    """
     return EnvSpec(
         world=World.base(mjcf=CARTPOLE_XML),
         robot=make_cartpole_profile(),
@@ -265,6 +271,7 @@ def make_cartpole_spec(*, num_envs: int, device: str | None = None, seed: int = 
         policies=CARTPOLE_POLICIES,
         num_envs=num_envs,
         device=device,
+        backend=backend,
         seed=seed,
         inspect=True,
     )
@@ -276,10 +283,11 @@ def make_cartpole_task(
     max_steps: int,
     device: str | None = None,
     seed: int = 0,
+    backend: str = "mujoco",
     **task_kwargs: object,
 ) -> CartPoleTask:
     """Build a fresh real-MuJoCo :class:`CartPoleTask`."""
-    spec = make_cartpole_spec(num_envs=num_envs, device=device, seed=seed)
+    spec = make_cartpole_spec(num_envs=num_envs, device=device, seed=seed, backend=backend)
     task = spec.make_task(CartPoleTask, max_steps=max_steps, seed=seed, **task_kwargs)
     assert isinstance(task, CartPoleTask)
     return task
@@ -291,6 +299,7 @@ def make_cartpole_gym(
     max_steps: int,
     device: str | None = None,
     seed: int = 0,
+    backend: str = "mujoco",
     **task_kwargs: object,
 ) -> GymTaskEnv:
     """Wrap the demo task in the optional Gymnasium face (lazy import)."""
@@ -299,6 +308,7 @@ def make_cartpole_gym(
         max_steps=max_steps,
         device=device,
         seed=seed,
+        backend=backend,
         **task_kwargs,
     )
     try:

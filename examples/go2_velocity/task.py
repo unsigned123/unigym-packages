@@ -226,13 +226,13 @@ class Go2VelocityTask(TaskEnv):
     # hooks
     # ------------------------------------------------------------------ #
     def on_bind(self, context: TaskContext) -> None:
-        """Resolve the Go2 joints and standby pose on the live model/profile."""
-        joints = context.instance.live.joints
-        missing = [joint for joint in GO2_JOINTS if joint not in joints]
-        if missing:
-            raise TaskConfigError(
-                f"Go2VelocityTask: compiled articulation is missing joints {missing}"
-            )
+        """Resolve the Go2 joints and standby pose from the profile/live model.
+
+        The live-model joint check is backend-specific: ``mujoco``/``mjwarp``
+        expose it, while ``isaaclab2`` publishes the compiled articulation
+        only through the typed state record.  On the latter the profile joint
+        order (validated immediately below) is the source of truth.
+        """
         profile = context.instance.profile
         if profile is None:
             raise TaskConfigError("Go2VelocityTask: the run has no robot profile")
@@ -241,6 +241,15 @@ class Go2VelocityTask(TaskEnv):
             raise TaskConfigError(
                 "Go2VelocityTask: the profile full joint order no longer matches "
                 f"GO2_JOINTS: {full_joint_names}"
+            )
+        try:
+            joints = context.instance.live.joints
+        except NotImplementedError:
+            joints = full_joint_names
+        missing = [joint for joint in GO2_JOINTS if joint not in joints]
+        if missing:
+            raise TaskConfigError(
+                f"Go2VelocityTask: compiled articulation is missing joints {missing}"
             )
         self._default_joint_pos = torch.tensor(
             [float(profile.default_joint_pos[joint]) for joint in GO2_JOINTS],

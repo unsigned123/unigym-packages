@@ -20,11 +20,12 @@ What it proves:
 ## Assets (required first)
 
 The example never downloads anything. Install the assets package, then fetch
-the pinned MJCF set:
+the pinned sets for the backends you use:
 
 ```bash
 pip install unigym-robots
-unigym-robots download --set mjcf-v0
+unigym-robots download --set mjcf-v0      # MuJoCo backend
+unigym-robots download --set usd-go2-v0   # IsaacLab 2.x backend
 ```
 
 `make_go2_velocity_spec()` resolves `release:go2-mjcf` from that install and
@@ -58,7 +59,9 @@ base_lin_vel_b (3) | base_ang_vel_b (3) | gravity_b (3)
 `TaskState.articulation` reads the extra record because this smoke does not
 request a core observation catalog; the extra record always publishes the
 namespaced articulation keys. Joint columns follow the profile joint order
-`GO2_JOINTS`; the task verifies every name on the live model at bind time.
+`GO2_JOINTS`; at bind time the task verifies every name against the live model
+on backends that expose one (`mujoco`, `mjwarp`) and otherwise falls back to the
+validated profile joint order (`isaaclab2` publishes no live proxy).
 
 Reward terms (no `RewardManager`/`TerminationManager`; direct hooks keep the
 task-owned command/action/clock state in one place):
@@ -104,6 +107,18 @@ PYTHONPATH=/data1/code/dlx/unigym-core:/data1/code/dlx/unigym-rl/src \
   /data1/code/dlx/unigym-core/.venv/bin/python \
   examples/go2_velocity/train_skrl.py --num-envs 8 --max-iterations 1 \
   --rollout-steps 4
+```
+
+`--backend` selects the simulation backend (default `mujoco`):
+
+```bash
+# MuJoCo on CPU
+... examples/go2_velocity/train_skrl.py --backend mujoco --device cpu \
+  --num-envs 8 --max-iterations 1 --rollout-steps 4
+
+# IsaacLab 2.x on GPU
+... examples/go2_velocity/train_skrl.py --backend isaaclab2 --device cuda:0 \
+  --num-envs 1024 --max-iterations 1 --rollout-steps 4
 ```
 
 The default is 8 envs, 500 max episode steps, 1000 iterations and 64 rollout
