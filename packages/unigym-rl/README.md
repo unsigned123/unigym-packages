@@ -1,7 +1,10 @@
 # unigym-rl
 
 L2 task-environment layer over [`unigym`](https://github.com/unsigned123/unigym)
-core.
+core. This package is developed and released in
+`packages/unigym-rl` of
+[`unigym-packages`](https://github.com/unsigned123/unigym-packages); core stays
+in its own repository.
 
 ```text
 core Run / ExternalRunner / reset / state
@@ -297,22 +300,36 @@ class MyTask(TaskEnv):
 
 ## Installing / testing
 
-R0 needs no install. Run the tests with the core checkout on `PYTHONPATH`
-(adjust the interpreter for your environment):
+`unigym-rl` is developed and released from
+`packages/unigym-rl` in the
+[`unigym-packages`](https://github.com/unsigned123/unigym-packages)
+repository. Core is not on PyPI yet, so install `unigym` from a checkout and
+install this package against it from `packages/unigym-rl`:
 
 ```bash
-PYTHONPATH=/data1/code/dlx/unigym-core:/data1/code/dlx/unigym-rl/src \
-  /data1/code/dlx/unigym-core/.venv/bin/python -m pytest tests -q
+git clone https://github.com/unsigned123/unigym ../unigym-core
+pip install -e ../unigym-core
+pip install -e '.[gymnasium,skrl]'
+```
+
+From the **root of the `unigym-packages` repository**, run the tests with the
+core checkout on `PYTHONPATH` (adjust paths for your environment):
+
+```bash
+PYTHONPATH=../unigym-core:packages/unigym-rl/src \
+  python -m pytest packages/unigym-rl/tests -q
 ```
 
 Static checks:
 
 ```bash
-PYTHONPATH=/data1/code/dlx/unigym-core:/data1/code/dlx/unigym-rl/src \
-  /data1/code/dlx/unigym-core/.venv/bin/python -m ruff check src tests examples
-PYTHONPATH=/data1/code/dlx/unigym-core:/data1/code/dlx/unigym-rl/src \
-  /data1/code/dlx/unigym-core/.venv/bin/python -m ruff format --check src tests examples
+python -m ruff check packages/unigym-rl/src packages/unigym-rl/tests packages/unigym-rl/examples
+python -m ruff format --check packages/unigym-rl/src packages/unigym-rl/tests packages/unigym-rl/examples
 ```
+
+Releases declare a core range in `pyproject.toml`
+(`unigym>=0.106,<0.107`) and are tagged `unigym-rl-v<version>`; see
+`COMPATIBILITY.md` at the repository root.
 
 ## External termination mode
 

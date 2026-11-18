@@ -51,19 +51,19 @@ The gymnasium and skrl extras are needed only for the training script:
 pip install -e '.[gymnasium,skrl]'
 ```
 
-From the repo root with the core checkout on `PYTHONPATH`:
+From `packages/unigym-rl` with the core checkout on `PYTHONPATH`:
 
 ```bash
-PYTHONPATH=/data1/code/dlx/unigym-core:/data1/code/dlx/unigym-rl/src \
-  /data1/code/dlx/unigym-core/.venv/bin/python \
+PYTHONPATH=../unigym-core:src \
+  python \
   examples/cartpole/train_skrl.py --max-iterations 10 --rollout-steps 16
 ```
 
 A one-iteration smoke:
 
 ```bash
-PYTHONPATH=/data1/code/dlx/unigym-core:/data1/code/dlx/unigym-rl/src \
-  /data1/code/dlx/unigym-core/.venv/bin/python \
+PYTHONPATH=../unigym-core:src \
+  python \
   examples/cartpole/train_skrl.py --max-iterations 1 --rollout-steps 2
 ```
 

@@ -4,12 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "unigym-rl"
-version = "0.0.0"
-description = "L2 task-environment contract over unigym core (R0 skeleton)"
+version = "0.1.0"
+description = "L2 task-environment layer over unigym core"
 readme = "README.md"
 requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "unsigned123" }]
 dependencies = [
-    "unigym",
+    "unigym>=0.106,<0.107",
     "torch",
     "numpy",
 ]
@@ -17,6 +19,11 @@ dependencies = [
 [project.optional-dependencies]
 gymnasium = ["gymnasium>=1.0,<2"]
 skrl = ["skrl>=2.1,<3"]
+
+[project.urls]
+Homepage = "https://github.com/unsigned123/unigym-packages"
+Source = "https://github.com/unsigned123/unigym-packages/tree/main/packages/unigym-rl"
+Core = "https://github.com/unsigned123/unigym"
 
 [tool.setuptools.packages.find]
 where = ["src"]

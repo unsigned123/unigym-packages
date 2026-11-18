@@ -130,11 +130,11 @@ by the action-group name.
 
 ## Run
 
-From the repo root with the core checkout on `PYTHONPATH`:
+From `packages/unigym-rl` with the core checkout on `PYTHONPATH`:
 
 ```bash
-PYTHONPATH=/data1/code/dlx/unigym-core:/data1/code/dlx/unigym-rl/src \
-  /data1/code/dlx/unigym-core/.venv/bin/python \
+PYTHONPATH=../unigym-core:src \
+  python \
   examples/go2_velocity/train_skrl.py --num-envs 8 --max-iterations 1 \
   --rollout-steps 4
 ```
