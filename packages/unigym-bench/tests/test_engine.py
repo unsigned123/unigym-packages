@@ -12,11 +12,11 @@ from unigym.core.episode_termination import (
     EpisodeTermination,
     TerminationSource,
 )
-from unigym.signals import SignalBus
+from unigym.values import StepValues, ValueStore
 
 from unigym_bench.engine import EngineStateError, StreamingEngine
 from unigym_bench.events import Event
-from unigym_bench.monitors import ThresholdMonitor
+from unigym_bench.monitors import PredicateMonitor, ThresholdMonitor
 from unigym_bench.specs import RetentionSpec
 from _support import (
     ScriptedMonitor,
@@ -177,44 +177,44 @@ def test_signal_publication_is_namespaced() -> None:
         "second",
         {0: TickScript(signals={"value": torch.tensor([3.0, 4.0])})},
     )
-    bus = SignalBus(num_envs=2, device="cpu")
-    engine = StreamingEngine([first, second], publisher=bus)
+    store = ValueStore(num_envs=2, device="cpu")
+    engine = StreamingEngine([first, second], publisher=store.publisher("sink"))
 
     engine.on_step(make_bundle(num_envs=2, t=0))
 
-    snapshot = bus.snapshot()
+    snapshot = store.snapshot()
     assert set(snapshot) == {"first/level", "first/active", "second/value"}
     assert snapshot["first/level"].tolist() == [1.0, 2.0]
     assert snapshot["first/active"].tolist() == [True, False]
     assert snapshot["second/value"].tolist() == [3.0, 4.0]
 
 
-def test_signals_are_not_published_for_a_closed_env_tick() -> None:
+def test_values_are_not_published_for_a_closed_env_tick() -> None:
     monitor = ScriptedMonitor(
-        "signals",
+        "levels",
         {
             0: TickScript(signals={"level": torch.tensor([1.0, 2.0])}),
             1: TickScript(signals={"level": torch.tensor([3.0, 4.0])}),
             2: TickScript(signals={"level": torch.tensor([5.0, 6.0])}),
         },
     )
-    bus = SignalBus(num_envs=2, device="cpu")
+    store = ValueStore(num_envs=2, device="cpu")
     engine = StreamingEngine(
         [monitor],
-        publisher=bus,
+        publisher=store.publisher("sink"),
         retention=RetentionSpec(retain_episodes=True),
     )
 
     engine.on_step(make_bundle(num_envs=2, t=0))
-    assert bus.snapshot()["signals/level"].tolist() == [1.0, 2.0]
+    assert store.snapshot()["levels/level"].tolist() == [1.0, 2.0]
 
     engine.on_episode_end([1], make_bundle(num_envs=2, t=0))
     engine.on_step(make_bundle(num_envs=2, t=1))
-    assert bus.snapshot()["signals/level"].tolist() == [1.0, 2.0]
+    assert store.snapshot()["levels/level"].tolist() == [1.0, 2.0]
 
     engine.on_reset([1])
     engine.on_step(make_bundle(num_envs=2, t=2))
-    assert bus.snapshot()["signals/level"].tolist() == [5.0, 6.0]
+    assert store.snapshot()["levels/level"].tolist() == [5.0, 6.0]
 
 
 def test_episode_end_reset_and_reopen_start_a_new_sequence() -> None:
@@ -368,3 +368,109 @@ def test_engine_does_not_retain_tick_tensors_or_unrequested_records() -> None:
     engine.on_episode_end([0], make_bundle(num_envs=1, t=0))
     assert engine.records == ()
     assert engine.summary.episodes == 1
+
+
+def _final_predicate() -> "PredicateMonitor":
+    return PredicateMonitor(
+        "end_pred",
+        {"source": "value:flag", "op": "gt", "value": 0.0},
+        "episode_end",
+        {
+            "event": "done",
+            "severity": "warning",
+            "terminal_reason": "score",
+            "terminal_outcome": "success",
+        },
+    )
+
+
+def test_episode_end_uses_final_step_values_and_publishes_final_levels() -> None:
+    monitor = _final_predicate()
+    store = ValueStore(num_envs=1, device="cpu")
+    engine = StreamingEngine(
+        [monitor],
+        publisher=store.publisher("sink"),
+        retention=RetentionSpec(retain_episodes=True),
+    )
+    bundle = make_bundle(
+        num_envs=1,
+        t=0,
+        values=StepValues({"flag": torch.tensor([0.0])}),
+        final_values=StepValues({"flag": torch.tensor([1.0])}),
+    )
+
+    engine.on_step(bundle)
+    assert monitor.signals()["fired"].tolist() == [False]
+    assert store.snapshot()["end_pred/fired"].tolist() == [False]
+
+    engine.on_episode_end([0], bundle)
+
+    assert engine.records[0].event_counts == {"task.end_pred.done": 1}
+    assert engine.summary.event_count == 1
+    assert engine.summary.termination_code_counts == {"custom.end_pred.score": 1}
+    assert engine.summary.termination_outcome_counts == {"success": 1}
+    assert engine.summary.termination_source_counts == {"custom": 1}
+    assert engine.drain_terminations() == {}
+    assert engine.conflicts == {}
+    assert store.snapshot()["end_pred/fired"].tolist() == [True]
+
+
+def test_final_scoring_terminal_does_not_enter_the_runner_latch_or_drain() -> None:
+    tick = ScriptedMonitor(
+        "tick",
+        {0: TickScript(terminals={0: make_termination("custom.tick.hit")})},
+    )
+    final = _final_predicate()
+    engine = StreamingEngine(
+        [tick, final],
+        retention=RetentionSpec(retain_episodes=True),
+    )
+    bundle = make_bundle(
+        num_envs=1,
+        t=0,
+        values=StepValues({"flag": torch.tensor([0.0])}),
+        final_values=StepValues({"flag": torch.tensor([1.0])}),
+    )
+
+    engine.on_step(bundle)
+    assert set(engine.drain_terminations()) == {0}
+    engine.on_episode_end([0], bundle)
+
+    assert engine.conflicts == {}
+    assert engine.drain_terminations() == {}
+    assert engine.summary.termination_code_counts == {
+        "custom.end_pred.score": 1,
+        "custom.tick.hit": 1,
+    }
+    assert engine.records[0].event_counts == {"task.end_pred.done": 1}
+
+
+def test_episode_end_requires_the_final_step_context() -> None:
+    engine = StreamingEngine([ScriptedMonitor("idle", {})])
+    bundle = make_bundle(num_envs=1, t=0)
+    engine.on_step(bundle)
+    del bundle["final_step"]
+
+    with pytest.raises(EngineStateError, match="final_step"):
+        engine.on_episode_end([0], bundle)
+
+
+def test_on_step_reads_tick_values_not_the_final_step_values() -> None:
+    monitor = PredicateMonitor(
+        "tick_pred",
+        {"source": "value:flag", "op": "gt", "value": 0.0},
+        "tick",
+        {"event": "hit"},
+    )
+    engine = StreamingEngine([monitor])
+    bundle = make_bundle(
+        num_envs=1,
+        t=0,
+        values=StepValues({"flag": torch.tensor([0.0])}),
+        final_values=StepValues({"flag": torch.tensor([1.0])}),
+    )
+
+    engine.on_step(bundle)
+
+    assert engine.journal == ()
+    assert engine.summary.event_count == 0

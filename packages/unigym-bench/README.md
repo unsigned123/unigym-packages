@@ -5,20 +5,32 @@ streaming, monitor-driven benchmarking layer on the public sink, evaluation,
 value and step-context contracts, without importing `unigym.benchmarks`,
 `unigym.runner.evaluation` or `unigym.runner.episodes`.
 
-Status: P12 (core `0.107.0` value/context baseline; no throughput claim).
+Status: P15 (core `0.107.0` value/context baseline; no throughput claim).
 P10 moves the import fence and version pin to core C13: the pack requires
 `unigym>=0.107,<0.108`, `CORE_SURFACE_VERSION` is `3`, and the fence checks
 `unigym.values` (`ValueStore`, `ValueView`, `ValuePublisher`, `StepValues`)
 and `unigym.evaluation.EnvStepContext` instead of the removed
-`unigym.signals`. Runtime migration is in progress: P11 replaces the pack
-`TickFrame` with `BenchmarkStepContext` (a core `EnvStepContext` subclass), and
-the streaming engine now reads only `bundle["step"]` while monitors take the
-core context. P12 adds the pack-owned source resolver (`unigym_bench.sources`)
-and condition DSL (`unigym_bench.conditions`); it does not migrate the sampler.
-The sink and sampler still use the P9 signal vocabulary, and value publication
-plus final-context recording (including sampler value migration) are P15 work.
-The package
-already contains the P0-P9 tree: version metadata, the core-contract import
+`unigym.signals`. Runtime migration is complete through P15: P11 replaces the
+pack `TickFrame` with `BenchmarkStepContext` (a core `EnvStepContext`
+subclass), P12 adds the source resolver and condition DSL, and P13 adds
+`PredicateMonitor`. P15 moves the runtime onto the core value transport:
+
+- `make_sink` reads `ctx.values` as a `ValuePublisher`, and `sink-steered`
+  fails fast when it is absent;
+- the engine consumes `bundle["step"]` for ticks and `bundle["final_step"]` for
+  episode-end evaluation, publishes monitor values as `<monitor>/<local>` and
+  never uses a raw signal publisher;
+- `PredicateMonitor.on_episode_end` evaluates final-context `episode_end`
+  predicates; their events are recorded in the ending episode and their
+  report/scoring terminals are counted in the aggregate/report without a
+  runner drain or latch conflict;
+- `ScenarioSampler.bind_values(ValueView)` replaces `bind_signals`;
+- the pack rewind schema is `unigym_bench.rewind/3` and monitor snapshots are
+  `unigym_bench.monitor/2`; older payloads are rejected explicitly.
+
+P14 (collapse the built-in monitors) and P16 (TaskDocument composition) remain
+later cards. The package
+already contains the P0-P15 tree: version metadata, the core-contract import
 fence, strict JSON helpers, the closed YAML task-spec loader
 (`unigym_bench.specs`), the monitor protocol with the v1 built-in monitors
 (`unigym_bench.monitors`), the streaming engine
@@ -48,15 +60,6 @@ that declares an extension is emitted only through that extension's
 the core `benchmark_report.json` or `results.json`.
 
 ## Authoring a run
-
-> **P9-era construction path on core C13.** The example and `make_sink` details
-> below describe the P9 pack as it ran against core `0.106.x`. Core C13
-> (`0.107.0`) exposes `SinkContext.values` backed by `ValueStore`/`ValueView`
-> and has removed the signal surface. P11 migrates only the engine's step
-> context and monitor signatures; P12 adds the source resolver and condition
-> DSL only. The sink and sampler still use the P9 signal vocabulary, so
-> `make_sink` and the P9 pack suite are expected to be red or unusable until
-> P15 (sink value publication, sampler migration, final context) lands.
 
 The pack is mounted as a core custom sink. A real benchmark run therefore keeps
 the run config in charge of the body/backend and gives the pack only its
@@ -93,13 +96,11 @@ summary = runner.run(stop_when=instance.stop_when)
 `monitor_factory` and `extension_factory` are zero-argument callables, given as
 `module:callable` paths, that return the instances in task declaration order;
 they must be importable from the run process. A factory is the only injection
-seam because monitor/extension instances are not JSON-safe. In the un-migrated
-P9 code, `make_sink(ctx)` fails fast on unknown options, an unknown loop mode, a
-`sink-steered` run without `ctx.signals`, `runner.auto_reset: false`, or a
-declared `monitor_extensions` reference that does not exist. On core C13 the
-equivalent construction context is `ctx.values` (`ValueStore`/`ValueView`); the
-`ctx.signals` branch is P9-era and is removed by the P11/P15 sink and engine
-migration.
+seam because monitor/extension instances are not JSON-safe. `make_sink(ctx)`
+fails fast on unknown options, an unknown loop mode, a `sink-steered` run
+without `ctx.values`, `runner.auto_reset: false`, or a declared
+`monitor_extensions` reference that does not exist. `ctx.values` is the core
+`ValuePublisher` from `SinkContext`; the pack never reads a signal surface.
 
 With `write_report: true` the sink writes the assembled document to
 `<out_dir>/external_benchmark_report.json` at run end. The filename and the
@@ -141,10 +142,14 @@ memory only in this revision: no event log file is written.
 ## Monitors
 
 `unigym_bench.monitors.Monitor` is the stateful per-env contract. A monitor
-observes a `BenchmarkStepContext` (a core `EnvStepContext` subclass), returns per-env level signals, drains one-shot `Event`
-occurrences and core `Termination` requests, observes the due env ids through
-`on_episode_end(env_ids)`, clears per-env measurement state through `reset`,
-and contributes a JSON-safe `report_view`. Stateful built-ins implement the
+observes a `BenchmarkStepContext` (a core `EnvStepContext` subclass), returns
+per-env level values, drains one-shot `Event` occurrences and runner
+`Termination` requests, and observes the due env ids plus the final step
+context through `on_episode_end(env_ids, final_context)`. Episode-end
+report/scoring terminals are drained through the separate optional
+`drain_episode_terminals()` face, never through the runner drain. A monitor
+clears per-env measurement state through `reset` and contributes a JSON-safe
+`report_view`. Stateful built-ins implement the
 optional `RewindableMonitor.snapshot()/restore()` capability with JSON-safe
 private copies; a snapshot carries a construction/config fingerprint and
 `restore` rejects a monitor with a different configuration.
@@ -159,44 +164,38 @@ Monitors never retain a frame, view or tensor.
 
 ## Closed loop
 
-> **P9-era closed loop, not P10 behavior.** The `SignalView`, `SignalBus`,
-> `ctx.signals` and `bind_signals` statements below describe the P9 pack against
-> core `0.106.x`. Core C13 (`0.107.0`) removed `unigym.signals` and exposes
-> `SinkContext.values` plus `ValueStore`/`ValueView`/`ValuePublisher`/
-> `StepValues`. The un-migrated sampler and sink value publication are expected
-> to be red or unusable until P15 (sink, final context, sampler); P12 adds only
-> the source resolver and condition DSL. The command names and latency
-> described here are P9-era, not a current claim.
-
-In the P9 code that still ships, the pack engine published every monitor's
-per-env level signals under `<monitor>/<signal>`. A monitor named `scenario`
-therefore published the closed-loop convention:
+The pack engine publishes every monitor's per-env level values under
+`<monitor>/<local>` through the core `ValuePublisher` that `make_sink` receives
+as `ctx.values`. A monitor named `scenario` therefore owns the closed-loop
+convention:
 
 - `scenario/desired_cmd`: a `float32` tensor of shape `(num_envs, dim)` on the
   run device; every value must be finite;
 - `scenario/command_valid`: an optional `bool` tensor of shape `(num_envs,)`;
   `False` rows keep their previous command, `True` rows take the desired row.
 
-`ScenarioSampler.bind_signals` (the P9 name, not a P10 API) requires the full
-read-only `SignalView` (`get` and `snapshot`) and stores it; `update` reads only
-those two names. It applies a valid desired command to `self.cmd` for the next
-env step and never advances the sampler cursor or RNG; without a desired command
-the pool/cursor behavior is unchanged. The sampler never scans the namespace,
-never falls back to another monitor's signals and never duplicates monitor
-detection. Invalid signal type, shape, dtype or device fails fast.
+`ScenarioSampler.bind_values` requires the full read-only `ValueView` (`get`
+and `snapshot`) and stores it; `update` reads only those two names from the
+run's core `ValueStore`. It applies a valid desired command to `self.cmd` for
+the next env step and never advances the sampler cursor or RNG; without a
+desired command the pool/cursor behavior is unchanged. The sampler never scans
+the value namespace, never falls back to another monitor's values and never
+duplicates monitor detection. Invalid value type, shape, dtype or device fails
+fast.
 
 Episode boundaries remain episode-granular: `on_episode_end` advances the
 cursor and `reset(env_ids)` writes the pool command, so a reset can overwrite
 a desired command for those envs until the next `update` re-applies the
-still-published level signal. A signal never drives the episode clock.
+still-published level value. A value never drives the episode clock.
 
-In P9 the runner order was `sink.on_step(t)` (publish) then
-`sampler.update(t+1)` (read) then `env.step(t+2)` (act), so in-episode closed
-loop had two policy-tick latency. The applied `cmd` is part of the sampler
-rewind state; the signal store rode the core `SignalBus` rewind provider, and
-the pack did not duplicate either. On core C13 the store is `ValueStore`/`ValueView`
-and the removed `SignalBus` provider is not available until the P11/P15
-migration lands; P12 adds the source resolver and condition DSL only.
+The runner order is `sink.on_step(t)` (publish the tick context snapshot) then
+`sampler.update(t+1)` (read the store) then `env.step(t+2)` (act), so in-episode
+closed loop has two policy-tick latency. The applied `cmd` is part of the
+sampler rewind state; the core `values` store is a separate core rewind
+provider (`name="values"`), and the pack provider never duplicates either.
+The tick context carries the pre-`on_step` value snapshot; the final context
+carries the post-`on_step` snapshot used for episode-end predicates and their
+final monitor publication.
 
 ## Task documents
 

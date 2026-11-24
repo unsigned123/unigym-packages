@@ -17,7 +17,7 @@ from unigym_bench.sampler import (
     make_sampler,
 )
 from unigym_bench.specs import ScenarioSpec, SpecError
-from _support import SamplerEnv, SamplerSignals
+from _support import SamplerEnv, SamplerValues
 
 
 def _spec(*, count: int = 10, plan: list[int] | None = None) -> ScenarioSpec:
@@ -224,7 +224,7 @@ def test_on_episode_end_ignores_results_and_validates_bound_env() -> None:
     sampler.on_episode_end(torch.tensor([0], dtype=torch.int64), {5: ()})
 
     sampler.bind_env(SamplerEnv(num_envs=2))
-    sampler.bind_signals(SamplerSignals())
+    sampler.bind_values(SamplerValues())
 
     with pytest.raises(ValueError):
         sampler.bind_env(SamplerEnv(num_envs=1))

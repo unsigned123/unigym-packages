@@ -14,7 +14,7 @@ from unigym.core.episode_termination import (
     TerminationSource,
 )
 from unigym.errors import ConfigError
-from unigym.signals import SignalBus
+from unigym.values import ValueStore
 
 import unigym_bench.sink as sink_module
 from unigym_bench.engine import StreamingEngine
@@ -54,19 +54,21 @@ def test_make_sink_builds_from_a_real_context_and_monitor_factory() -> None:
 
 
 def test_make_sink_accepts_sink_steered_with_a_publisher() -> None:
-    bus = SignalBus(num_envs=1, device="cpu")
+    store = ValueStore(num_envs=1, device="cpu")
+    publisher = store.publisher("sink")
     sink = make_sink(
         make_sink_context(
             options={"loop_mode": "sink-steered", "monitor_factory": _FACTORY},
-            signals=bus,
+            values=publisher,
         )
     )
 
     assert sink.loop_mode == "sink-steered"
+    assert sink.rewind_provider.publisher is publisher
 
 
-def test_make_sink_rejects_sink_steered_without_signals() -> None:
-    with pytest.raises(ConfigError, match="requires ctx.signals"):
+def test_make_sink_rejects_sink_steered_without_values() -> None:
+    with pytest.raises(ConfigError, match="requires ctx.values"):
         make_sink(make_sink_context(options={"loop_mode": "sink-steered"}))
 
 
@@ -224,19 +226,21 @@ def test_make_sink_without_a_factory_builds_an_empty_honest_run() -> None:
 
 
 def test_direct_sink_steered_construction_requires_a_publisher() -> None:
-    with pytest.raises(ConfigError, match="requires a signal publisher"):
+    with pytest.raises(ConfigError, match="requires a value publisher"):
         BenchmarkSink([], loop_mode="sink-steered")
 
-    bus = SignalBus(num_envs=1, device="cpu")
-    assert BenchmarkSink([], loop_mode="sink-steered", publisher=bus).loop_mode == "sink-steered"
+    store = ValueStore(num_envs=1, device="cpu")
+    sink = BenchmarkSink([], loop_mode="sink-steered", publisher=store.publisher("sink"))
+    assert sink.loop_mode == "sink-steered"
 
 
 def test_injected_engine_sink_steered_requires_an_engine_publisher() -> None:
-    with pytest.raises(ConfigError, match="requires a signal publisher"):
+    with pytest.raises(ConfigError, match="requires a value publisher"):
         BenchmarkSink(engine=StreamingEngine([]), loop_mode="sink-steered")
 
-    bus = SignalBus(num_envs=1, device="cpu")
-    sink = BenchmarkSink(engine=StreamingEngine([], publisher=bus), loop_mode="sink-steered")
+    store = ValueStore(num_envs=1, device="cpu")
+    engine = StreamingEngine([], publisher=store.publisher("sink"))
+    sink = BenchmarkSink(engine=engine, loop_mode="sink-steered")
     assert sink.loop_mode == "sink-steered"
 
 

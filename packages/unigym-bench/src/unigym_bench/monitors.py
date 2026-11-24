@@ -71,7 +71,7 @@ __all__ = [
 #: Comparison operator accepted by the value-threshold built-ins.
 Comparison: TypeAlias = Literal[">", ">=", "<", "<="]
 
-_SNAPSHOT_SCHEMA = "unigym_bench.monitor/1"
+_SNAPSHOT_SCHEMA = "unigym_bench.monitor/2"
 _SNAPSHOT_KEYS = frozenset(
     {
         "schema",

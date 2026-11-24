@@ -71,25 +71,48 @@ def make_bundle(
     t: int = 0,
     cmd: torch.Tensor | None = None,
     view: EnvView | None = None,
+    values: ValueView | None = None,
     reset_state: Mapping[int, JsonValue] | None = None,
     step_index: torch.Tensor | None = None,
     time_s: torch.Tensor | None = None,
     device: str | torch.device = "cpu",
     terminations: Mapping[int, object] | None = None,
+    final_view: EnvView | None = None,
+    final_values: ValueView | None = None,
+    final_t: int | None = None,
+    final_step: EnvStepContext | None = None,
 ) -> dict[str, object]:
-    """Build a real runner-shaped bundle carrying one step context."""
+    """Build a real runner-shaped bundle carrying step and final contexts.
+
+    The runner builds ``final_step`` after ``on_step`` and before
+    ``on_episode_end``.  Tests may supply a distinct final view/value snapshot
+    to prove episode-end predicates read the final boundary, not the tick one.
+    """
     target = torch.device(device)
     context = make_context(
         num_envs=num_envs,
         t=t,
         cmd=cmd,
         view=view,
+        values=values,
         reset_state=reset_state,
         step_index=step_index,
         time_s=time_s,
         device=target,
     )
-    bundle: dict[str, object] = {"step": context}
+    if final_step is None:
+        final_step = make_context(
+            num_envs=num_envs,
+            t=t if final_t is None else final_t,
+            cmd=cmd,
+            view=view if final_view is None else final_view,
+            values=values if final_values is None else final_values,
+            reset_state=reset_state,
+            step_index=step_index,
+            time_s=time_s,
+            device=target,
+        )
+    bundle: dict[str, object] = {"step": context, "final_step": final_step}
     if terminations is not None:
         bundle["terminations"] = terminations
     return bundle
@@ -130,6 +153,7 @@ class ScriptedMonitor(BaseMonitor):
         self._events: list[Event] = []
         self._terminals: dict[int, Termination] = {}
         self.episode_ends: list[tuple[int, ...]] = []
+        self.final_contexts: list[EnvStepContext | None] = []
         self.resets: list[tuple[int, ...]] = []
 
     def on_tick(self, context: EnvStepContext) -> None:
@@ -154,8 +178,9 @@ class ScriptedMonitor(BaseMonitor):
         self._terminals.clear()
         return terminals
 
-    def on_episode_end(self, env_ids: Sequence[int]) -> None:
+    def on_episode_end(self, env_ids: Sequence[int], context: EnvStepContext | None = None) -> None:
         self.episode_ends.append(tuple(env_ids))
+        self.final_contexts.append(context)
 
     def reset(self, env_ids: Sequence[int]) -> None:
         self.resets.append(tuple(env_ids))
@@ -238,7 +263,7 @@ _SINK_CONTEXT_CFG: dict[str, JsonValue] = {
 def make_sink_context(
     *,
     options: Mapping[str, JsonValue] | None = None,
-    signals: object | None = None,
+    values: object | None = None,
     auto_reset: bool | None = None,
 ) -> SinkContext:
     """Build a real SinkContext over a real, backend-free RunSpec."""
@@ -255,7 +280,7 @@ def make_sink_context(
         action_groups=(),
         run_identity=None,
         options={} if options is None else options,
-        signals=signals,
+        values=values,
     )
 
 
@@ -624,16 +649,16 @@ class SamplerEnv:
     num_envs: int = 1
 
 
-class SamplerSignals:
-    """Static read-only signal view for command-sampler closed-loop tests.
+class SamplerValues:
+    """Static read-only value view for command-sampler closed-loop tests.
 
     Values are stored verbatim so a test can inject an invalid level (a list,
     an integer tensor or a wrong-shape tensor) and assert the sampler's
-    teaching error.  The real transport path uses
-    :class:`unigym.signals.SignalBus`.
+    teaching error.  The real transport path is the core
+    :class:`unigym.values.ValueStore`.
 
     Args:
-        values: Optional initial level values keyed by signal name.
+        values: Optional initial level values keyed by value name.
         record: When true, append every ``get`` name to :attr:`requests` and
             count every ``snapshot`` call in :attr:`snapshot_calls`.
     """
@@ -655,3 +680,7 @@ class SamplerSignals:
         if self._record:
             self.snapshot_calls += 1
         return dict(self.values)
+
+    def __contains__(self, name: object) -> bool:
+        """Return whether a level is present."""
+        return name in self.values

@@ -22,7 +22,7 @@ Semantics are episode-granular and explicit:
   visited once per cycle;
 - ``reset(env_ids)`` writes the environment's current command and never
   advances the cursor;
-- ``update`` changes a command only when the bound signal view carries a
+- ``update`` changes a command only when the bound value view carries a
   valid ``scenario/desired_cmd``; otherwise the command clock is episodes,
   not seconds;
 - ``on_episode_end`` decrements the dwell counter and advances the cursor only
@@ -32,7 +32,7 @@ Semantics are episode-granular and explicit:
 Closed-loop convention
 ----------------------
 
-A monitor named ``scenario`` publishes two local level signals; the pack
+A monitor named ``scenario`` publishes two local level values; the pack
 engine prefixes its name and republishes them as ``scenario/desired_cmd`` and
 the optional ``scenario/command_valid``.  This module owns the consumer side:
 
@@ -44,19 +44,19 @@ the optional ``scenario/command_valid``.  This module owns the consumer side:
 - a missing ``desired_cmd`` leaves ``cmd`` unchanged, so the pool/cursor
   behavior of :meth:`ScenarioSampler.reset` and
   :meth:`ScenarioSampler.on_episode_end` is untouched;
-- an invalid signal (wrong tensor type, shape, dtype or device) raises a
+- an invalid value (wrong tensor type, shape, dtype or device) raises a
   teaching error instead of silently falling back.
 
-The sampler never scans the signal namespace, never infers a command from
+The sampler never scans the value namespace, never infers a command from
 another monitor and never duplicates monitor detection: only the two names
 above are read.  Applying a desired command changes ``cmd`` alone; it never
 advances a cursor, consumes dwell or draws from the RNG.  Episode boundaries
 still behave as before: ``on_episode_end`` advances the cursor and ``reset``
 then writes the pool command, which can overwrite a desired command for the
 reset environments until the next ``update`` re-applies the still-published
-level signal.  A signal never drives the episode clock.  ``cmd`` is part of
+level value.  A value never drives the episode clock.  ``cmd`` is part of
 :meth:`ScenarioSampler.rewind_state`, so it restores with the sampler while
-the signal store itself rides the core ``SignalBus`` rewind provider.
+the core ``values`` store rides its own rewind provider.
 
 Timing is the core runner order: ``sink.on_step(t)`` publishes after tick
 ``t``'s physics and observation snapshot, ``update(t+1)`` is the first read,
@@ -85,7 +85,7 @@ from .specs import ScenarioSpec, SpecError
 if TYPE_CHECKING:  # pragma: no cover - typing-only
     from unigym.core.episode_result import EpisodeResultView
     from unigym.env.backends.base import EnvBackend
-    from unigym.signals import SignalView
+    from unigym.values import ValueView
 
 __all__ = [
     "COMMAND_VALID_SIGNAL",
@@ -98,7 +98,7 @@ __all__ = [
 #: Schema id of :meth:`ScenarioSampler.rewind_state` payloads.
 SAMPLER_REWIND_SCHEMA = "unigym_bench.sampler/1"
 
-#: Namespaced level signal carrying the next closed-loop command.
+#: Namespaced level value carrying the next closed-loop command.
 DESIRED_CMD_SIGNAL = "scenario/desired_cmd"
 #: Optional per-env validity mask gating :data:`DESIRED_CMD_SIGNAL`.
 COMMAND_VALID_SIGNAL = "scenario/command_valid"
@@ -240,7 +240,7 @@ class ScenarioSampler(CommandSampler):
         self._cursor: list[int] = [int(value) for value in offsets.tolist()]
         self._remaining: list[int] = [dwell] * num_envs
         self._commands = torch.tensor(scenario.commands, dtype=torch.float32, device=self.device)
-        self._signals: SignalView | None = None
+        self._values: ValueView | None = None
         self._write(torch.arange(num_envs, device=self.device))
 
     def reset(self, env_ids=None) -> torch.Tensor:
@@ -252,7 +252,7 @@ class ScenarioSampler(CommandSampler):
         """Apply the next valid closed-loop command, if one is published.
 
         The call reads ``scenario/desired_cmd`` and the optional
-        ``scenario/command_valid`` from the bound signal view.  It changes
+        ``scenario/command_valid`` from the bound value view.  It changes
         ``cmd`` only; cursor, dwell and RNG stay untouched.  Without a bound
         view, or without a published desired command, the pool command is
         returned unchanged.
@@ -266,25 +266,25 @@ class ScenarioSampler(CommandSampler):
             The sampler's applied command buffer.
 
         Raises:
-            TypeError: A published signal is not a tensor or has the wrong
+            TypeError: A published value is not a tensor or has the wrong
                 dtype.
-            ValueError: A published signal has the wrong shape or device, or
+            ValueError: A published value has the wrong shape or device, or
                 a desired command is not finite.
         """
         del step_dt, cmd
-        self._apply_desired_signal()
+        self._apply_desired_value()
         return self.cmd
 
-    def _apply_desired_signal(self) -> None:
+    def _apply_desired_value(self) -> None:
         """Copy a valid published command into the owned buffer."""
-        signals = self._signals
-        if signals is None:
+        values = self._values
+        if values is None:
             return
-        desired = signals.get(DESIRED_CMD_SIGNAL)
+        desired = values.get(DESIRED_CMD_SIGNAL)
         if desired is None:
             return
         checked = self._validate_desired_cmd(desired)
-        valid = signals.get(COMMAND_VALID_SIGNAL)
+        valid = values.get(COMMAND_VALID_SIGNAL)
         if valid is None:
             self.cmd.copy_(checked)
             return
@@ -294,7 +294,7 @@ class ScenarioSampler(CommandSampler):
 
     def _validate_desired_cmd(self, value: object) -> torch.Tensor:
         """Validate one desired-command tensor and return it narrowed."""
-        where = f"ScenarioSampler signal {DESIRED_CMD_SIGNAL!r}"
+        where = f"ScenarioSampler value {DESIRED_CMD_SIGNAL!r}"
         if not isinstance(value, torch.Tensor):
             raise TypeError(f"{where}: expected a torch.Tensor, got {type(value).__name__}")
         expected_shape = (self.num_envs, self.dim)
@@ -311,7 +311,7 @@ class ScenarioSampler(CommandSampler):
 
     def _validate_command_valid(self, value: object) -> torch.Tensor:
         """Validate one per-env validity mask and return it narrowed."""
-        where = f"ScenarioSampler signal {COMMAND_VALID_SIGNAL!r}"
+        where = f"ScenarioSampler value {COMMAND_VALID_SIGNAL!r}"
         if not isinstance(value, torch.Tensor):
             raise TypeError(f"{where}: expected a torch.Tensor, got {type(value).__name__}")
         expected_shape = (self.num_envs,)
@@ -358,24 +358,24 @@ class ScenarioSampler(CommandSampler):
                 "ScenarioSampler.bind_env: expected env.num_envs " f"{self.num_envs}, got {bound}"
             )
 
-    def bind_signals(self, signals: SignalView) -> None:
-        """Store the run's read-only signal view for closed-loop reads.
+    def bind_values(self, values: ValueView) -> None:
+        """Store the run's read-only value view for closed-loop reads.
 
-        The full :class:`~unigym.signals.SignalView` protocol (``get`` and
+        The full :class:`~unigym.values.ValueView` protocol (``get`` and
         ``snapshot``) is required even though only ``get`` is used, so a
         partial object cannot masquerade as a view.  The view is not
-        serialized: signal values ride the core ``SignalBus`` rewind provider,
+        serialized: the core ``values`` store rides its own rewind provider,
         while :meth:`rewind_state` carries the applied ``cmd`` buffer.  Only
         :meth:`update` reads it.
         """
-        if not callable(getattr(signals, "get", None)) or not callable(
-            getattr(signals, "snapshot", None)
+        if not callable(getattr(values, "get", None)) or not callable(
+            getattr(values, "snapshot", None)
         ):
             raise TypeError(
-                "ScenarioSampler.bind_signals: expected a SignalView with callable "
-                f"get(name) and snapshot(), got {type(signals).__name__}"
+                "ScenarioSampler.bind_values: expected a ValueView with callable "
+                f"get(name) and snapshot(), got {type(values).__name__}"
             )
-        self._signals = signals
+        self._values = values
 
     def rewind_state(self) -> dict[str, JsonValue]:
         """Return a JSON-safe private copy of cursor, dwell, RNG and commands."""

@@ -12,7 +12,7 @@ Construction seam (P4/P6 boundary)
 ``make_sink(ctx)`` reads JSON-safe keys from ``ctx.options``:
 
 - ``loop_mode``: ``"pool"`` (default) or ``"sink-steered"``.  A sink-steered
-  run requires ``ctx.signals``; absent publisher is a construction error.
+  run requires ``ctx.values``; an absent publisher is a construction error.
 - ``monitor_factory``: optional ``"pkg.mod:callable"`` path.  The zero-argument
   callable returns the monitor sequence in task declaration order.
 - ``extension_factory``: optional ``"pkg.mod:callable"`` path returning the
@@ -51,12 +51,12 @@ never writes the core ``benchmark_report.json`` or any other core artifact.
 
 Rewind and early-stop hooks.  ``stop_when`` never stops.  The sink exposes the
 run's :class:`~unigym_bench.engine.StreamingEngine` as its core rewind provider
-(``name="unigym_bench"``, schema ``unigym_bench.rewind/2``); the engine owns all
+(``name="unigym_bench"``, schema ``unigym_bench.rewind/3``); the engine owns all
 checkpointable pack state, including stateful report extensions, and the sink's
 own ``_pending_reset`` glue is empty at every core snapshot freeze point (a
 snapshot is taken between completed ticks).  The sampler cursor/RNG and the
-``SignalBus`` remain separate core providers.  ``on_rewind`` delegates to the
-engine so open episodes are marked ``rewound``.
+core ``values`` store are separate core providers.  ``on_rewind`` delegates to
+the engine so open episodes are marked ``rewound``.
 """
 
 from __future__ import annotations
@@ -88,7 +88,7 @@ from .version import __version__
 if TYPE_CHECKING:
     from unigym.core.episode_termination import Termination
     from unigym.run import SinkContext
-    from unigym.signals import SignalPublisher
+    from unigym.values import ValuePublisher
 
 __all__ = [
     "BenchmarkSink",
@@ -99,7 +99,7 @@ __all__ = [
     "make_sink",
 ]
 
-#: Default closed-loop mode: monitor signals are published for other consumers.
+#: Default closed-loop mode: monitor values are published for other consumers.
 DEFAULT_LOOP_MODE = "pool"
 #: Mode in which the pack sink owns the command loop through its publisher.
 SINK_STEERED = "sink-steered"
@@ -133,11 +133,11 @@ def make_sink(ctx: SinkContext) -> BenchmarkSink:
 
     Args:
         ctx: The core construction context.  Only ``options`` and the
-            publisher-only ``signals`` face are read; no live env, writer or
+            publisher-only ``values`` face are read; no live env, writer or
             logger is available here by design.
 
     Returns:
-        A :class:`BenchmarkSink` wired to the run's signal publisher and report
+        A :class:`BenchmarkSink` wired to the run's value publisher and report
         metadata.
 
     Raises:
@@ -158,10 +158,10 @@ def make_sink(ctx: SinkContext) -> BenchmarkSink:
         )
     loop_mode = options.get("loop_mode", DEFAULT_LOOP_MODE)
     _validate_loop_mode(loop_mode)
-    if loop_mode == SINK_STEERED and ctx.signals is None:
+    if loop_mode == SINK_STEERED and ctx.values is None:
         raise ConfigError(
-            "unigym-bench sink: loop_mode 'sink-steered' requires ctx.signals, "
-            "but the build supplied no signal publisher"
+            "unigym-bench sink: loop_mode 'sink-steered' requires ctx.values, "
+            "but the build supplied no value publisher"
         )
     auto_reset = _runner_auto_reset(ctx.spec)
     if not auto_reset:
@@ -206,7 +206,7 @@ def make_sink(ctx: SinkContext) -> BenchmarkSink:
     )
     return BenchmarkSink(
         monitors,
-        publisher=ctx.signals,
+        publisher=ctx.values,
         loop_mode=loop_mode,
         reset_after_episode=auto_reset,
         extensions=extensions,
@@ -231,9 +231,10 @@ class BenchmarkSink:
             When supplied, ``retention``, ``publisher`` and ``extensions`` must
             be omitted because the engine already owns them.
         retention: Explicit event/episode retention for a sink-built engine.
-        publisher: Optional write-only signal publisher for a sink-built engine.
+        publisher: Optional write-only value publisher for a sink-built engine.
         loop_mode: ``"pool"`` or ``"sink-steered"``.  A sink-steered sink needs
-            a publisher on its engine; absent publisher is a construction error.
+            a value publisher on its engine; absent publisher is a construction
+            error.
         reset_after_episode: Explicit assertion that the runner actually resets
             due envs.  The sink cannot observe the backend reset chain, so a
             false value is rejected instead of silently reopening envs.
@@ -266,7 +267,7 @@ class BenchmarkSink:
         *,
         engine: StreamingEngine | None = None,
         retention: RetentionSpec | None = None,
-        publisher: SignalPublisher | None = None,
+        publisher: ValuePublisher | None = None,
         loop_mode: str = DEFAULT_LOOP_MODE,
         reset_after_episode: bool = True,
         extensions: Sequence[ReportExtension] | None = None,
@@ -318,7 +319,7 @@ class BenchmarkSink:
             )
         if loop_mode == SINK_STEERED and self._engine.publisher is None:
             raise ConfigError(
-                "BenchmarkSink: loop_mode 'sink-steered' requires a signal publisher "
+                "BenchmarkSink: loop_mode 'sink-steered' requires a value publisher "
                 "on the engine"
             )
         self._loop_mode = loop_mode

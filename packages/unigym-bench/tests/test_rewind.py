@@ -57,7 +57,8 @@ def test_provider_identity_and_payload_is_json_safe_and_private() -> None:
     assert provider.name == REWIND_PROVIDER_NAME == "unigym_bench"
     state = provider.rewind_state()
 
-    assert state["schema"] == REWIND_SCHEMA == "unigym_bench.rewind/2"
+    assert state["schema"] == REWIND_SCHEMA == "unigym_bench.rewind/3"
+    assert state["monitors"]["contact"]["schema"] == "unigym_bench.monitor/2"
     assert set(state) == {"schema", "engine", "monitors"}
     assert ensure_json_value(state) == state
     assert json.loads(json.dumps(state)) == state
@@ -219,13 +220,13 @@ def test_rewind_after_due_episode_marks_replayed_open_episode_rewound() -> None:
     assert summary["BenchmarkSink"]["episodes"]["count"] == 2
 
 
-def test_payload_never_carries_sampler_or_signal_bus_state() -> None:
+def test_payload_never_carries_sampler_or_core_value_state() -> None:
     sink, _, _ = _sink([[1.0]])
     _step(sink, 0)
 
     state = sink.rewind_provider.rewind_state()
 
-    forbidden = {"sampler", "signals", "signal_bus", "bus", "episode_id"}
+    forbidden = {"sampler", "signals", "signal_bus", "bus", "values", "episode_id"}
     seen: set[str] = set()
 
     def walk(value: object) -> None:
@@ -239,3 +240,23 @@ def test_payload_never_carries_sampler_or_signal_bus_state() -> None:
 
     walk(state)
     assert seen.isdisjoint(forbidden)
+
+
+def test_old_rewind_and_monitor_schemas_are_rejected() -> None:
+    sink, engine, _ = _sink([[0.0]])
+    _step(sink, 0)
+    state = sink.rewind_provider.rewind_state()
+
+    old_rewind = json.loads(json.dumps(state))
+    old_rewind["schema"] = "unigym_bench.rewind/2"
+    with pytest.raises(ValueError, match=r"expected 'unigym_bench.rewind/3'"):
+        engine.validate_rewind_state(old_rewind)
+    with pytest.raises(ValueError, match=r"expected 'unigym_bench.rewind/3'"):
+        engine.apply_rewind_state(old_rewind)
+
+    old_monitor = json.loads(json.dumps(state))
+    old_monitor["monitors"]["contact"]["schema"] = "unigym_bench.monitor/1"
+    with pytest.raises(ValueError, match=r"expected schema 'unigym_bench.monitor/2'"):
+        engine.validate_rewind_state(old_monitor)
+    with pytest.raises(ValueError, match=r"expected schema 'unigym_bench.monitor/2'"):
+        engine.apply_rewind_state(old_monitor)

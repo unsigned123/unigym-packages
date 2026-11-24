@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 import pytest
+import torch
 from unigym.core.episode_termination import (
     EpisodeOutcome,
     EpisodeTermination,
@@ -18,7 +19,7 @@ from unigym.errors import ConfigError
 from unigym_bench.engine import StreamingEngine
 from unigym_bench.events import EpisodeRecord, EpisodeSummary, Event
 from unigym_bench.json import ensure_json_value
-from unigym_bench.monitors import BaseMonitor
+from unigym_bench.monitors import BaseMonitor, PredicateMonitor
 from unigym_bench.report import (
     REPORT_SCHEMA,
     ReportBuilder,
@@ -28,6 +29,8 @@ from unigym_bench.report import (
 )
 from unigym_bench.sink import BenchmarkSink, make_sink
 from unigym_bench.specs import RetentionSpec
+from unigym.values import StepValues
+
 from _support import (
     CaptureReportExtension,
     CountingReportExtension,
@@ -697,3 +700,33 @@ def test_on_run_end_writes_no_core_report_artifact(tmp_path: Path) -> None:
     assert list(tmp_path.iterdir()) == []
     assert not (tmp_path / "benchmark_report.json").exists()
     assert not (tmp_path / "results.json").exists()
+
+
+def test_final_episode_end_terminal_is_counted_in_the_report() -> None:
+    monitor = PredicateMonitor(
+        "end_pred",
+        {"source": "value:flag", "op": "gt", "value": 0.0},
+        "episode_end",
+        {"terminal_reason": "score", "terminal_outcome": "success"},
+    )
+    sink, engine = _sink([monitor])
+    bundle = make_bundle(
+        num_envs=1,
+        t=0,
+        values=StepValues({"flag": torch.tensor([0.0])}),
+        final_values=StepValues({"flag": torch.tensor([1.0])}),
+    )
+
+    sink.on_step(0, bundle)
+    sink.on_episode_end([0], bundle)
+    report = sink.on_run_end()["BenchmarkSink"]
+
+    assert isinstance(report, dict)
+    assert report["terminations"] == {
+        "total": 1,
+        "outcome": {"success": 1},
+        "code": {"custom.end_pred.score": 1},
+        "source": {"custom": 1},
+    }
+    assert report["execution"]["terminal_conflicts"] == 0
+    assert engine.drain_terminations() == {}

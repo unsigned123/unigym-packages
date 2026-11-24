@@ -12,8 +12,8 @@ declaration order and owns the consequences:
   JSON-safe start command and reset facts captured on the episode's first tick.
 
 The engine never keeps an ``EnvView``, a step context, a tensor or a backend
-handle.
-Signals are validated and published one tick at a time; they are not stored.
+handle.  Monitor values are validated and published one boundary at a time
+through the run's core ``ValuePublisher``; they are not stored by the engine.
 
 Lifecycle (delegated by the sink in the next card)::
 
@@ -29,10 +29,18 @@ the ids returned by ``on_episode_end`` until the post-reset callback and calls
 
 A terminal request for an environment that is not open is a pack contract
 error.  A terminal request for an environment that is open but already latched
-is a *conflict*: it is counted and not emitted.  Signal publication is skipped
+is a *conflict*: it is counted and not emitted.  Value publication is skipped
 on a tick that still contains a closed environment because a level vector is
 full-run and the transport has no per-env mask; a normal runner tick is fully
 open.
+
+Episode-end finalization consumes ``bundle["final_step"]``: the core runner's
+post-``on_step`` boundary snapshot.  Monitors evaluate their ``episode_end``
+predicates against that final context, and their final events and separate
+report/scoring terminals are drained here.  Those terminals are counted in the
+run aggregate and report but never enter the runner ``_pending`` drain or the
+first-terminal latch; the episode record is built only after final events have
+been accounted for.
 """
 
 from __future__ import annotations
@@ -70,13 +78,13 @@ from .report import ReportExtension, validate_report_extensions
 from .specs import RetentionSpec
 
 if TYPE_CHECKING:
-    from unigym.signals import SignalPublisher
+    from unigym.values import ValuePublisher
 
 #: Checkpoint payload key and schema owned by the pack's rewind provider.
-#: Schema 2 adds the retention-independent run counters (rewind/termination/
-#: per-env aggregates) required for an honest default-retention report.
+#: Schema 3 consumes the core final-context boundary and the separate
+#: episode-end terminal face; it rejects schema 2 and older payloads.
 REWIND_PROVIDER_NAME = "unigym_bench"
-REWIND_SCHEMA = "unigym_bench.rewind/2"
+REWIND_SCHEMA = "unigym_bench.rewind/3"
 
 __all__ = [
     "EngineStateError",
@@ -173,11 +181,12 @@ class StreamingEngine:
 
     Args:
         monitors: Monitor instances in task declaration order.  Names must be
-            unique because they namespace published signals and report blocks.
+            unique because they namespace published values and report blocks.
         retention: Explicit event/episode retention policy.  The default is the
             pack's documented ``RetentionSpec`` default.
-        publisher: Optional write-only signal publisher.  When supplied, every
-            monitor level is published as ````<monitor>/<signal>````.
+        publisher: Optional write-only value publisher.  When supplied, every
+            monitor level is published as ``<monitor>/<local>`` at the tick and
+            episode-end boundaries.
         extensions: Report extensions in task declaration order.  A stateful
             extension must implement snapshot/restore so the pack provider can
             restore its accumulator.
@@ -191,7 +200,7 @@ class StreamingEngine:
         monitors: Sequence[Monitor],
         *,
         retention: RetentionSpec | None = None,
-        publisher: SignalPublisher | None = None,
+        publisher: ValuePublisher | None = None,
         extensions: Sequence[ReportExtension] = (),
     ) -> None:
         if isinstance(monitors, (str, bytes, bytearray)) or not isinstance(monitors, Sequence):
@@ -276,8 +285,8 @@ class StreamingEngine:
         return self._device
 
     @property
-    def publisher(self) -> SignalPublisher | None:
-        """The write-only signal publisher, or ``None`` when not configured."""
+    def publisher(self) -> ValuePublisher | None:
+        """The write-only value publisher, or ``None`` when not configured."""
         return self._publisher
 
     @property
@@ -353,8 +362,8 @@ class StreamingEngine:
         The payload owns only pack state: engine flags/counters, journal,
         latches/pending drains, report accumulators that already exist, and
         every rewindable monitor's ``snapshot()``.  The sampler cursor/RNG and
-        the signal bus are separate core providers and are never duplicated
-        here.
+        the core ``values`` store are separate core providers and are never
+        duplicated here.
         """
         engine: dict[str, JsonValue] = {
             "bound": self._bound,
@@ -489,7 +498,7 @@ class StreamingEngine:
             EngineStateError: The run has ended, ``bundle["step"]`` is missing,
                 or a monitor requested a terminal for a closed environment.
             TypeError: ``bundle["step"]`` has the wrong type, or a monitor
-                output or signal violates the contract.
+                output or value violates the contract.
             ValueError: A shape, device, source or code is invalid.
         """
         self._require_running()
@@ -516,7 +525,7 @@ class StreamingEngine:
             collected.append(
                 (
                     monitor,
-                    self._collect_signals(monitor, context),
+                    self._collect_values(monitor, context),
                     self._collect_events(monitor),
                     self._collect_terminals(monitor, num_envs),
                 )
@@ -535,8 +544,8 @@ class StreamingEngine:
                     )
 
         if self._publisher is not None and all(self._open):
-            for monitor, signals, _, _ in collected:
-                for local_name, value in signals.items():
+            for monitor, values, _, _ in collected:
+                for local_name, value in values.items():
                     self._publisher.publish(f"{monitor.name}/{local_name}", value)
 
         for _, _, events, _ in collected:
@@ -563,10 +572,12 @@ class StreamingEngine:
 
         Args:
             due: Sequence of env ids or a 1-D integer tensor from the runner.
-            bundle: The runner's episode-end bundle.  Its ``terminations``
-                mapping supplies the canonical terminal stamps and core facts;
-                ``reset_facts`` are not read here because the record keeps the
-                JSON-safe reset state captured on the episode's first tick.
+            bundle: The runner's episode-end bundle.  ``final_step`` is the
+                required post-``on_step`` boundary context used for final
+                predicate evaluation.  ``terminations`` supplies the canonical
+                terminal stamps and core facts; ``reset_facts`` are not read
+                here because the record keeps the JSON-safe reset state captured
+                on the episode's first tick.
 
         Returns:
             The sorted, unique due env ids.  The sink stores this tuple until
@@ -574,8 +585,11 @@ class StreamingEngine:
             runner's reset chain.
 
         Raises:
-            EngineStateError: The engine is unbound/ended, a due env is closed,
-                or a monitor reports a lifecycle violation.
+            EngineStateError: The engine is unbound/ended, ``final_step`` is
+                missing, a due env is closed, or a monitor reports a lifecycle
+                violation.
+            TypeError: ``final_step`` or a monitor output has the wrong type.
+            ValueError: A shape, device, source, env id or code is invalid.
         """
         self._require_running()
         num_envs = self._require_bound()
@@ -592,6 +606,58 @@ class StreamingEngine:
                     f"engine episode_end.due: env {env_id} is already closed; "
                     f"open envs are {list(self.open_envs)}"
                 )
+        final_context = self._build_final_context(bundle)
+        if final_context.num_envs != self._num_envs:
+            raise ValueError(
+                f"engine bundle.final_step: num_envs changed from {self._num_envs} "
+                f"to {final_context.num_envs}"
+            )
+        if final_context.device != self._device:
+            raise ValueError(
+                f"engine bundle.final_step: device changed from {self._device} "
+                f"to {final_context.device}"
+            )
+
+        # Evaluate only this boundary's rows against the one final context.
+        for monitor in self._monitors:
+            monitor.on_episode_end(due_ids, final_context)
+
+        # Read and validate the post-evaluation levels before draining outputs,
+        # so a malformed value cannot consume events/terminals on a failed
+        # boundary.  Publication still happens only after every check.
+        final_values = [
+            (monitor, self._collect_values(monitor, final_context)) for monitor in self._monitors
+        ]
+        final_events = [(monitor, self._collect_events(monitor)) for monitor in self._monitors]
+        final_terminals: list[Termination] = []
+        for monitor in self._monitors:
+            drain = getattr(monitor, "drain_episode_terminals", None)
+            if callable(drain):
+                final_terminals.extend(self._collect_episode_terminals(monitor, due_ids).values())
+
+        # Validate every final occurrence before mutating journal/counters.
+        for monitor, events in final_events:
+            for event in events:
+                self._validate_final_event_envs(monitor, event, due_ids)
+
+        # Publish after final evaluation so the store never receives stale tick
+        # levels for the due rows.  A partial open set is skipped for the same
+        # full-run level-vector reason as the tick publication.
+        if self._publisher is not None and all(self._open):
+            for monitor, values in final_values:
+                for local_name, value in values.items():
+                    self._publisher.publish(f"{monitor.name}/{local_name}", value)
+
+        # Account for final occurrences before records are built so their
+        # per-episode event counts are complete.
+        for _, events in final_events:
+            for event in events:
+                self._record_event(event)
+
+        # Episode-end terminals are report/scoring facts only: count them in
+        # the run aggregate, never in the runner drain or first-terminal latch.
+        for termination in final_terminals:
+            self._count_termination(termination)
 
         records = [
             EpisodeRecord(
@@ -611,8 +677,6 @@ class StreamingEngine:
             for env_id in due_ids
         ]
 
-        for monitor in self._monitors:
-            monitor.on_episode_end(due_ids)
         if self._extensions:
             # Only this boundary's envs are visible, and the records are frozen;
             # an extension cannot reach another env or mutate a finalized record.
@@ -989,6 +1053,28 @@ class StreamingEngine:
             )
         return BenchmarkStepContext.from_env_step(step)
 
+    def _build_final_context(self, bundle: Mapping[str, object]) -> BenchmarkStepContext:
+        """Return the pack final context from the runner's ``final_step``.
+
+        The core has already built one boundary context for the post-``on_step``
+        snapshot; this method only wraps it with the pack's empty output fields.
+        It never builds a second ``EnvView``.
+        """
+        step = bundle.get("final_step")
+        if step is None:
+            raise EngineStateError(
+                "engine bundle.final_step: expected an EnvStepContext under key "
+                "'final_step', but the key is missing or None"
+            )
+        if not isinstance(step, EnvStepContext):
+            raise TypeError(
+                "engine bundle.final_step: expected an EnvStepContext, "
+                f"got {type(step).__name__}"
+            )
+        # Wrap even an already-specialized pack context so the final boundary
+        # starts with empty output fields and cannot surface stale tick output.
+        return BenchmarkStepContext.from_env_step(step)
+
     def _bind(self, context: BenchmarkStepContext) -> None:
         """Bind the run shape on the first tick and reject later changes."""
         if not self._bound:
@@ -1063,9 +1149,7 @@ class StreamingEngine:
             return None
         return EpisodeTermination.from_terminations(core_terms)
 
-    def _collect_signals(
-        self, monitor: Monitor, context: BenchmarkStepContext
-    ) -> dict[str, Tensor]:
+    def _collect_values(self, monitor: Monitor, context: BenchmarkStepContext) -> dict[str, Tensor]:
         """Validate one monitor's fresh per-env level tensors."""
         signals = monitor.signals()
         if not isinstance(signals, Mapping):
@@ -1083,7 +1167,7 @@ class StreamingEngine:
             if "/" in local_name:
                 raise ValueError(
                     f"monitor {monitor.name!r}.signals: name {local_name!r} must not "
-                    "contain '/'; the engine owns the '<monitor>/<signal>' namespace"
+                    "contain '/'; the engine owns the '<monitor>/<local>' namespace"
                 )
             if not isinstance(value, Tensor):
                 raise TypeError(
@@ -1151,6 +1235,63 @@ class StreamingEngine:
             terminals[env_id] = value
         return terminals
 
+    def _collect_episode_terminals(
+        self, monitor: Monitor, due_ids: tuple[int, ...]
+    ) -> dict[int, Termination]:
+        """Drain and validate one monitor's report/scoring terminals.
+
+        These facts are not runner terminal requests: they must name a due env
+        and never enter the pending drain or the first-terminal latch.
+        """
+        drained = monitor.drain_episode_terminals()  # type: ignore[attr-defined]
+        if not isinstance(drained, Mapping):
+            raise TypeError(
+                f"monitor {monitor.name!r}.drain_episode_terminals: expected a mapping, "
+                f"got {type(drained).__name__}"
+            )
+        due = set(due_ids)
+        terminals: dict[int, Termination] = {}
+        for key, value in drained.items():
+            env_id = _require_env_id(
+                key, self._require_bound(), f"monitor {monitor.name!r}.episode_terminals"
+            )
+            if env_id not in due:
+                raise EngineStateError(
+                    f"monitor {monitor.name!r}.episode_terminals[{env_id}]: env is not due "
+                    f"at this boundary; due envs are {list(due_ids)}"
+                )
+            if not isinstance(value, Termination):
+                raise TypeError(
+                    f"monitor {monitor.name!r}.episode_terminals[{env_id}]: expected a "
+                    f"Termination, got {type(value).__name__}"
+                )
+            if value.source is not TerminationSource.CUSTOM:
+                raise ValueError(
+                    f"monitor {monitor.name!r}.episode_terminals[{env_id}]: source must be "
+                    f"custom, got {value.source.value!r}"
+                )
+            if not value.code.startswith("custom."):
+                raise ValueError(
+                    f"monitor {monitor.name!r}.episode_terminals[{env_id}]: code must start "
+                    f"with 'custom.', got {value.code!r}"
+                )
+            validate_code(value.code)
+            terminals[env_id] = value
+        return terminals
+
+    def _validate_final_event_envs(
+        self, monitor: Monitor, event: Event, due_ids: tuple[int, ...]
+    ) -> None:
+        """Reject a final occurrence that names a non-due or closed environment."""
+        due = set(due_ids)
+        for env_id in event.env_ids:
+            if env_id not in due:
+                raise EngineStateError(
+                    f"monitor {monitor.name!r}.events[{event.name!r}]: env {env_id} "
+                    f"is not due at this boundary; due envs are {list(due_ids)}"
+                )
+        self._validate_event_envs(monitor, event)
+
     def _validate_event_envs(self, monitor: Monitor, event: Event) -> None:
         """Reject an occurrence that names a closed or unknown environment."""
         num_envs = self._require_bound()
@@ -1204,19 +1345,21 @@ class StreamingEngine:
             self._rewound_total += 1
         self._episode_counts_by_env[record.env_id] += 1
         for termination in _record_terminations(record):
-            outcome = termination.outcome.value
-            self._termination_outcome_counts[outcome] = (
-                self._termination_outcome_counts.get(outcome, 0) + 1
-            )
-            self._termination_code_counts[termination.code] = (
-                self._termination_code_counts.get(termination.code, 0) + 1
-            )
-            source = termination.source.value
-            self._termination_source_counts[source] = (
-                self._termination_source_counts.get(source, 0) + 1
-            )
+            self._count_termination(termination)
         if self._retention.retain_episodes:
             self._records.append(record)
+
+    def _count_termination(self, termination: Termination) -> None:
+        """Accumulate one termination fact in the run's aggregate counters."""
+        outcome = termination.outcome.value
+        self._termination_outcome_counts[outcome] = (
+            self._termination_outcome_counts.get(outcome, 0) + 1
+        )
+        self._termination_code_counts[termination.code] = (
+            self._termination_code_counts.get(termination.code, 0) + 1
+        )
+        source = termination.source.value
+        self._termination_source_counts[source] = self._termination_source_counts.get(source, 0) + 1
 
     def _require_running(self) -> None:
         if self._run_ended:
@@ -1231,12 +1374,12 @@ class StreamingEngine:
 
 
 def _require_monitor_name(name: object) -> str:
-    """Validate one monitor name used as a signal namespace."""
+    """Validate one monitor name used as a value namespace."""
     if not isinstance(name, str) or not name:
         raise TypeError(f"engine monitor.name: expected a non-empty str, got {name!r}")
     if "/" in name:
         raise ValueError(
-            f"engine monitor.name: {name!r} must not contain '/'; names namespace signals"
+            f"engine monitor.name: {name!r} must not contain '/'; names namespace values"
         )
     return name
 
