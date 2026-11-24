@@ -33,6 +33,8 @@ _FENCE_SCRIPT = f"""
 import sys
 
 import unigym_bench as pack
+import unigym_bench.sampler
+import unigym_bench.scenario
 
 pack.assert_core_contract()
 prefixes = {_BLOCKED_PREFIXES!r}

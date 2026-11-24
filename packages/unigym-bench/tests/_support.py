@@ -527,3 +527,23 @@ class RecordingReportExtension:
 def make_report_extensions() -> tuple[RecordingReportExtension, ...]:
     """Importable zero-argument report-extension factory used by make_sink tests."""
     return (RecordingReportExtension(),)
+
+
+@dataclass(frozen=True)
+class SamplerEnv:
+    """Minimal read-only env face used by command-sampler bind tests."""
+
+    num_envs: int = 1
+
+
+class SamplerSignals:
+    """Minimal read-only signal view used by command-sampler bind tests."""
+
+    def get(self, name: str) -> torch.Tensor | None:
+        """Report no value for any name."""
+        del name
+        return None
+
+    def snapshot(self) -> Mapping[str, torch.Tensor]:
+        """Return an empty signal snapshot."""
+        return {}

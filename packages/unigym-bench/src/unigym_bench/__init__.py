@@ -8,8 +8,9 @@ the monitor protocol and the built-in monitors in
 :mod:`unigym_bench.sink` and the full immutable episode record in
 :mod:`unigym_bench.events`.  P5 adds the ``unigym_bench`` rewind provider on
 the streaming engine.  P6 adds the report builder, the report-extension
-protocol and the monitor fallback in :mod:`unigym_bench.report`.  There is no
-scenario or sampler implementation yet.
+protocol and the monitor fallback in :mod:`unigym_bench.report`.  P7 adds the
+validated command scenario in :mod:`unigym_bench.scenario` and the
+rewind-capable scenario sampler in :mod:`unigym_bench.sampler`.
 """
 
 from __future__ import annotations
