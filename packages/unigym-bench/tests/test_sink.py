@@ -45,7 +45,8 @@ def test_make_sink_builds_from_a_real_context_and_monitor_factory() -> None:
     assert isinstance(sink, BenchmarkSink)
     assert sink.loop_mode == "pool"
     assert sink.stop_when() is False
-    assert sink.rewind_provider is None
+    assert sink.rewind_provider is not None
+    assert sink.rewind_provider.name == "unigym_bench"
 
 
 def test_make_sink_accepts_sink_steered_with_a_publisher() -> None:

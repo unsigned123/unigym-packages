@@ -41,12 +41,11 @@ from torch import Tensor
 from unigym.core.episode_termination import (
     EpisodeOutcome,
     Termination,
-    TerminationExtension,
     TerminationSource,
     validate_code,
 )
 
-from .events import SEVERITIES, Event, Severity
+from .events import SEVERITIES, Event, Severity, termination_from_json
 from .frames import TickFrame
 from .json import JsonValue, ensure_json_value
 
@@ -88,6 +87,17 @@ _MONITOR_OUTCOMES: frozenset[EpisodeOutcome] = frozenset(
 _NAME_PATTERN = re.compile(r"[a-z][a-z0-9_]*")
 
 _T = TypeVar("_T")
+
+
+@dataclass(frozen=True)
+class _DecodedMonitorSnapshot:
+    """One fully validated monitor snapshot, held as private locals."""
+
+    state: object
+    num_envs: int | None
+    device: torch.device | None
+    pending_events: tuple[Event, ...]
+    pending_terminals: dict[int, Termination]
 
 
 class Probe(Protocol):
@@ -247,6 +257,15 @@ class _StatefulMonitor(BaseMonitor):
             },
         }
 
+    def validate_restore(self, state: JsonValue) -> None:
+        """Pre-flight a monitor snapshot without mutating any field.
+
+        This is the read-only half of :meth:`restore`: it applies the same
+        schema, shape and config-fingerprint judgment and is used by the pack's
+        rewind provider before any state is touched.
+        """
+        self._decode_snapshot(state)
+
     def restore(self, state: JsonValue) -> None:
         """Replace the monitor state from a snapshot's private copy.
 
@@ -254,6 +273,15 @@ class _StatefulMonitor(BaseMonitor):
         monitor field is mutated.  A rejected snapshot therefore leaves the
         monitor exactly as it was and still usable.
         """
+        decoded = self._decode_snapshot(state)
+        self._apply_state(decoded.state)
+        self._num_envs = decoded.num_envs
+        self._device = decoded.device
+        self._pending_events = list(decoded.pending_events)
+        self._pending_terminals = dict(decoded.pending_terminals)
+
+    def _decode_snapshot(self, state: JsonValue) -> _DecodedMonitorSnapshot:
+        """Decode one snapshot into private locals without mutation."""
         payload = ensure_json_value(state, where=f"monitor {self._name!r} restore")
         if not isinstance(payload, dict):
             raise TypeError(
@@ -301,7 +329,7 @@ class _StatefulMonitor(BaseMonitor):
         terminals: dict[int, Termination] = {}
         for key, item in raw_terminals.items():
             env_id = _decode_env_key(key, f"{where}.pending_terminals")
-            terminals[env_id] = _termination_from_json(item, f"{where}.pending_terminals[{key}]")
+            terminals[env_id] = termination_from_json(item, f"{where}.pending_terminals[{key}]")
         target_num_envs = self._num_envs if num_envs is None else num_envs
         target_device = self._device if device is None else device
         if target_num_envs is not None:
@@ -319,11 +347,13 @@ class _StatefulMonitor(BaseMonitor):
                             f"[0, num_envs={target_num_envs})"
                         )
         decoded = self._decode_state(raw_state, target_num_envs)
-        self._apply_state(decoded)
-        self._num_envs = target_num_envs
-        self._device = target_device
-        self._pending_events = list(events)
-        self._pending_terminals = terminals
+        return _DecodedMonitorSnapshot(
+            state=decoded,
+            num_envs=target_num_envs,
+            device=target_device,
+            pending_events=events,
+            pending_terminals=terminals,
+        )
 
     def _bind_frame(self, frame: TickFrame) -> None:
         """Bind the run shape on the first tick and reject a mismatch later."""
@@ -1767,108 +1797,6 @@ def _decode_captured_commands(
             values.append(number)
         result.append(tuple(values))
     return result
-
-
-def _termination_from_json(payload: JsonValue, where: str) -> Termination:
-    if not isinstance(payload, dict):
-        raise TypeError(f"{where}: expected a termination object, got {type(payload).__name__}")
-    _require_keys(
-        payload,
-        frozenset(
-            {
-                "outcome",
-                "code",
-                "source",
-                "step_index",
-                "time_s",
-                "metrics",
-                "extensions",
-                "priority",
-            }
-        ),
-        where,
-    )
-    outcome_text = payload["outcome"]
-    source_text = payload["source"]
-    if not isinstance(outcome_text, str):
-        raise TypeError(f"{where}.outcome: expected a string, got {outcome_text!r}")
-    if not isinstance(source_text, str):
-        raise TypeError(f"{where}.source: expected a string, got {source_text!r}")
-    try:
-        outcome = EpisodeOutcome(outcome_text)
-    except ValueError as exc:
-        raise ValueError(f"{where}.outcome: unknown outcome {outcome_text!r}") from exc
-    try:
-        source = TerminationSource(source_text)
-    except ValueError as exc:
-        raise ValueError(f"{where}.source: unknown source {source_text!r}") from exc
-    code = payload["code"]
-    if not isinstance(code, str):
-        raise TypeError(f"{where}.code: expected a string, got {code!r}")
-    step_index_value = payload["step_index"]
-    step_index: int | None
-    if step_index_value is None:
-        step_index = None
-    elif isinstance(step_index_value, int) and not isinstance(step_index_value, bool):
-        step_index = step_index_value
-    else:
-        raise TypeError(f"{where}.step_index: expected an int or None, got {step_index_value!r}")
-    time_value = payload["time_s"]
-    time_s: float | None
-    if time_value is None:
-        time_s = None
-    elif isinstance(time_value, bool) or not isinstance(time_value, (int, float)):
-        raise TypeError(f"{where}.time_s: expected a number or None, got {time_value!r}")
-    else:
-        time_s = float(time_value)
-    metrics_value = payload["metrics"]
-    if not isinstance(metrics_value, dict):
-        raise TypeError(f"{where}.metrics: expected an object, got {type(metrics_value).__name__}")
-    metrics: dict[str, float] = {}
-    for key, item in metrics_value.items():
-        if not isinstance(item, (int, float)) or isinstance(item, bool):
-            raise TypeError(f"{where}.metrics[{key!r}]: expected a number, got {item!r}")
-        metrics[key] = float(item)
-    extensions_value = payload["extensions"]
-    if not isinstance(extensions_value, dict):
-        raise TypeError(
-            f"{where}.extensions: expected an object, got {type(extensions_value).__name__}"
-        )
-    extensions: dict[str, TerminationExtension] = {}
-    for key, item in extensions_value.items():
-        extension_where = f"{where}.extensions[{key!r}]"
-        if not isinstance(item, dict):
-            raise TypeError(f"{extension_where}: expected an object, got {type(item).__name__}")
-        _require_keys(item, frozenset({"namespace", "schema_version", "data"}), extension_where)
-        namespace = item["namespace"]
-        schema_version = item["schema_version"]
-        data = item["data"]
-        if not isinstance(namespace, str):
-            raise TypeError(f"{extension_where}.namespace: expected a string, got {namespace!r}")
-        if isinstance(schema_version, bool) or not isinstance(schema_version, int):
-            raise TypeError(
-                f"{extension_where}.schema_version: expected an int, got {schema_version!r}"
-            )
-        if not isinstance(data, dict):
-            raise TypeError(
-                f"{extension_where}.data: expected an object, got {type(data).__name__}"
-            )
-        extensions[key] = TerminationExtension(
-            namespace=namespace, schema_version=schema_version, data=data
-        )
-    priority_value = payload["priority"]
-    if isinstance(priority_value, bool) or not isinstance(priority_value, int):
-        raise TypeError(f"{where}.priority: expected an int, got {priority_value!r}")
-    return Termination(
-        outcome=outcome,
-        code=code,
-        source=source,
-        step_index=step_index,
-        time_s=time_s,
-        metrics=metrics,
-        extensions=extensions,
-        priority=priority_value,
-    )
 
 
 def _decode_env_key(key: str, where: str) -> int:

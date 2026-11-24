@@ -20,7 +20,14 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Literal, TypeAlias
 
-from unigym.core.episode_termination import EpisodeTermination, Termination, validate_code
+from unigym.core.episode_termination import (
+    EpisodeOutcome,
+    EpisodeTermination,
+    Termination,
+    TerminationExtension,
+    TerminationSource,
+    validate_code,
+)
 
 from .json import JsonValue, ensure_json_value
 
@@ -48,6 +55,34 @@ EpisodeVerdict: TypeAlias = Literal["terminal", "deadline", "core", "incomplete"
 VERDICTS: frozenset[str] = frozenset({"terminal", "deadline", "core", "incomplete", "rewound"})
 
 _EVENT_KEYS = frozenset({"name", "code", "env_ids", "severity", "data"})
+_RECORD_KEYS = frozenset(
+    {
+        "env_id",
+        "episode_seq",
+        "ticks",
+        "verdict",
+        "command_at_start",
+        "first_terminal",
+        "core_termination",
+        "reset_facts",
+        "event_counts",
+        "rewound",
+    }
+)
+_TERMINATION_KEYS = frozenset(
+    {
+        "outcome",
+        "code",
+        "source",
+        "step_index",
+        "time_s",
+        "metrics",
+        "extensions",
+        "priority",
+    }
+)
+_EPISODE_TERMINATION_KEYS = frozenset({"primary", "all"})
+_TERMINATION_EXTENSION_KEYS = frozenset({"namespace", "schema_version", "data"})
 
 
 @dataclass(frozen=True)
@@ -259,6 +294,66 @@ class EpisodeRecord:
             "rewound": self.rewound,
         }
 
+    @classmethod
+    def from_json(cls, payload: object) -> EpisodeRecord:
+        """Rebuild a record from :meth:`to_json` output.
+
+        Args:
+            payload: A JSON-safe record document.
+
+        Returns:
+            A new record sharing no mutable state with ``payload``.
+
+        Raises:
+            TypeError: The payload or one of its fields has the wrong type.
+            ValueError: A field is missing, unknown or invalid.
+        """
+        document = ensure_json_value(payload, where="episode record snapshot")
+        if not isinstance(document, dict):
+            raise TypeError(
+                "episode record snapshot: expected a mapping, " f"got {type(document).__name__}"
+            )
+        _require_keys(document, _RECORD_KEYS, "episode record snapshot")
+        raw_env_id = document["env_id"]
+        if isinstance(raw_env_id, bool) or not isinstance(raw_env_id, int):
+            raise TypeError(f"episode record snapshot.env_id: expected an int, got {raw_env_id!r}")
+        episode_seq = _require_int(document["episode_seq"], "episode record snapshot.episode_seq")
+        ticks = _require_int(document["ticks"], "episode record snapshot.ticks")
+        verdict = _require_verdict(document["verdict"], "episode record snapshot.verdict")
+        first_terminal = _optional_termination(
+            document["first_terminal"], "episode record snapshot.first_terminal"
+        )
+        core_termination = _optional_episode_termination(
+            document["core_termination"], "episode record snapshot.core_termination"
+        )
+        reset_facts = document["reset_facts"]
+        if not isinstance(reset_facts, dict):
+            raise TypeError(
+                "episode record snapshot.reset_facts: expected an object, "
+                f"got {type(reset_facts).__name__}"
+            )
+        event_counts = document["event_counts"]
+        if not isinstance(event_counts, dict):
+            raise TypeError(
+                "episode record snapshot.event_counts: expected an object, "
+                f"got {type(event_counts).__name__}"
+            )
+        rewound = document["rewound"]
+        if not isinstance(rewound, bool):
+            raise TypeError(f"episode record snapshot.rewound: expected a bool, got {rewound!r}")
+        return cls(
+            env_id=raw_env_id,
+            episode_seq=episode_seq,
+            ticks=ticks,
+            verdict=verdict,
+            command_at_start=_validate_command(document["command_at_start"]),
+            first_terminal=first_terminal,
+            core_termination=core_termination,
+            reset_facts=reset_facts,
+            event_counts=event_counts,
+            rewound=rewound,
+        )
+
 
 @dataclass(frozen=True)
 class EpisodeSummary:
@@ -309,6 +404,147 @@ class EpisodeSummary:
             "dropped_events": self.dropped_events,
             "conflicts": self.conflicts,
         }
+
+
+def termination_from_json(payload: JsonValue, where: str) -> Termination:
+    """Rebuild one core termination from its :meth:`Termination.to_json` form."""
+    if not isinstance(payload, dict):
+        raise TypeError(f"{where}: expected a termination object, got {type(payload).__name__}")
+    _require_keys(payload, _TERMINATION_KEYS, where)
+    outcome_text = payload["outcome"]
+    source_text = payload["source"]
+    code = payload["code"]
+    if not isinstance(outcome_text, str):
+        raise TypeError(f"{where}.outcome: expected a string, got {outcome_text!r}")
+    if not isinstance(source_text, str):
+        raise TypeError(f"{where}.source: expected a string, got {source_text!r}")
+    if not isinstance(code, str):
+        raise TypeError(f"{where}.code: expected a string, got {code!r}")
+    try:
+        outcome = EpisodeOutcome(outcome_text)
+    except ValueError as exc:
+        raise ValueError(f"{where}.outcome: unknown outcome {outcome_text!r}") from exc
+    try:
+        source = TerminationSource(source_text)
+    except ValueError as exc:
+        raise ValueError(f"{where}.source: unknown source {source_text!r}") from exc
+    step_index = _optional_int(payload["step_index"], f"{where}.step_index")
+    time_s = _optional_float(payload["time_s"], f"{where}.time_s")
+    metrics = _float_mapping(payload["metrics"], f"{where}.metrics")
+    extensions = _termination_extensions(payload["extensions"], f"{where}.extensions")
+    priority = _require_int(payload["priority"], f"{where}.priority")
+    return Termination(
+        outcome=outcome,
+        code=code,
+        source=source,
+        step_index=step_index,
+        time_s=time_s,
+        metrics=metrics,
+        extensions=extensions,
+        priority=priority,
+    )
+
+
+def episode_termination_from_json(payload: JsonValue, where: str) -> EpisodeTermination:
+    """Rebuild one core episode termination from its JSON form."""
+    if not isinstance(payload, dict):
+        raise TypeError(
+            f"{where}: expected an episode termination object, got {type(payload).__name__}"
+        )
+    _require_keys(payload, _EPISODE_TERMINATION_KEYS, where)
+    raw_all = payload["all"]
+    if not isinstance(raw_all, list):
+        raise TypeError(f"{where}.all: expected a list, got {type(raw_all).__name__}")
+    if not raw_all:
+        raise ValueError(f"{where}.all: expected at least one termination")
+    terms = tuple(
+        termination_from_json(item, f"{where}.all[{index}]") for index, item in enumerate(raw_all)
+    )
+    primary = termination_from_json(payload["primary"], f"{where}.primary")
+    return EpisodeTermination(primary=primary, all=terms)
+
+
+def _optional_termination(payload: JsonValue, where: str) -> Termination | None:
+    if payload is None:
+        return None
+    return termination_from_json(payload, where)
+
+
+def _optional_episode_termination(payload: JsonValue, where: str) -> EpisodeTermination | None:
+    if payload is None:
+        return None
+    return episode_termination_from_json(payload, where)
+
+
+def _termination_extensions(payload: JsonValue, where: str) -> dict[str, TerminationExtension]:
+    if not isinstance(payload, dict):
+        raise TypeError(f"{where}: expected an object, got {type(payload).__name__}")
+    extensions: dict[str, TerminationExtension] = {}
+    for key, item in payload.items():
+        item_where = f"{where}[{key!r}]"
+        if not isinstance(item, dict):
+            raise TypeError(f"{item_where}: expected an object, got {type(item).__name__}")
+        _require_keys(item, _TERMINATION_EXTENSION_KEYS, item_where)
+        namespace = item["namespace"]
+        schema_version = item["schema_version"]
+        data = item["data"]
+        if not isinstance(namespace, str):
+            raise TypeError(f"{item_where}.namespace: expected a string, got {namespace!r}")
+        if isinstance(schema_version, bool) or not isinstance(schema_version, int):
+            raise TypeError(f"{item_where}.schema_version: expected an int, got {schema_version!r}")
+        if not isinstance(data, dict):
+            raise TypeError(f"{item_where}.data: expected an object, got {type(data).__name__}")
+        extensions[key] = TerminationExtension(
+            namespace=namespace,
+            schema_version=schema_version,
+            data=data,
+        )
+    return extensions
+
+
+def _float_mapping(payload: JsonValue, where: str) -> dict[str, float]:
+    if not isinstance(payload, dict):
+        raise TypeError(f"{where}: expected an object, got {type(payload).__name__}")
+    values: dict[str, float] = {}
+    for key, item in payload.items():
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            raise TypeError(f"{where}[{key!r}]: expected a number, got {item!r}")
+        values[key] = float(item)
+    return values
+
+
+def _optional_int(payload: JsonValue, where: str) -> int | None:
+    if payload is None:
+        return None
+    return _require_int(payload, where)
+
+
+def _optional_float(payload: JsonValue, where: str) -> float | None:
+    if payload is None:
+        return None
+    if isinstance(payload, bool) or not isinstance(payload, (int, float)):
+        raise TypeError(f"{where}: expected a number or None, got {payload!r}")
+    return float(payload)
+
+
+def _require_int(payload: JsonValue, where: str) -> int:
+    if isinstance(payload, bool) or not isinstance(payload, int):
+        raise TypeError(f"{where}: expected an int, got {payload!r}")
+    return payload
+
+
+def _require_verdict(payload: JsonValue, where: str) -> EpisodeVerdict:
+    if payload == "terminal":
+        return "terminal"
+    if payload == "deadline":
+        return "deadline"
+    if payload == "core":
+        return "core"
+    if payload == "incomplete":
+        return "incomplete"
+    if payload == "rewound":
+        return "rewound"
+    raise ValueError(f"{where}: expected one of {sorted(VERDICTS)}, got {payload!r}")
 
 
 def _validate_command(value: object) -> tuple[float, ...] | None:

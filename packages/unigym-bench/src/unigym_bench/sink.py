@@ -35,9 +35,13 @@ terminals in that mode, and reopening a row the backend never reset would be
 incorrect.  The direct constructor exposes the same assertion as
 ``reset_after_episode``.
 
-Rewind and early-stop hooks are interfaces only in P4.  ``stop_when`` never
-stops, ``on_rewind`` marks nothing, and ``rewind_provider`` returns ``None``;
-P5 owns the JSON-safe provider and any state it must restore.
+Rewind and early-stop hooks.  ``stop_when`` never stops.  The sink exposes the
+run's :class:`~unigym_bench.engine.StreamingEngine` as its core rewind provider
+(``name="unigym_bench"``, schema ``unigym_bench.rewind/1``); the engine owns all
+checkpointable pack state and the sink's own ``_pending_reset`` glue is empty at
+every core snapshot freeze point (a snapshot is taken between completed ticks).
+The sampler cursor/RNG and the ``SignalBus`` remain separate core providers.
+``on_rewind`` delegates to the engine so open episodes are marked ``rewound``.
 """
 
 from __future__ import annotations
@@ -215,9 +219,9 @@ class BenchmarkSink:
         return self._loop_mode
 
     @property
-    def rewind_provider(self) -> None:
-        """P5 owns the JSON-safe rewind provider; P4 has no state to checkpoint."""
-        return None
+    def rewind_provider(self) -> StreamingEngine:
+        """The run's core rewind provider, owned by the streaming engine."""
+        return self._engine
 
     def on_step(self, t: int, bundle: dict[str, object]) -> None:
         """Delegate one pre-reset tick to the engine."""
@@ -247,8 +251,8 @@ class BenchmarkSink:
         return False
 
     def on_rewind(self, info: dict[str, object]) -> None:
-        """P4 has no rewind state to mark; P5 owns abandoned-branch handling."""
-        del info
+        """Mark the currently open episodes as belonging to a forked timeline."""
+        self._engine.on_rewind(info)
 
 
 def _validate_loop_mode(value: object) -> None:

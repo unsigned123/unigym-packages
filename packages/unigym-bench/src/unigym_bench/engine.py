@@ -36,8 +36,10 @@ open.
 
 from __future__ import annotations
 
+import math
 import operator
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from types import MappingProxyType
 from typing import TYPE_CHECKING
 
@@ -51,20 +53,102 @@ from unigym.core.episode_termination import (
     validate_code,
 )
 
-from .events import EpisodeRecord, EpisodeSummary, EpisodeVerdict, Event
+from .events import (
+    VERDICTS,
+    EpisodeRecord,
+    EpisodeSummary,
+    EpisodeVerdict,
+    Event,
+    termination_from_json,
+)
 from .frames import TickFrame
-from .json import JsonValue
+from .json import JsonValue, ensure_json_value
 from .monitors import Monitor
 from .specs import RetentionSpec
 
 if TYPE_CHECKING:
     from unigym.signals import SignalPublisher
 
-__all__ = ["EngineStateError", "StreamingEngine"]
+#: Checkpoint payload key and schema owned by the pack's rewind provider.
+REWIND_PROVIDER_NAME = "unigym_bench"
+REWIND_SCHEMA = "unigym_bench.rewind/1"
+
+__all__ = [
+    "EngineStateError",
+    "REWIND_PROVIDER_NAME",
+    "REWIND_SCHEMA",
+    "StreamingEngine",
+]
+
+_REWIND_KEYS = frozenset({"schema", "engine", "monitors"})
+_ENGINE_KEYS = frozenset(
+    {
+        "bound",
+        "run_ended",
+        "num_envs",
+        "device",
+        "retention",
+        "open",
+        "rewound",
+        "episode_seq",
+        "episode_ticks",
+        "episode_events",
+        "episode_command",
+        "episode_reset",
+        "latched",
+        "pending",
+        "conflicts",
+        "conflict_total",
+        "journal",
+        "dropped_events",
+        "event_total",
+        "records",
+        "episode_total",
+        "tick_total",
+        "verdict_counts",
+    }
+)
+_RETENTION_KEYS = frozenset({"retain_episodes", "max_events", "event_log"})
 
 
 class EngineStateError(RuntimeError):
     """The engine was driven outside its declared per-run lifecycle."""
+
+
+@dataclass(frozen=True)
+class _DecodedEngineState:
+    """One fully validated engine payload held as private locals."""
+
+    bound: bool
+    run_ended: bool
+    num_envs: int | None
+    device: torch.device | None
+    open: list[bool]
+    rewound: list[bool]
+    episode_seq: list[int]
+    episode_ticks: list[int]
+    episode_events: list[dict[str, int]]
+    episode_command: list[tuple[float, ...] | None]
+    episode_reset: list[dict[str, JsonValue]]
+    latched: dict[int, Termination]
+    pending: dict[int, Termination]
+    conflicts: dict[int, int]
+    conflict_total: int
+    journal: list[Event]
+    dropped_events: int
+    event_total: int
+    records: list[EpisodeRecord]
+    episode_total: int
+    tick_total: int
+    verdict_counts: dict[str, int]
+
+
+@dataclass(frozen=True)
+class _DecodedRewindState:
+    """One validated checkpoint document before any live state is touched."""
+
+    engine: _DecodedEngineState
+    monitors: dict[str, JsonValue]
 
 
 class StreamingEngine:
@@ -78,6 +162,9 @@ class StreamingEngine:
         publisher: Optional write-only signal publisher.  When supplied, every
             monitor level is published as ````<monitor>/<signal>````.
     """
+
+    #: Structural rewind-provider name; checkpoint payload keys are namespaced.
+    name: str = REWIND_PROVIDER_NAME
 
     def __init__(
         self,
@@ -126,6 +213,7 @@ class StreamingEngine:
         self._device: torch.device | None = None
 
         self._open: list[bool] = []
+        self._rewound: list[bool] = []
         self._episode_seq: list[int] = []
         self._episode_ticks: list[int] = []
         self._episode_events: list[dict[str, int]] = []
@@ -205,6 +293,105 @@ class StreamingEngine:
             dropped_events=self._dropped_events,
             conflicts=self._conflict_total,
         )
+
+    # ------------------------------------------------------------------ #
+    # Core rewind-provider face
+    # ------------------------------------------------------------------ #
+    def rewind_state(self) -> dict[str, JsonValue]:
+        """Return a JSON-safe, private-copied checkpoint of the run state.
+
+        The payload owns only pack state: engine flags/counters, journal,
+        latches/pending drains, report accumulators that already exist, and
+        every rewindable monitor's ``snapshot()``.  The sampler cursor/RNG and
+        the signal bus are separate core providers and are never duplicated
+        here.
+        """
+        engine: dict[str, JsonValue] = {
+            "bound": self._bound,
+            "run_ended": self._run_ended,
+            "num_envs": self._num_envs,
+            "device": None if self._device is None else str(self._device),
+            "retention": _retention_state(self._retention),
+            "open": list(self._open),
+            "rewound": list(self._rewound),
+            "episode_seq": list(self._episode_seq),
+            "episode_ticks": list(self._episode_ticks),
+            "episode_events": [dict(counts) for counts in self._episode_events],
+            "episode_command": [
+                None if command is None else list(command) for command in self._episode_command
+            ],
+            "episode_reset": [dict(facts) for facts in self._episode_reset],
+            "latched": {
+                str(env_id): termination.to_json()
+                for env_id, termination in sorted(self._latched.items())
+            },
+            "pending": {
+                str(env_id): termination.to_json()
+                for env_id, termination in sorted(self._pending.items())
+            },
+            "conflicts": {str(env_id): count for env_id, count in sorted(self._conflicts.items())},
+            "conflict_total": self._conflict_total,
+            "journal": [event.to_json() for event in self._journal],
+            "dropped_events": self._dropped_events,
+            "event_total": self._event_total,
+            "records": [record.to_json() for record in self._records],
+            "episode_total": self._episode_total,
+            "tick_total": self._tick_total,
+            "verdict_counts": dict(self._verdict_counts),
+        }
+        monitors: dict[str, JsonValue] = {}
+        for monitor in self._monitors:
+            snapshot = _monitor_snapshot(monitor)
+            if snapshot is not None:
+                monitors[monitor.name] = snapshot
+        document: dict[str, JsonValue] = {
+            "schema": REWIND_SCHEMA,
+            "engine": engine,
+            "monitors": monitors,
+        }
+        normalized = ensure_json_value(document, where="unigym_bench rewind state")
+        if not isinstance(normalized, dict):
+            raise TypeError("unigym_bench rewind state: expected an object")
+        return normalized
+
+    def validate_rewind_state(self, state: object) -> None:
+        """Read-only pre-flight with the same judgment as :meth:`apply_rewind_state`."""
+        self._decode_rewind_state(state)
+
+    def apply_rewind_state(self, state: object) -> None:
+        """Restore a checkpoint in place after fully decoding and validating it.
+
+        Monitor snapshots are pre-flighted with the read-only
+        ``validate_restore`` capability when present.  The live monitor state
+        is captured before any monitor is touched so an unexpected restore
+        failure rolls every monitor back; engine fields are assigned only after
+        every monitor restored successfully.
+        """
+        decoded = self._decode_rewind_state(state)
+        rollback: dict[str, JsonValue] = {}
+        for monitor in self._monitors:
+            snapshot = _monitor_snapshot(monitor)
+            if snapshot is not None:
+                rollback[monitor.name] = snapshot
+        try:
+            for monitor in self._monitors:
+                target = decoded.monitors.get(monitor.name)
+                if target is None:
+                    continue
+                restore = getattr(monitor, "restore", None)
+                if not callable(restore):
+                    raise TypeError(
+                        f"monitor {monitor.name!r}: rewind snapshot present but no "
+                        "callable restore"
+                    )
+                restore(target)
+        except Exception:
+            for monitor in self._monitors:
+                previous = rollback.get(monitor.name)
+                if previous is not None:
+                    monitor.restore(previous)
+            raise
+        self._apply_engine_state(decoded.engine)
 
     # ------------------------------------------------------------------ #
     # Runner-facing lifecycle
@@ -338,6 +525,7 @@ class StreamingEngine:
                 core_termination=self._core_termination(bundle, env_id),
                 reset_facts=dict(self._episode_reset[env_id]),
                 event_counts=dict(self._episode_events[env_id]),
+                rewound=self._rewound[env_id],
             )
             for env_id in due_ids
         ]
@@ -356,6 +544,7 @@ class StreamingEngine:
             self._episode_command[env_id] = None
             self._episode_reset[env_id].clear()
             self._open[env_id] = False
+            self._rewound[env_id] = False
         return due_ids
 
     def on_reset(self, env_ids: object) -> None:
@@ -390,6 +579,7 @@ class StreamingEngine:
             self._episode_events[env_id].clear()
             self._episode_command[env_id] = None
             self._episode_reset[env_id].clear()
+            self._rewound[env_id] = False
 
     def on_run_end(self) -> EpisodeSummary:
         """Finalize still-open episodes as ``incomplete`` and return the summary.
@@ -411,11 +601,12 @@ class StreamingEngine:
                     env_id=env_id,
                     episode_seq=self._episode_seq[env_id],
                     ticks=self._episode_ticks[env_id],
-                    verdict="incomplete",
+                    verdict="rewound" if self._rewound[env_id] else "incomplete",
                     command_at_start=self._episode_command[env_id],
                     first_terminal=self._latched.get(env_id),
                     reset_facts=dict(self._episode_reset[env_id]),
                     event_counts=dict(self._episode_events[env_id]),
+                    rewound=self._rewound[env_id],
                 )
                 for env_id in recorded_ids
             ]
@@ -427,9 +618,211 @@ class StreamingEngine:
                 self._episode_command[env_id] = None
                 self._episode_reset[env_id].clear()
                 self._open[env_id] = False
+                self._rewound[env_id] = False
             self._pending.clear()
         self._run_ended = True
         return self.summary
+
+    def on_rewind(self, info: Mapping[str, object]) -> None:
+        """Mark every currently open episode as belonging to a forked timeline.
+
+        The core runner calls this after the provider restore, just before the
+        restored timeline's first step.  The mark rides the episode until it
+        finalizes: a due record keeps its natural verdict plus ``rewound=True``;
+        an episode still open at run end is reported with verdict ``rewound``.
+        """
+        del info
+        for env_id, is_open in enumerate(self._open):
+            if is_open:
+                self._rewound[env_id] = True
+
+    # ------------------------------------------------------------------ #
+    # Rewind payload decode and apply
+    # ------------------------------------------------------------------ #
+    def _decode_rewind_state(self, state: object) -> _DecodedRewindState:
+        """Decode and validate a checkpoint without mutating live state."""
+        payload = ensure_json_value(state, where="unigym_bench rewind state")
+        if not isinstance(payload, dict):
+            raise TypeError(
+                "unigym_bench rewind state: expected an object, " f"got {type(payload).__name__}"
+            )
+        where = "unigym_bench rewind state"
+        _require_keys(payload, _REWIND_KEYS, where)
+        if payload["schema"] != REWIND_SCHEMA:
+            raise ValueError(
+                f"{where}.schema: expected {REWIND_SCHEMA!r}, got {payload['schema']!r}"
+            )
+        raw_engine = payload["engine"]
+        if not isinstance(raw_engine, dict):
+            raise TypeError(f"{where}.engine: expected an object, got {type(raw_engine).__name__}")
+        engine = self._decode_engine_state(raw_engine)
+        raw_monitors = payload["monitors"]
+        if not isinstance(raw_monitors, dict):
+            raise TypeError(
+                f"{where}.monitors: expected an object, got {type(raw_monitors).__name__}"
+            )
+        expected: dict[str, Monitor] = {}
+        for monitor in self._monitors:
+            if _rewind_capability(monitor) is not None:
+                expected[monitor.name] = monitor
+        if set(raw_monitors) != set(expected):
+            raise ValueError(
+                f"{where}.monitors: checkpoint monitor names "
+                f"{sorted(raw_monitors)} do not match the live rewindable monitors "
+                f"{sorted(expected)}"
+            )
+        monitors: dict[str, JsonValue] = {}
+        for name, item in raw_monitors.items():
+            monitor = expected[name]
+            monitor_where = f"{where}.monitors[{name!r}]"
+            normalized = ensure_json_value(item, where=monitor_where)
+            validate = getattr(monitor, "validate_restore", None)
+            if callable(validate):
+                validate(normalized)
+            monitors[name] = normalized
+        return _DecodedRewindState(engine=engine, monitors=monitors)
+
+    def _decode_engine_state(self, raw: Mapping[str, JsonValue]) -> _DecodedEngineState:
+        """Decode the engine-owned part of the payload into private locals."""
+        where = "unigym_bench rewind state.engine"
+        _require_keys(raw, _ENGINE_KEYS, where)
+        bound = _require_bool(raw["bound"], f"{where}.bound")
+        run_ended = _require_bool(raw["run_ended"], f"{where}.run_ended")
+        num_envs = _optional_positive_int(raw["num_envs"], f"{where}.num_envs")
+        device = _optional_device(raw["device"], f"{where}.device")
+        if bound:
+            if num_envs is None or device is None:
+                raise ValueError(
+                    f"{where}: a bound checkpoint requires num_envs and device, "
+                    f"got num_envs={num_envs!r}, device={device!r}"
+                )
+            if self._bound:
+                if num_envs != self._num_envs:
+                    raise ValueError(
+                        f"{where}.num_envs: checkpoint {num_envs} does not match "
+                        f"live engine num_envs {self._num_envs}"
+                    )
+                if device != self._device:
+                    raise ValueError(
+                        f"{where}.device: checkpoint {device} does not match "
+                        f"live engine device {self._device}"
+                    )
+        else:
+            if num_envs is not None or device is not None:
+                raise ValueError(
+                    f"{where}: an unbound checkpoint must not carry num_envs/device, "
+                    f"got {num_envs!r}/{device!r}"
+                )
+            if self._bound:
+                raise ValueError(f"{where}: checkpoint is unbound but the live engine is bound")
+        retention = _decode_retention(raw["retention"], f"{where}.retention")
+        if retention != _retention_state(self._retention):
+            raise ValueError(
+                f"{where}.retention: checkpoint retention {retention!r} does not match "
+                f"live retention {_retention_state(self._retention)!r}"
+            )
+        open_flags = _decode_bool_list(raw["open"], f"{where}.open", num_envs)
+        rewound = _decode_bool_list(raw["rewound"], f"{where}.rewound", num_envs)
+        episode_seq = _decode_int_list(raw["episode_seq"], f"{where}.episode_seq", num_envs)
+        episode_ticks = _decode_int_list(raw["episode_ticks"], f"{where}.episode_ticks", num_envs)
+        episode_events = _decode_event_counts_list(
+            raw["episode_events"], f"{where}.episode_events", num_envs
+        )
+        episode_command = _decode_command_list(
+            raw["episode_command"], f"{where}.episode_command", num_envs
+        )
+        episode_reset = _decode_reset_list(raw["episode_reset"], f"{where}.episode_reset", num_envs)
+        latched = _decode_termination_map(raw["latched"], f"{where}.latched", num_envs)
+        pending = _decode_termination_map(raw["pending"], f"{where}.pending", num_envs)
+        for env_id in latched:
+            if not open_flags[env_id]:
+                raise ValueError(
+                    f"{where}.latched: env {env_id} has a latch but the episode is closed"
+                )
+        for env_id in pending:
+            if env_id not in latched:
+                raise ValueError(
+                    f"{where}.pending: env {env_id} has a pending drain without a latch"
+                )
+        conflicts = _decode_conflict_map(raw["conflicts"], f"{where}.conflicts", num_envs)
+        conflict_total = _nonnegative_int(raw["conflict_total"], f"{where}.conflict_total")
+        journal = _decode_journal(raw["journal"], f"{where}.journal", num_envs)
+        if not self._retention.event_log:
+            if journal:
+                raise ValueError(
+                    f"{where}.journal: checkpoint carries entries but live retention "
+                    "has event_log disabled"
+                )
+        elif len(journal) > self._retention.max_events:
+            raise ValueError(
+                f"{where}.journal: checkpoint has {len(journal)} entries but live "
+                f"retention max_events is {self._retention.max_events}"
+            )
+        records = _decode_records(raw["records"], f"{where}.records", num_envs)
+        episode_total = _nonnegative_int(raw["episode_total"], f"{where}.episode_total")
+        tick_total = _nonnegative_int(raw["tick_total"], f"{where}.tick_total")
+        if self._retention.retain_episodes and len(records) != episode_total:
+            raise ValueError(
+                f"{where}.records: checkpoint retains {len(records)} records but "
+                f"episode_total is {episode_total}"
+            )
+        if not self._retention.retain_episodes and records:
+            raise ValueError(
+                f"{where}.records: checkpoint carries records but live retention "
+                "has retain_episodes disabled"
+            )
+        verdict_counts = _decode_verdict_counts(raw["verdict_counts"], f"{where}.verdict_counts")
+        dropped_events = _nonnegative_int(raw["dropped_events"], f"{where}.dropped_events")
+        event_total = _nonnegative_int(raw["event_total"], f"{where}.event_total")
+        return _DecodedEngineState(
+            bound=bound,
+            run_ended=run_ended,
+            num_envs=num_envs,
+            device=device,
+            open=list(open_flags),
+            rewound=list(rewound),
+            episode_seq=list(episode_seq),
+            episode_ticks=list(episode_ticks),
+            episode_events=[dict(counts) for counts in episode_events],
+            episode_command=list(episode_command),
+            episode_reset=[dict(facts) for facts in episode_reset],
+            latched=latched,
+            pending=pending,
+            conflicts=conflicts,
+            conflict_total=conflict_total,
+            journal=journal,
+            dropped_events=dropped_events,
+            event_total=event_total,
+            records=records,
+            episode_total=episode_total,
+            tick_total=tick_total,
+            verdict_counts=verdict_counts,
+        )
+
+    def _apply_engine_state(self, decoded: _DecodedEngineState) -> None:
+        """Assign the validated engine locals in place."""
+        self._bound = decoded.bound
+        self._run_ended = decoded.run_ended
+        self._num_envs = decoded.num_envs
+        self._device = decoded.device
+        self._open = decoded.open
+        self._rewound = decoded.rewound
+        self._episode_seq = decoded.episode_seq
+        self._episode_ticks = decoded.episode_ticks
+        self._episode_events = decoded.episode_events
+        self._episode_command = decoded.episode_command
+        self._episode_reset = decoded.episode_reset
+        self._latched = decoded.latched
+        self._pending = decoded.pending
+        self._conflicts = decoded.conflicts
+        self._conflict_total = decoded.conflict_total
+        self._journal = decoded.journal
+        self._dropped_events = decoded.dropped_events
+        self._event_total = decoded.event_total
+        self._records = decoded.records
+        self._episode_total = decoded.episode_total
+        self._tick_total = decoded.tick_total
+        self._verdict_counts = decoded.verdict_counts
 
     # ------------------------------------------------------------------ #
     # Frame and output validation
@@ -473,6 +866,7 @@ class StreamingEngine:
             self._num_envs = frame.num_envs
             self._device = frame.device
             self._open = [True] * frame.num_envs
+            self._rewound = [False] * frame.num_envs
             self._episode_seq = [0] * frame.num_envs
             self._episode_ticks = [0] * frame.num_envs
             self._episode_events = [{} for _ in range(frame.num_envs)]
@@ -735,3 +1129,257 @@ def _as_env_ids(value: object, num_envs: int, where: str) -> tuple[int, ...]:
         seen.add(env_id)
         ids.append(env_id)
     return tuple(sorted(ids))
+
+
+def _retention_state(retention: RetentionSpec) -> dict[str, JsonValue]:
+    """Return the construction fingerprint a checkpoint must match."""
+    return {
+        "retain_episodes": retention.retain_episodes,
+        "max_events": retention.max_events,
+        "event_log": retention.event_log,
+    }
+
+
+def _decode_retention(raw: JsonValue, where: str) -> dict[str, JsonValue]:
+    if not isinstance(raw, dict):
+        raise TypeError(f"{where}: expected an object, got {type(raw).__name__}")
+    _require_keys(raw, _RETENTION_KEYS, where)
+    return {
+        "retain_episodes": _require_bool(raw["retain_episodes"], f"{where}.retain_episodes"),
+        "max_events": _nonnegative_int(raw["max_events"], f"{where}.max_events"),
+        "event_log": _require_bool(raw["event_log"], f"{where}.event_log"),
+    }
+
+
+def _rewind_capability(
+    monitor: Monitor,
+) -> tuple[Callable[[], object], Callable[[object], None]] | None:
+    """Return a monitor's snapshot/restore pair, or ``None`` when stateless.
+
+    A monitor that declares only one half of the optional capability is an
+    inconsistent implementation and fails fast instead of silently
+    participating in or opting out of rewind.
+    """
+    snapshot = getattr(monitor, "snapshot", None)
+    restore = getattr(monitor, "restore", None)
+    has_snapshot = callable(snapshot)
+    has_restore = callable(restore)
+    if has_snapshot != has_restore:
+        raise TypeError(
+            f"monitor {monitor.name!r}: rewind capability requires both snapshot " "and restore"
+        )
+    if not has_snapshot:
+        return None
+    return snapshot, restore
+
+
+def _monitor_snapshot(monitor: Monitor) -> JsonValue | None:
+    capability = _rewind_capability(monitor)
+    if capability is None:
+        return None
+    snapshot, _ = capability
+    return ensure_json_value(snapshot(), where=f"monitor {monitor.name!r} rewind snapshot")
+
+
+def _require_keys(document: Mapping[str, JsonValue], expected: frozenset[str], where: str) -> None:
+    missing = sorted(expected - document.keys())
+    unknown = sorted(document.keys() - expected)
+    if missing or unknown:
+        raise ValueError(
+            f"{where}: expected keys {sorted(expected)}, missing {missing}, unknown {unknown}"
+        )
+
+
+def _require_bool(value: JsonValue, where: str) -> bool:
+    if not isinstance(value, bool):
+        raise TypeError(f"{where}: expected a bool, got {value!r}")
+    return value
+
+
+def _nonnegative_int(value: JsonValue, where: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{where}: expected an int, got {value!r}")
+    if value < 0:
+        raise ValueError(f"{where}: expected an int >= 0, got {value}")
+    return value
+
+
+def _optional_positive_int(value: JsonValue, where: str) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{where}: expected a positive int or None, got {value!r}")
+    if value < 1:
+        raise ValueError(f"{where}: expected a positive int, got {value}")
+    return value
+
+
+def _optional_device(value: JsonValue, where: str) -> torch.device | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        raise TypeError(f"{where}: expected a device string or None, got {value!r}")
+    try:
+        return torch.device(value)
+    except (RuntimeError, ValueError) as exc:
+        raise ValueError(f"{where}: invalid device string {value!r}: {exc}") from exc
+
+
+def _require_list(value: JsonValue, where: str) -> list[JsonValue]:
+    if not isinstance(value, list):
+        raise TypeError(f"{where}: expected a list, got {type(value).__name__}")
+    return value
+
+
+def _require_run_length(values: Sequence[object], num_envs: int | None, where: str) -> None:
+    if num_envs is None:
+        if values:
+            raise ValueError(f"{where}: an unbound checkpoint must not carry per-env state")
+        return
+    if len(values) != num_envs:
+        raise ValueError(f"{where}: expected {num_envs} entries, got {len(values)}")
+
+
+def _decode_bool_list(value: JsonValue, where: str, num_envs: int | None) -> list[bool]:
+    items = _require_list(value, where)
+    _require_run_length(items, num_envs, where)
+    values: list[bool] = []
+    for index, item in enumerate(items):
+        values.append(_require_bool(item, f"{where}[{index}]"))
+    return values
+
+
+def _decode_int_list(value: JsonValue, where: str, num_envs: int | None) -> list[int]:
+    items = _require_list(value, where)
+    _require_run_length(items, num_envs, where)
+    return [_nonnegative_int(item, f"{where}[{index}]") for index, item in enumerate(items)]
+
+
+def _decode_event_counts_list(
+    value: JsonValue, where: str, num_envs: int | None
+) -> list[dict[str, int]]:
+    items = _require_list(value, where)
+    _require_run_length(items, num_envs, where)
+    counts: list[dict[str, int]] = []
+    for index, item in enumerate(items):
+        item_where = f"{where}[{index}]"
+        if not isinstance(item, dict):
+            raise TypeError(f"{item_where}: expected an object, got {type(item).__name__}")
+        per_env: dict[str, int] = {}
+        for code, count in item.items():
+            validate_code(code)
+            per_env[code] = _nonnegative_int(count, f"{item_where}[{code!r}]")
+        counts.append(per_env)
+    return counts
+
+
+def _decode_command(value: JsonValue, where: str) -> tuple[float, ...] | None:
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise TypeError(f"{where}: expected a command list or None, got {value!r}")
+    command: list[float] = []
+    for index, item in enumerate(value):
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            raise TypeError(f"{where}[{index}]: expected a number, got {item!r}")
+        number = float(item)
+        if not math.isfinite(number):
+            raise ValueError(f"{where}[{index}]: expected a finite number, got {number!r}")
+        command.append(number)
+    return tuple(command)
+
+
+def _decode_command_list(
+    value: JsonValue, where: str, num_envs: int | None
+) -> list[tuple[float, ...] | None]:
+    items = _require_list(value, where)
+    _require_run_length(items, num_envs, where)
+    return [_decode_command(item, f"{where}[{index}]") for index, item in enumerate(items)]
+
+
+def _decode_reset_list(
+    value: JsonValue, where: str, num_envs: int | None
+) -> list[dict[str, JsonValue]]:
+    items = _require_list(value, where)
+    _require_run_length(items, num_envs, where)
+    facts: list[dict[str, JsonValue]] = []
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise TypeError(f"{where}[{index}]: expected an object, got {type(item).__name__}")
+        facts.append(dict(item))
+    return facts
+
+
+def _decode_env_key(key: str, where: str) -> int:
+    if not key.isdigit() or str(int(key)) != key:
+        raise ValueError(f"{where}: expected a non-negative integer key, got {key!r}")
+    return int(key)
+
+
+def _decode_termination_map(
+    value: JsonValue, where: str, num_envs: int | None
+) -> dict[int, Termination]:
+    if not isinstance(value, dict):
+        raise TypeError(f"{where}: expected an object, got {type(value).__name__}")
+    terminals: dict[int, Termination] = {}
+    for key, item in value.items():
+        env_id = _decode_env_key(key, where)
+        if num_envs is None or env_id >= num_envs:
+            raise ValueError(f"{where}: env id {env_id} is outside [0, num_envs={num_envs})")
+        terminals[env_id] = termination_from_json(item, f"{where}[{key!r}]")
+    return terminals
+
+
+def _decode_conflict_map(value: JsonValue, where: str, num_envs: int | None) -> dict[int, int]:
+    if not isinstance(value, dict):
+        raise TypeError(f"{where}: expected an object, got {type(value).__name__}")
+    conflicts: dict[int, int] = {}
+    for key, item in value.items():
+        env_id = _decode_env_key(key, where)
+        if num_envs is None or env_id >= num_envs:
+            raise ValueError(f"{where}: env id {env_id} is outside [0, num_envs={num_envs})")
+        conflicts[env_id] = _nonnegative_int(item, f"{where}[{key!r}]")
+    return conflicts
+
+
+def _decode_journal(value: JsonValue, where: str, num_envs: int | None) -> list[Event]:
+    items = _require_list(value, where)
+    if num_envs is None and items:
+        raise ValueError(f"{where}: an unbound checkpoint must not carry journal entries")
+    journal: list[Event] = []
+    for index, item in enumerate(items):
+        event = Event.from_json(item)
+        if num_envs is not None:
+            for env_id in event.env_ids:
+                if env_id >= num_envs:
+                    raise ValueError(
+                        f"{where}[{index}]: env id {env_id} is outside [0, num_envs={num_envs})"
+                    )
+        journal.append(event)
+    return journal
+
+
+def _decode_records(value: JsonValue, where: str, num_envs: int | None) -> list[EpisodeRecord]:
+    items = _require_list(value, where)
+    if num_envs is None and items:
+        raise ValueError(f"{where}: an unbound checkpoint must not carry episode records")
+    records: list[EpisodeRecord] = []
+    for index, item in enumerate(items):
+        record = EpisodeRecord.from_json(item)
+        if num_envs is not None and record.env_id >= num_envs:
+            raise ValueError(
+                f"{where}[{index}]: env id {record.env_id} is outside " f"[0, num_envs={num_envs})"
+            )
+        records.append(record)
+    return records
+
+
+def _decode_verdict_counts(value: JsonValue, where: str) -> dict[str, int]:
+    if not isinstance(value, dict):
+        raise TypeError(f"{where}: expected an object, got {type(value).__name__}")
+    counts: dict[str, int] = {}
+    for verdict, count in value.items():
+        if verdict not in VERDICTS:
+            raise ValueError(f"{where}: unknown verdict {verdict!r}; allowed {sorted(VERDICTS)}")
+        counts[verdict] = _nonnegative_int(count, f"{where}[{verdict!r}]")
+    return counts

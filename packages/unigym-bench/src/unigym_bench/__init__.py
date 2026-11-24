@@ -6,8 +6,9 @@ the monitor protocol and the built-in monitors in
 :mod:`unigym_bench.monitors`.  P3 adds the per-run streaming engine in
 :mod:`unigym_bench.engine`.  P4 adds the core sink shell in
 :mod:`unigym_bench.sink` and the full immutable episode record in
-:mod:`unigym_bench.events`.  There is no report, scenario or sampler
-implementation yet.
+:mod:`unigym_bench.events`.  P5 adds the ``unigym_bench`` rewind provider on
+the streaming engine.  There is no report, scenario or sampler implementation
+yet.
 """
 
 from __future__ import annotations
