@@ -1,8 +1,8 @@
 """Core-contract fence for the external benchmark pack.
 
-The pack builds on the public sink, run, evaluation, identity and signal
-surfaces of ``unigym``.  It must never reach for the benchmark scaffolding it
-replaces (``unigym.benchmarks``, ``unigym.runner.evaluation``,
+The pack builds on the public sink, run, evaluation, identity, termination and
+signal surfaces of ``unigym``.  It must never reach for the benchmark
+scaffolding it replaces (``unigym.benchmarks``, ``unigym.runner.evaluation``,
 ``unigym.runner.episodes``), so this module checks only the allowed surfaces
 and reports every missing one in a single teaching error.
 
@@ -26,6 +26,16 @@ _REQUIRED_SURFACES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("unigym.run", ("SinkContext", "SinkSpec", "SinkFactory")),
     ("unigym.evaluation", ("EnvView",)),
     ("unigym.core.identity", ("RunIdentity",)),
+    (
+        "unigym.core.episode_termination",
+        (
+            "EpisodeOutcome",
+            "Termination",
+            "TerminationExtension",
+            "TerminationSource",
+            "validate_code",
+        ),
+    ),
     ("unigym.signals", ("SignalPublisher",)),
 )
 

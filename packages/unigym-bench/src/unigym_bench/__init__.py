@@ -1,8 +1,10 @@
 """External benchmark pack for unigym.
 
 P1 provides version metadata, the core-contract import fence, strict JSON
-helpers and the closed task-spec loader in :mod:`unigym_bench.specs`.  No
-benchmark engine, monitors, sink, report or sampler code exists yet.
+helpers and the closed task-spec loader in :mod:`unigym_bench.specs`.  P2 adds
+the monitor protocol and the built-in monitors in
+:mod:`unigym_bench.monitors`.  There is no benchmark engine, sink, report,
+scenario or sampler implementation yet.
 """
 
 from __future__ import annotations

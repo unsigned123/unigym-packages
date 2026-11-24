@@ -11,6 +11,6 @@ __all__ = ["CORE_SURFACE_VERSION", "REQUIRED_CORE_VERSION", "__version__"]
 
 __version__ = "0.1.0"
 
-CORE_SURFACE_VERSION: int = 1
+CORE_SURFACE_VERSION: int = 2
 
 REQUIRED_CORE_VERSION = "0.106.0"

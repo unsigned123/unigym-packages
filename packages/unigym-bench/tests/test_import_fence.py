@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from unigym.core import episode_termination
 
 import unigym_bench
 from unigym_bench import assert_core_contract, compat
@@ -18,6 +19,14 @@ _BLOCKED_PREFIXES = (
     "unigym.benchmarks",
     "unigym.runner.evaluation",
     "unigym.runner.episodes",
+)
+
+_TERMINATION_SURFACES = (
+    "EpisodeOutcome",
+    "Termination",
+    "TerminationExtension",
+    "TerminationSource",
+    "validate_code",
 )
 
 _FENCE_SCRIPT = f"""
@@ -81,3 +90,13 @@ def test_core_contract_rejects_an_older_core(monkeypatch: pytest.MonkeyPatch) ->
     message = str(excinfo.value)
     assert "999.0.0" in message
     assert "is older than required" in message
+
+
+@pytest.mark.parametrize("attribute", _TERMINATION_SURFACES)
+def test_core_contract_requires_each_termination_surface(
+    monkeypatch: pytest.MonkeyPatch, attribute: str
+) -> None:
+    monkeypatch.delattr(episode_termination, attribute)
+    with pytest.raises(RuntimeError) as excinfo:
+        compat.assert_core_contract()
+    assert f"unigym.core.episode_termination.{attribute}" in str(excinfo.value)
