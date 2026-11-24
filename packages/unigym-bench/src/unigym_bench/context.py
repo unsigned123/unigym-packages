@@ -45,9 +45,7 @@ class BenchmarkStepContext(EnvStepContext):
         super(BenchmarkStepContext, self).__post_init__()
 
         raw_events = self.events
-        if isinstance(raw_events, (str, bytes, bytearray)) or not isinstance(
-            raw_events, Sequence
-        ):
+        if isinstance(raw_events, (str, bytes, bytearray)) or not isinstance(raw_events, Sequence):
             raise TypeError(
                 "BenchmarkStepContext.events must be a sequence of Event, "
                 f"got {type(raw_events).__name__}"
@@ -72,8 +70,7 @@ class BenchmarkStepContext(EnvStepContext):
         for env_id, termination in raw_terminals.items():
             if isinstance(env_id, bool) or not isinstance(env_id, int):
                 raise TypeError(
-                    "BenchmarkStepContext.terminals keys must be int env ids, "
-                    f"got {env_id!r}"
+                    "BenchmarkStepContext.terminals keys must be int env ids, " f"got {env_id!r}"
                 )
             if env_id < 0 or env_id >= num_envs:
                 raise ValueError(

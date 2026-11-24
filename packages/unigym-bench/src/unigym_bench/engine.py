@@ -985,8 +985,7 @@ class StreamingEngine:
             return step
         if not isinstance(step, EnvStepContext):
             raise TypeError(
-                "engine bundle.step: expected an EnvStepContext, "
-                f"got {type(step).__name__}"
+                "engine bundle.step: expected an EnvStepContext, " f"got {type(step).__name__}"
             )
         return BenchmarkStepContext.from_env_step(step)
 
