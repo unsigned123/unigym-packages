@@ -14,14 +14,18 @@ tensor or caller-owned mapping.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Literal, TypeAlias
+from typing import TYPE_CHECKING, Literal, TypeAlias
 
-from unigym.core.episode_termination import Termination, validate_code
+from unigym.core.episode_termination import EpisodeTermination, Termination, validate_code
 
 from .json import JsonValue, ensure_json_value
+
+if TYPE_CHECKING:
+    from .specs import FrozenJson
 
 __all__ = [
     "SEVERITIES",
@@ -163,21 +167,33 @@ class EpisodeRecord:
     """A finalized episode's small, immutable facts.
 
     The streaming engine builds one record per due environment.  A record holds
-    only scalars, the first pack terminal (if any), per-episode event counts and
-    a verdict; it never retains a view, frame, tensor or backend handle.  The
-    report layer owns serialization into the external report schema.
+    only scalars, the command observed on the episode's first tick, the first
+    pack terminal (if any), the core/runner termination facts, the boundary-safe
+    reset facts captured at episode start, per-episode event counts and a
+    verdict; it never retains a view, frame, tensor or backend handle.
+
+    ``first_terminal`` prefers the runner's canonical stamped terminal when the
+    same custom request also appears in the episode-end bundle.  Otherwise it
+    is the monitor's raw request; P5/P6 own any later re-stamp.  The report
+    layer owns serialization into the external report schema.
+
+    ``reset_facts`` is a deeply frozen JSON tree (read-only mappings and
+    tuples); :meth:`to_json` rebuilds a fully independent mutable copy.
     """
 
     env_id: int
     episode_seq: int
     ticks: int
     verdict: EpisodeVerdict
+    command_at_start: tuple[float, ...] | None = None
     first_terminal: Termination | None = None
+    core_termination: EpisodeTermination | None = None
+    reset_facts: Mapping[str, FrozenJson] = field(default_factory=dict)
     event_counts: Mapping[str, int] = field(default_factory=dict)
     rewound: bool = False
 
     def __post_init__(self) -> None:
-        """Validate the record and freeze its event counts."""
+        """Validate the record and freeze its mappings."""
         if isinstance(self.env_id, bool) or not isinstance(self.env_id, int):
             raise TypeError(f"episode record.env_id: expected an int, got {self.env_id!r}")
         if self.env_id < 0:
@@ -189,13 +205,22 @@ class EpisodeRecord:
                 f"episode record.verdict: expected one of {sorted(VERDICTS)}, "
                 f"got {self.verdict!r}"
             )
+        object.__setattr__(self, "command_at_start", _validate_command(self.command_at_start))
         if self.first_terminal is not None and not isinstance(self.first_terminal, Termination):
             raise TypeError(
                 "episode record.first_terminal: expected a Termination or None, "
                 f"got {type(self.first_terminal).__name__}"
             )
+        if self.core_termination is not None and not isinstance(
+            self.core_termination, EpisodeTermination
+        ):
+            raise TypeError(
+                "episode record.core_termination: expected an EpisodeTermination or None, "
+                f"got {type(self.core_termination).__name__}"
+            )
         if self.verdict == "terminal" and self.first_terminal is None:
             raise ValueError("episode record: verdict 'terminal' requires a first_terminal")
+        object.__setattr__(self, "reset_facts", _freeze_json_mapping(self.reset_facts))
         if not isinstance(self.event_counts, Mapping):
             raise TypeError(
                 "episode record.event_counts: expected a mapping, "
@@ -220,9 +245,16 @@ class EpisodeRecord:
             "episode_seq": self.episode_seq,
             "ticks": self.ticks,
             "verdict": self.verdict,
+            "command_at_start": (
+                None if self.command_at_start is None else list(self.command_at_start)
+            ),
             "first_terminal": (
                 None if self.first_terminal is None else self.first_terminal.to_json()
             ),
+            "core_termination": (
+                None if self.core_termination is None else self.core_termination.to_json()
+            ),
+            "reset_facts": _thaw_json_mapping(self.reset_facts),
             "event_counts": dict(self.event_counts),
             "rewound": self.rewound,
         }
@@ -277,6 +309,68 @@ class EpisodeSummary:
             "dropped_events": self.dropped_events,
             "conflicts": self.conflicts,
         }
+
+
+def _validate_command(value: object) -> tuple[float, ...] | None:
+    """Normalize an episode's start command into a finite float tuple."""
+    if value is None:
+        return None
+    if not isinstance(value, (tuple, list)):
+        raise TypeError(
+            "episode record.command_at_start: expected a sequence of numbers or None, "
+            f"got {type(value).__name__}"
+        )
+    command: list[float] = []
+    for index, raw in enumerate(value):
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            raise TypeError(
+                f"episode record.command_at_start[{index}]: expected a number, got {raw!r}"
+            )
+        item = float(raw)
+        if not math.isfinite(item):
+            raise ValueError(
+                f"episode record.command_at_start[{index}]: expected a finite number, got {item!r}"
+            )
+        command.append(item)
+    return tuple(command)
+
+
+def _freeze_json_mapping(value: object) -> Mapping[str, FrozenJson]:
+    """Validate and deep-freeze a JSON object into read-only containers."""
+    if not isinstance(value, Mapping):
+        raise TypeError(
+            "episode record.reset_facts: expected a mapping, " f"got {type(value).__name__}"
+        )
+    try:
+        normalized = ensure_json_value(dict(value), where="episode record.reset_facts")
+    except (TypeError, ValueError) as exc:
+        raise type(exc)(f"episode record.reset_facts: {exc}") from exc
+    if not isinstance(normalized, dict):
+        raise TypeError("episode record.reset_facts: expected an object")
+    return MappingProxyType({key: _freeze_json(item) for key, item in normalized.items()})
+
+
+def _freeze_json(value: JsonValue) -> FrozenJson:
+    """Recursively turn a JSON tree into read-only mappings and tuples."""
+    if isinstance(value, dict):
+        return MappingProxyType({key: _freeze_json(item) for key, item in value.items()})
+    if isinstance(value, list):
+        return tuple(_freeze_json(item) for item in value)
+    return value
+
+
+def _thaw_json_mapping(value: Mapping[str, FrozenJson]) -> dict[str, JsonValue]:
+    """Return a fresh, fully independent JSON object from a frozen tree."""
+    return {key: _thaw_json(item) for key, item in value.items()}
+
+
+def _thaw_json(value: FrozenJson) -> JsonValue:
+    """Recursively rebuild mutable JSON containers from a frozen tree."""
+    if isinstance(value, Mapping):
+        return {key: _thaw_json(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw_json(item) for item in value]
+    return value
 
 
 def _require_nonnegative_int(value: object, where: str) -> None:

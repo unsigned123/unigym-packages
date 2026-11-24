@@ -8,7 +8,8 @@ the task monitors in declaration order and owns the consequences:
 - a run-scoped event journal with an explicit retention cap and dropped count;
 - pending ``env_id -> Termination`` drains for the core runner;
 - per-env episode sequence, episode-tick counts and finalized
-  :class:`~unigym_bench.events.EpisodeRecord` values.
+  :class:`~unigym_bench.events.EpisodeRecord` values, including the
+  JSON-safe start command and reset facts captured on the episode's first tick.
 
 The engine never keeps an ``EnvView``, a frame, a tensor or a backend handle.
 Signals are validated and published one tick at a time; they are not stored.
@@ -17,9 +18,13 @@ Lifecycle (delegated by the sink in the next card)::
 
     sink.on_step -> engine.on_step(bundle)
     runner drain -> engine.drain_terminations()
-    runner due   -> engine.on_episode_end(due, bundle)
-    runner reset -> engine.on_reset(due)        # reopen the new episodes
+    runner due   -> engine.on_episode_end(due, bundle) -> due ids (sink stores)
+    runner reset -> engine.on_reset(stored due)          # reopen new episodes
     runner end   -> engine.on_run_end()
+
+The core runner does not pass reset ids to ``on_step_end``, so the sink keeps
+the ids returned by ``on_episode_end`` until the post-reset callback and calls
+``on_reset`` there.
 
 A terminal request for an environment that is not open is a pack contract
 error.  A terminal request for an environment that is open but already latched
@@ -48,6 +53,7 @@ from unigym.core.episode_termination import (
 
 from .events import EpisodeRecord, EpisodeSummary, EpisodeVerdict, Event
 from .frames import TickFrame
+from .json import JsonValue
 from .monitors import Monitor
 from .specs import RetentionSpec
 
@@ -123,6 +129,8 @@ class StreamingEngine:
         self._episode_seq: list[int] = []
         self._episode_ticks: list[int] = []
         self._episode_events: list[dict[str, int]] = []
+        self._episode_command: list[tuple[float, ...] | None] = []
+        self._episode_reset: list[dict[str, JsonValue]] = []
 
         self._latched: dict[int, Termination] = {}
         self._pending: dict[int, Termination] = {}
@@ -150,6 +158,11 @@ class StreamingEngine:
     def device(self) -> torch.device | None:
         """Bound tensor device, or ``None`` before the first tick."""
         return self._device
+
+    @property
+    def publisher(self) -> SignalPublisher | None:
+        """The write-only signal publisher, or ``None`` when not configured."""
+        return self._publisher
 
     @property
     def open_envs(self) -> tuple[int, ...]:
@@ -221,6 +234,9 @@ class StreamingEngine:
         for env_id in range(num_envs):
             if self._open[env_id]:
                 self._episode_ticks[env_id] += 1
+        for env_id in range(num_envs):
+            if self._open[env_id] and self._episode_ticks[env_id] == 1:
+                self._capture_episode_start(env_id, frame)
 
         for monitor in self._monitors:
             monitor.on_tick(frame)
@@ -274,13 +290,20 @@ class StreamingEngine:
         self._pending.clear()
         return pending
 
-    def on_episode_end(self, due: object, bundle: Mapping[str, object]) -> None:
+    def on_episode_end(self, due: object, bundle: Mapping[str, object]) -> tuple[int, ...]:
         """Finalize the due environments and clear their latches.
 
         Args:
             due: Sequence of env ids or a 1-D integer tensor from the runner.
             bundle: The runner's episode-end bundle.  Its ``terminations``
-                mapping is read only to label a core/deadline verdict.
+                mapping supplies the canonical terminal stamps and core facts;
+                ``reset_facts`` are not read here because the record keeps the
+                JSON-safe reset state captured on the episode's first tick.
+
+        Returns:
+            The sorted, unique due env ids.  The sink stores this tuple until
+            ``on_step_end`` and then reopens exactly these envs after the
+            runner's reset chain.
 
         Raises:
             EngineStateError: The engine is unbound/ended, a due env is closed,
@@ -294,7 +317,7 @@ class StreamingEngine:
             )
         due_ids = _as_env_ids(due, num_envs, "engine episode_end.due")
         if not due_ids:
-            return
+            return ()
         for env_id in due_ids:
             if not self._open[env_id]:
                 raise EngineStateError(
@@ -310,7 +333,10 @@ class StreamingEngine:
                 verdict=(
                     "terminal" if env_id in self._latched else self._due_verdict(bundle, env_id)
                 ),
-                first_terminal=self._latched.get(env_id),
+                command_at_start=self._episode_command[env_id],
+                first_terminal=self._first_terminal(bundle, env_id),
+                core_termination=self._core_termination(bundle, env_id),
+                reset_facts=dict(self._episode_reset[env_id]),
                 event_counts=dict(self._episode_events[env_id]),
             )
             for env_id in due_ids
@@ -327,7 +353,10 @@ class StreamingEngine:
             self._latched.pop(env_id, None)
             self._pending.pop(env_id, None)
             self._episode_events[env_id].clear()
+            self._episode_command[env_id] = None
+            self._episode_reset[env_id].clear()
             self._open[env_id] = False
+        return due_ids
 
     def on_reset(self, env_ids: object) -> None:
         """Reopen the environments the runner has just reset.
@@ -359,34 +388,44 @@ class StreamingEngine:
             self._episode_seq[env_id] += 1
             self._episode_ticks[env_id] = 0
             self._episode_events[env_id].clear()
+            self._episode_command[env_id] = None
+            self._episode_reset[env_id].clear()
 
     def on_run_end(self) -> EpisodeSummary:
         """Finalize still-open episodes as ``incomplete`` and return the summary.
 
         This is deliberately not a score: an env that never received a due
         boundary is recorded as incomplete with its observed tick count and any
-        latched first terminal.  The method is idempotent for teardown paths.
+        latched first terminal.  An env the sink reopened after a reset but
+        that never produced a tick is not an episode yet, so it is closed
+        silently instead of being recorded as a phantom zero-tick episode.  The
+        method is idempotent for teardown paths.
         """
         if self._run_ended:
             return self.summary
         if self._bound:
             open_ids = self.open_envs
+            recorded_ids = tuple(env_id for env_id in open_ids if self._episode_ticks[env_id] > 0)
             records = [
                 EpisodeRecord(
                     env_id=env_id,
                     episode_seq=self._episode_seq[env_id],
                     ticks=self._episode_ticks[env_id],
                     verdict="incomplete",
+                    command_at_start=self._episode_command[env_id],
                     first_terminal=self._latched.get(env_id),
+                    reset_facts=dict(self._episode_reset[env_id]),
                     event_counts=dict(self._episode_events[env_id]),
                 )
-                for env_id in open_ids
+                for env_id in recorded_ids
             ]
             for record in records:
                 self._finalize_record(record)
             for env_id in open_ids:
                 self._latched.pop(env_id, None)
                 self._episode_events[env_id].clear()
+                self._episode_command[env_id] = None
+                self._episode_reset[env_id].clear()
                 self._open[env_id] = False
             self._pending.clear()
         self._run_ended = True
@@ -437,12 +476,66 @@ class StreamingEngine:
             self._episode_seq = [0] * frame.num_envs
             self._episode_ticks = [0] * frame.num_envs
             self._episode_events = [{} for _ in range(frame.num_envs)]
+            self._episode_command = [None] * frame.num_envs
+            self._episode_reset = [{} for _ in range(frame.num_envs)]
             self._bound = True
             return
         if frame.num_envs != self._num_envs:
             raise ValueError(f"engine: num_envs changed from {self._num_envs} to {frame.num_envs}")
         if frame.device != self._device:
             raise ValueError(f"engine: device changed from {self._device} to {frame.device}")
+
+    def _capture_episode_start(self, env_id: int, frame: TickFrame) -> None:
+        """Record the JSON-safe command and reset facts of a new episode."""
+        self._episode_reset[env_id] = dict(frame.reset_state.get(env_id, {}))
+        cmd = frame.cmd
+        if cmd is None:
+            self._episode_command[env_id] = None
+            return
+        row = cmd[env_id].detach().to(device="cpu").reshape(-1).tolist()
+        self._episode_command[env_id] = tuple(float(value) for value in row)
+
+    def _termination_entry(
+        self, bundle: Mapping[str, object], env_id: int
+    ) -> EpisodeTermination | None:
+        """Return the runner's termination fact for one env, if present."""
+        terminations = bundle.get("terminations")
+        if not isinstance(terminations, Mapping):
+            return None
+        entry = terminations.get(env_id)
+        if isinstance(entry, EpisodeTermination):
+            return entry
+        if isinstance(entry, Termination):
+            return EpisodeTermination(primary=entry)
+        return None
+
+    def _first_terminal(self, bundle: Mapping[str, object], env_id: int) -> Termination | None:
+        """Return the latched terminal, preferring its canonical stamped copy."""
+        latched = self._latched.get(env_id)
+        if latched is None:
+            return None
+        entry = self._termination_entry(bundle, env_id)
+        if entry is not None:
+            for term in entry.all:
+                if (
+                    term.source is latched.source
+                    and term.code == latched.code
+                    and term.outcome is latched.outcome
+                ):
+                    return term
+        return latched
+
+    def _core_termination(
+        self, bundle: Mapping[str, object], env_id: int
+    ) -> EpisodeTermination | None:
+        """Return the core-owned part of the runner's termination fact."""
+        entry = self._termination_entry(bundle, env_id)
+        if entry is None:
+            return None
+        core_terms = [term for term in entry.all if term.source is not TerminationSource.CUSTOM]
+        if not core_terms:
+            return None
+        return EpisodeTermination.from_terminations(core_terms)
 
     def _collect_signals(self, monitor: Monitor, frame: TickFrame) -> dict[str, Tensor]:
         """Validate one monitor's fresh per-env level tensors."""
@@ -569,16 +662,8 @@ class StreamingEngine:
 
     def _due_verdict(self, bundle: Mapping[str, object], env_id: int) -> EpisodeVerdict:
         """Label a due env without a pack terminal: deadline or core."""
-        terminations = bundle.get("terminations")
-        if not isinstance(terminations, Mapping):
-            return "core"
-        entry = terminations.get(env_id)
-        primary: Termination | None = None
-        if isinstance(entry, EpisodeTermination):
-            primary = entry.primary
-        elif isinstance(entry, Termination):
-            primary = entry
-        if primary is not None and primary.outcome is EpisodeOutcome.DEADLINE:
+        entry = self._termination_entry(bundle, env_id)
+        if entry is not None and entry.primary.outcome is EpisodeOutcome.DEADLINE:
             return "deadline"
         return "core"
 

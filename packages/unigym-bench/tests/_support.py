@@ -7,8 +7,9 @@ small callable that returns a real tensor for the frame's device.
 
 from __future__ import annotations
 
+from argparse import Namespace
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import torch
 
@@ -18,10 +19,13 @@ from unigym.core.episode_termination import (
     TerminationSource,
 )
 from unigym.evaluation import EnvView
+from unigym.run import SinkContext
+from unigym.run.spec import build_spec
+from unigym.signals import SignalPublisher
 from unigym_bench.events import Event
 from unigym_bench.frames import TickFrame
 from unigym_bench.json import JsonValue
-from unigym_bench.monitors import BaseMonitor
+from unigym_bench.monitors import BaseMonitor, Monitor, ThresholdMonitor
 
 
 def make_view(num_envs: int = 2, *, device: str | torch.device = "cpu") -> EnvView:
@@ -206,3 +210,60 @@ def table_probe(
         return torch.tensor(table[frame.t], dtype=dtype, device=frame.device)
 
     return probe
+
+
+_SINK_CONTEXT_CFG: dict[str, JsonValue] = {
+    "run_name": "sink-context",
+    "seed": 0,
+    "env": {"backend": "mujoco", "num_envs": 1},
+    "world_base": {"mjcf": "model.xml"},
+    "collect": {"steps": 1},
+    "articulations": [{"name": "arm", "joints": [{"name": "shoulder"}]}],
+    "action_spec": [
+        {
+            "name": "arm",
+            "articulation": "arm",
+            "joints": ["shoulder"],
+            "target": "position",
+            "role": "body",
+        }
+    ],
+    "policies": [{"adapter": "manual", "groups": [["arm", "arm"]]}],
+    "observations": {"robot": ["arm"]},
+}
+
+
+def make_sink_context(
+    *,
+    options: Mapping[str, JsonValue] | None = None,
+    signals: SignalPublisher | None = None,
+    auto_reset: bool | None = None,
+) -> SinkContext:
+    """Build a real SinkContext over a real, backend-free RunSpec."""
+    spec = build_spec(_SINK_CONTEXT_CFG, Namespace(config="run.yaml"))
+    if auto_reset is not None:
+        spec = replace(spec, runner={**spec.runner, "auto_reset": auto_reset})
+    return SinkContext(
+        spec=spec,
+        mode=spec.mode,
+        out_dir="data_out/sink-context",
+        num_envs=1,
+        policy_dt=0.02,
+        seed=0,
+        action_groups=(),
+        run_identity=None,
+        options={} if options is None else options,
+        signals=signals,
+    )
+
+
+def make_threshold_monitors() -> tuple[Monitor, ...]:
+    """Importable zero-argument monitor factory used by make_sink tests."""
+    return (
+        ThresholdMonitor(
+            "contact",
+            constant_probe([0.0]),
+            threshold=0.5,
+            terminal_outcome="success",
+        ),
+    )
