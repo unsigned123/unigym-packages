@@ -360,8 +360,11 @@ class EpisodeSummary:
     """Run-scoped episode totals owned by the streaming engine.
 
     The summary is deliberately aggregate-only: it carries no episode payloads
-    and no tensors.  A report builder may combine it with retained
-    :class:`EpisodeRecord` values without asking the engine to score anything.
+    and no tensors.  Every counter is maintained independently of episode
+    retention, so a report can still count verdicts, rewinds, terminations and
+    per-env episodes when ``retain_episodes`` is false.  A report builder may
+    combine it with retained :class:`EpisodeRecord` values for per-record
+    detail without asking the engine to score anything.
     """
 
     episodes: int = 0
@@ -370,14 +373,25 @@ class EpisodeSummary:
     event_count: int = 0
     dropped_events: int = 0
     conflicts: int = 0
+    rewound: int = 0
+    termination_outcome_counts: Mapping[str, int] = field(default_factory=dict)
+    termination_code_counts: Mapping[str, int] = field(default_factory=dict)
+    termination_source_counts: Mapping[str, int] = field(default_factory=dict)
+    episodes_by_env: Mapping[int, int] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        """Validate the aggregate counters and freeze the verdict map."""
+        """Validate the aggregate counters and freeze the mappings."""
         _require_nonnegative_int(self.episodes, "episode summary.episodes")
         _require_nonnegative_int(self.total_ticks, "episode summary.total_ticks")
         _require_nonnegative_int(self.event_count, "episode summary.event_count")
         _require_nonnegative_int(self.dropped_events, "episode summary.dropped_events")
         _require_nonnegative_int(self.conflicts, "episode summary.conflicts")
+        _require_nonnegative_int(self.rewound, "episode summary.rewound")
+        if self.rewound > self.episodes:
+            raise ValueError(
+                "episode summary.rewound: expected a value <= episodes, "
+                f"got {self.rewound} > {self.episodes}"
+            )
         if not isinstance(self.verdict_counts, Mapping):
             raise TypeError(
                 "episode summary.verdict_counts: expected a mapping, "
@@ -393,6 +407,28 @@ class EpisodeSummary:
             _require_nonnegative_int(count, f"episode summary.verdict_counts[{verdict!r}]")
             counts[verdict] = count
         object.__setattr__(self, "verdict_counts", MappingProxyType(counts))
+        object.__setattr__(
+            self,
+            "termination_outcome_counts",
+            _freeze_count_mapping(
+                self.termination_outcome_counts, "episode summary.termination_outcome_counts"
+            ),
+        )
+        object.__setattr__(
+            self,
+            "termination_code_counts",
+            _freeze_count_mapping(
+                self.termination_code_counts, "episode summary.termination_code_counts"
+            ),
+        )
+        object.__setattr__(
+            self,
+            "termination_source_counts",
+            _freeze_count_mapping(
+                self.termination_source_counts, "episode summary.termination_source_counts"
+            ),
+        )
+        object.__setattr__(self, "episodes_by_env", _freeze_env_counts(self.episodes_by_env))
 
     def to_json(self) -> dict[str, JsonValue]:
         """Return a fresh JSON-safe summary document."""
@@ -403,6 +439,13 @@ class EpisodeSummary:
             "event_count": self.event_count,
             "dropped_events": self.dropped_events,
             "conflicts": self.conflicts,
+            "rewound": self.rewound,
+            "termination_outcome_counts": dict(self.termination_outcome_counts),
+            "termination_code_counts": dict(self.termination_code_counts),
+            "termination_source_counts": dict(self.termination_source_counts),
+            "episodes_by_env": {
+                str(env_id): count for env_id, count in sorted(self.episodes_by_env.items())
+            },
         }
 
 
@@ -614,6 +657,40 @@ def _require_nonnegative_int(value: object, where: str) -> None:
         raise TypeError(f"{where}: expected an int, got {value!r}")
     if value < 0:
         raise ValueError(f"{where}: expected an int >= 0, got {value}")
+
+
+def _freeze_count_mapping(value: object, where: str) -> Mapping[str, int]:
+    """Validate and freeze a string-keyed non-negative count mapping."""
+    if not isinstance(value, Mapping):
+        raise TypeError(f"{where}: expected a mapping, got {type(value).__name__}")
+    counts: dict[str, int] = {}
+    for key, count in value.items():
+        if not isinstance(key, str) or not key:
+            raise TypeError(f"{where}: keys must be non-empty strings, got {key!r}")
+        _require_nonnegative_int(count, f"{where}[{key!r}]")
+        counts[key] = count
+    return MappingProxyType(dict(sorted(counts.items())))
+
+
+def _freeze_env_counts(value: object) -> Mapping[int, int]:
+    """Validate and freeze an ``env_id -> count`` mapping."""
+    if not isinstance(value, Mapping):
+        raise TypeError(
+            "episode summary.episodes_by_env: expected a mapping, " f"got {type(value).__name__}"
+        )
+    counts: dict[int, int] = {}
+    for env_id, count in value.items():
+        if isinstance(env_id, bool) or not isinstance(env_id, int):
+            raise TypeError(
+                f"episode summary.episodes_by_env: env ids must be ints, got {env_id!r}"
+            )
+        if env_id < 0:
+            raise ValueError(
+                f"episode summary.episodes_by_env: expected env ids >= 0, got {env_id}"
+            )
+        _require_nonnegative_int(count, f"episode summary.episodes_by_env[{env_id}]")
+        counts[env_id] = count
+    return MappingProxyType(dict(sorted(counts.items())))
 
 
 def _require_severity(value: JsonValue, where: str) -> Severity:

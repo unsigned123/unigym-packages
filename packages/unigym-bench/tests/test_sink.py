@@ -18,6 +18,7 @@ from unigym.signals import SignalBus
 from unigym_bench.engine import StreamingEngine
 from unigym_bench.events import Event, EpisodeRecord
 from unigym_bench.json import ensure_json_value
+from unigym_bench.report import REPORT_SCHEMA
 from unigym_bench.sink import BenchmarkSink, make_sink
 from unigym_bench.specs import RetentionSpec
 from _support import (
@@ -105,16 +106,52 @@ def test_make_sink_rejects_a_non_callable_factory_target() -> None:
 def test_make_sink_without_a_factory_builds_an_empty_honest_run() -> None:
     sink = make_sink(make_sink_context())
 
-    assert sink.on_run_end() == {
-        "BenchmarkSink": {
-            "episodes": 0,
-            "total_ticks": 0,
-            "verdict_counts": {},
-            "event_count": 0,
-            "dropped_events": 0,
-            "conflicts": 0,
-        }
+    summary = sink.on_run_end()
+
+    assert set(summary) == {"BenchmarkSink"}
+    report = summary["BenchmarkSink"]
+    assert isinstance(report, dict)
+    assert report["schema"] == REPORT_SCHEMA
+    assert list(report) == [
+        "schema",
+        "run",
+        "tasks",
+        "episodes",
+        "terminations",
+        "execution",
+        "monitors",
+        "extensions",
+    ]
+    assert report["run"]["run_name"] == "sink-context"
+    assert report["episodes"] == {
+        "count": 0,
+        "complete": 0,
+        "incomplete": 0,
+        "rewound": 0,
+        "retained": 0,
+        "retain_episodes": False,
+        "total_ticks": 0,
+        "verdicts": {},
+        "by_env_counts": {},
     }
+    assert report["terminations"] == {
+        "total": 0,
+        "outcome": {},
+        "code": {},
+        "source": {},
+    }
+    assert report["execution"] == {
+        "event_total": 0,
+        "dropped_events": 0,
+        "terminal_conflicts": 0,
+        "retention": {
+            "retain_episodes": False,
+            "max_events": 200_000,
+            "event_log": True,
+        },
+    }
+    assert report["monitors"] == {}
+    assert report["extensions"] == {}
 
 
 def test_direct_sink_steered_construction_requires_a_publisher() -> None:
@@ -187,8 +224,21 @@ def test_on_run_end_immediately_after_reset_skips_the_zero_tick_reopened_env() -
 
     summary = sink.on_run_end()
 
-    assert summary["BenchmarkSink"]["episodes"] == 1
-    assert summary["BenchmarkSink"]["verdict_counts"] == {"terminal": 1}
+    assert summary["BenchmarkSink"]["episodes"]["count"] == 1
+    assert summary["BenchmarkSink"]["episodes"]["verdicts"] == {"terminal": 1}
+    assert summary["BenchmarkSink"]["episodes"]["retained"] == 1
+    assert summary["BenchmarkSink"]["episodes"]["retain_episodes"] is True
+    assert summary["BenchmarkSink"]["episodes"]["by_env_counts"] == {"0": 1}
+    assert summary["BenchmarkSink"]["execution"] == {
+        "event_total": 0,
+        "dropped_events": 0,
+        "terminal_conflicts": 0,
+        "retention": {
+            "retain_episodes": True,
+            "max_events": 200_000,
+            "event_log": True,
+        },
+    }
     assert len(engine.records) == 1
     assert engine.records[0].verdict == "terminal"
     assert engine.open_envs == ()
@@ -318,8 +368,23 @@ def test_open_episode_is_incomplete_in_the_unique_run_summary() -> None:
     assert set(summary) == {"BenchmarkSink"}
     document = summary["BenchmarkSink"]
     assert isinstance(document, dict)
-    assert document["episodes"] == 1
-    assert document["verdict_counts"] == {"incomplete": 1}
+    assert document["episodes"]["count"] == 1
+    assert document["episodes"]["incomplete"] == 1
+    assert document["episodes"]["verdicts"] == {"incomplete": 1}
+    assert document["episodes"]["retained"] == 1
+    assert document["episodes"]["retain_episodes"] is True
+    assert document["episodes"]["length"] == {"min": 1, "max": 1, "mean": 1.0}
+    assert document["episodes"]["by_env"]["0"]["incomplete"] == 1
+    assert document["execution"] == {
+        "event_total": 0,
+        "dropped_events": 0,
+        "terminal_conflicts": 0,
+        "retention": {
+            "retain_episodes": True,
+            "max_events": 200_000,
+            "event_log": True,
+        },
+    }
     assert json.loads(json.dumps(document)) == document
 
 
@@ -328,15 +393,35 @@ def test_zero_episode_run_returns_an_honest_summary() -> None:
 
     summary = sink.on_run_end()
 
-    assert summary == {
-        "BenchmarkSink": {
-            "episodes": 0,
-            "total_ticks": 0,
-            "verdict_counts": {},
-            "event_count": 0,
-            "dropped_events": 0,
-            "conflicts": 0,
-        }
+    assert set(summary) == {"BenchmarkSink"}
+    report = summary["BenchmarkSink"]
+    assert isinstance(report, dict)
+    assert report["episodes"] == {
+        "count": 0,
+        "complete": 0,
+        "incomplete": 0,
+        "rewound": 0,
+        "retained": 0,
+        "retain_episodes": False,
+        "total_ticks": 0,
+        "verdicts": {},
+        "by_env_counts": {},
+    }
+    assert report["terminations"] == {
+        "total": 0,
+        "outcome": {},
+        "code": {},
+        "source": {},
+    }
+    assert report["execution"] == {
+        "event_total": 0,
+        "dropped_events": 0,
+        "terminal_conflicts": 0,
+        "retention": {
+            "retain_episodes": False,
+            "max_events": 200_000,
+            "event_log": True,
+        },
     }
 
 

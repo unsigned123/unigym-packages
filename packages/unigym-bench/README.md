@@ -5,12 +5,30 @@ streaming, monitor-driven benchmarking layer on the public sink, signal and
 evaluation contracts, without importing `unigym.benchmarks`,
 `unigym.runner.evaluation` or `unigym.runner.episodes`.
 
-Status: P3. The package contains the skeleton — version metadata, the
+Status: P6. The package contains the skeleton — version metadata, the
 core-contract import fence, strict JSON helpers, the closed YAML task-spec
 loader (`unigym_bench.specs`), the monitor protocol with the v1 built-in
-monitors (`unigym_bench.monitors`), and the streaming engine
-(`unigym_bench.engine`). There is no sink, report, scenario or sampler
-implementation yet.
+monitors (`unigym_bench.monitors`), the streaming engine
+(`unigym_bench.engine`), the core sink shell (`unigym_bench.sink`), the rewind
+provider and the report builder with report extensions
+(`unigym_bench.report`). There is no scenario or sampler implementation yet.
+
+## Report
+
+At run end the pack sink returns `{"BenchmarkSink": <report>}` where the report
+is a JSON-safe document with the fixed blocks `schema`, `run`, `tasks`,
+`episodes`, `terminations`, `execution`, `monitors` and `extensions`. Episode,
+termination and per-env counters are maintained independently of episode
+retention, so the aggregate report is correct even with the default
+`retain_episodes: false`; per-record `length`/`by_env` detail is emitted only
+when episodes are retained. `execution` records the event total, dropped events,
+terminal conflicts and the retention/cap policy. Monitors without a declared
+`report_extension` contribute their `report_view()` under `monitors`; a monitor
+that declares an extension is emitted only through that extension's
+`extensions/<name>` block. A stateful report extension declares
+`stateful = True` and implements `snapshot()`/`restore()` so the
+`unigym_bench` rewind provider restores its accumulator. The pack never writes
+the core `benchmark_report.json` or `results.json`.
 
 ## Monitors
 

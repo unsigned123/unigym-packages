@@ -57,7 +57,7 @@ def test_provider_identity_and_payload_is_json_safe_and_private() -> None:
     assert provider.name == REWIND_PROVIDER_NAME == "unigym_bench"
     state = provider.rewind_state()
 
-    assert state["schema"] == REWIND_SCHEMA == "unigym_bench.rewind/1"
+    assert state["schema"] == REWIND_SCHEMA == "unigym_bench.rewind/2"
     assert set(state) == {"schema", "engine", "monitors"}
     assert ensure_json_value(state) == state
     assert json.loads(json.dumps(state)) == state
@@ -216,7 +216,7 @@ def test_rewind_after_due_episode_marks_replayed_open_episode_rewound() -> None:
     assert [record.rewound for record in engine.records] == [False, True]
     assert engine.records[1].episode_seq == 1
     assert engine.records[1].ticks == 1
-    assert summary["BenchmarkSink"]["episodes"] == 2
+    assert summary["BenchmarkSink"]["episodes"]["count"] == 2
 
 
 def test_payload_never_carries_sampler_or_signal_bus_state() -> None:

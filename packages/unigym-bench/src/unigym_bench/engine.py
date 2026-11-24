@@ -64,14 +64,17 @@ from .events import (
 from .frames import TickFrame
 from .json import JsonValue, ensure_json_value
 from .monitors import Monitor
+from .report import ReportExtension, validate_report_extensions
 from .specs import RetentionSpec
 
 if TYPE_CHECKING:
     from unigym.signals import SignalPublisher
 
 #: Checkpoint payload key and schema owned by the pack's rewind provider.
+#: Schema 2 adds the retention-independent run counters (rewind/termination/
+#: per-env aggregates) required for an honest default-retention report.
 REWIND_PROVIDER_NAME = "unigym_bench"
-REWIND_SCHEMA = "unigym_bench.rewind/1"
+REWIND_SCHEMA = "unigym_bench.rewind/2"
 
 __all__ = [
     "EngineStateError",
@@ -81,6 +84,7 @@ __all__ = [
 ]
 
 _REWIND_KEYS = frozenset({"schema", "engine", "monitors"})
+_REWIND_OPTIONAL_KEYS = frozenset({"extensions"})
 _ENGINE_KEYS = frozenset(
     {
         "bound",
@@ -106,6 +110,11 @@ _ENGINE_KEYS = frozenset(
         "episode_total",
         "tick_total",
         "verdict_counts",
+        "rewound_total",
+        "termination_outcome_counts",
+        "termination_code_counts",
+        "termination_source_counts",
+        "episode_counts_by_env",
     }
 )
 _RETENTION_KEYS = frozenset({"retain_episodes", "max_events", "event_log"})
@@ -141,6 +150,11 @@ class _DecodedEngineState:
     episode_total: int
     tick_total: int
     verdict_counts: dict[str, int]
+    rewound_total: int
+    termination_outcome_counts: dict[str, int]
+    termination_code_counts: dict[str, int]
+    termination_source_counts: dict[str, int]
+    episode_counts_by_env: list[int]
 
 
 @dataclass(frozen=True)
@@ -149,6 +163,7 @@ class _DecodedRewindState:
 
     engine: _DecodedEngineState
     monitors: dict[str, JsonValue]
+    extensions: dict[str, JsonValue]
 
 
 class StreamingEngine:
@@ -161,6 +176,9 @@ class StreamingEngine:
             pack's documented ``RetentionSpec`` default.
         publisher: Optional write-only signal publisher.  When supplied, every
             monitor level is published as ````<monitor>/<signal>````.
+        extensions: Report extensions in task declaration order.  A stateful
+            extension must implement snapshot/restore so the pack provider can
+            restore its accumulator.
     """
 
     #: Structural rewind-provider name; checkpoint payload keys are namespaced.
@@ -172,6 +190,7 @@ class StreamingEngine:
         *,
         retention: RetentionSpec | None = None,
         publisher: SignalPublisher | None = None,
+        extensions: Sequence[ReportExtension] = (),
     ) -> None:
         if isinstance(monitors, (str, bytes, bytearray)) or not isinstance(monitors, Sequence):
             raise TypeError(
@@ -190,6 +209,7 @@ class StreamingEngine:
                 raise ValueError(f"engine monitors: duplicate monitor name {name!r}")
             names.add(name)
             checked.append(monitor)
+        checked_extensions = validate_report_extensions(extensions)
         if retention is None:
             retention = RetentionSpec()
         elif not isinstance(retention, RetentionSpec):
@@ -204,6 +224,7 @@ class StreamingEngine:
             )
 
         self._monitors: tuple[Monitor, ...] = tuple(checked)
+        self._extensions: tuple[ReportExtension, ...] = checked_extensions
         self._retention = retention
         self._publisher = publisher
 
@@ -233,6 +254,11 @@ class StreamingEngine:
         self._episode_total = 0
         self._tick_total = 0
         self._verdict_counts: dict[str, int] = {}
+        self._rewound_total = 0
+        self._termination_outcome_counts: dict[str, int] = {}
+        self._termination_code_counts: dict[str, int] = {}
+        self._termination_source_counts: dict[str, int] = {}
+        self._episode_counts_by_env: list[int] = []
 
     # ------------------------------------------------------------------ #
     # Public read-only state
@@ -251,6 +277,21 @@ class StreamingEngine:
     def publisher(self) -> SignalPublisher | None:
         """The write-only signal publisher, or ``None`` when not configured."""
         return self._publisher
+
+    @property
+    def retention(self) -> RetentionSpec:
+        """The explicit event/episode retention policy for this run."""
+        return self._retention
+
+    @property
+    def monitors(self) -> tuple[Monitor, ...]:
+        """The monitors in task declaration order."""
+        return self._monitors
+
+    @property
+    def extensions(self) -> tuple[ReportExtension, ...]:
+        """The report extensions in task declaration order."""
+        return self._extensions
 
     @property
     def open_envs(self) -> tuple[int, ...]:
@@ -292,6 +333,13 @@ class StreamingEngine:
             event_count=self._event_total,
             dropped_events=self._dropped_events,
             conflicts=self._conflict_total,
+            rewound=self._rewound_total,
+            termination_outcome_counts=MappingProxyType(dict(self._termination_outcome_counts)),
+            termination_code_counts=MappingProxyType(dict(self._termination_code_counts)),
+            termination_source_counts=MappingProxyType(dict(self._termination_source_counts)),
+            episodes_by_env=MappingProxyType(
+                {env_id: count for env_id, count in enumerate(self._episode_counts_by_env)}
+            ),
         )
 
     # ------------------------------------------------------------------ #
@@ -338,6 +386,11 @@ class StreamingEngine:
             "episode_total": self._episode_total,
             "tick_total": self._tick_total,
             "verdict_counts": dict(self._verdict_counts),
+            "rewound_total": self._rewound_total,
+            "termination_outcome_counts": dict(self._termination_outcome_counts),
+            "termination_code_counts": dict(self._termination_code_counts),
+            "termination_source_counts": dict(self._termination_source_counts),
+            "episode_counts_by_env": list(self._episode_counts_by_env),
         }
         monitors: dict[str, JsonValue] = {}
         for monitor in self._monitors:
@@ -349,6 +402,16 @@ class StreamingEngine:
             "engine": engine,
             "monitors": monitors,
         }
+        extensions: dict[str, JsonValue] = {}
+        for extension in self._extensions:
+            if extension.stateful:
+                extensions[extension.name] = _extension_snapshot(extension)
+        if extensions:
+            # The ``extensions`` key is optional: a payload with no stateful
+            # extension keeps the three-key shape.  It is present whenever
+            # state must be restored, so a stateful extension can never silently
+            # resume from a checkpoint that lacks its accumulator.
+            document["extensions"] = extensions
         normalized = ensure_json_value(document, where="unigym_bench rewind state")
         if not isinstance(normalized, dict):
             raise TypeError("unigym_bench rewind state: expected an object")
@@ -361,18 +424,23 @@ class StreamingEngine:
     def apply_rewind_state(self, state: object) -> None:
         """Restore a checkpoint in place after fully decoding and validating it.
 
-        Monitor snapshots are pre-flighted with the read-only
-        ``validate_restore`` capability when present.  The live monitor state
-        is captured before any monitor is touched so an unexpected restore
-        failure rolls every monitor back; engine fields are assigned only after
-        every monitor restored successfully.
+        Monitor and stateful-extension snapshots are pre-flighted with the
+        read-only ``validate_restore`` capability when present.  The live state
+        of every rewindable monitor and extension is captured before anything is
+        touched so an unexpected restore failure rolls all of them back; engine
+        fields are assigned only after every restore succeeded.
         """
         decoded = self._decode_rewind_state(state)
-        rollback: dict[str, JsonValue] = {}
+        monitor_rollback: dict[str, JsonValue] = {}
         for monitor in self._monitors:
             snapshot = _monitor_snapshot(monitor)
             if snapshot is not None:
-                rollback[monitor.name] = snapshot
+                monitor_rollback[monitor.name] = snapshot
+        extension_rollback: dict[str, JsonValue] = {}
+        for extension in self._extensions:
+            if extension.stateful:
+                extension_rollback[extension.name] = _extension_snapshot(extension)
+        expected_extensions = _stateful_extensions(self._extensions)
         try:
             for monitor in self._monitors:
                 target = decoded.monitors.get(monitor.name)
@@ -385,11 +453,21 @@ class StreamingEngine:
                         "callable restore"
                     )
                 restore(target)
+            for name, target in decoded.extensions.items():
+                restore = getattr(expected_extensions[name], "restore", None)
+                if not callable(restore):
+                    raise TypeError(
+                        f"report extension {name!r}: rewind snapshot present but no "
+                        "callable restore"
+                    )
+                restore(target)
         except Exception:
             for monitor in self._monitors:
-                previous = rollback.get(monitor.name)
+                previous = monitor_rollback.get(monitor.name)
                 if previous is not None:
                     monitor.restore(previous)
+            for name, previous in extension_rollback.items():
+                expected_extensions[name].restore(previous)
             raise
         self._apply_engine_state(decoded.engine)
 
@@ -532,6 +610,12 @@ class StreamingEngine:
 
         for monitor in self._monitors:
             monitor.on_episode_end(due_ids)
+        if self._extensions:
+            # Only this boundary's envs are visible, and the records are frozen;
+            # an extension cannot reach another env or mutate a finalized record.
+            due_records = MappingProxyType({record.env_id: record for record in records})
+            for extension in self._extensions:
+                extension.on_env_end(due_ids, due_records)
         for monitor in self._monitors:
             monitor.reset(due_ids)
 
@@ -647,7 +731,7 @@ class StreamingEngine:
                 "unigym_bench rewind state: expected an object, " f"got {type(payload).__name__}"
             )
         where = "unigym_bench rewind state"
-        _require_keys(payload, _REWIND_KEYS, where)
+        _require_keys(payload, _REWIND_KEYS, where, optional=_REWIND_OPTIONAL_KEYS)
         if payload["schema"] != REWIND_SCHEMA:
             raise ValueError(
                 f"{where}.schema: expected {REWIND_SCHEMA!r}, got {payload['schema']!r}"
@@ -680,7 +764,28 @@ class StreamingEngine:
             if callable(validate):
                 validate(normalized)
             monitors[name] = normalized
-        return _DecodedRewindState(engine=engine, monitors=monitors)
+        raw_extensions = payload.get("extensions", {})
+        if not isinstance(raw_extensions, dict):
+            raise TypeError(
+                f"{where}.extensions: expected an object, " f"got {type(raw_extensions).__name__}"
+            )
+        expected_extensions = _stateful_extensions(self._extensions)
+        if set(raw_extensions) != set(expected_extensions):
+            raise ValueError(
+                f"{where}.extensions: checkpoint extension names "
+                f"{sorted(raw_extensions)} do not match the live stateful extensions "
+                f"{sorted(expected_extensions)}"
+            )
+        extensions: dict[str, JsonValue] = {}
+        for name, item in raw_extensions.items():
+            extension = expected_extensions[name]
+            extension_where = f"{where}.extensions[{name!r}]"
+            normalized = ensure_json_value(item, where=extension_where)
+            validate = getattr(extension, "validate_restore", None)
+            if callable(validate):
+                validate(normalized)
+            extensions[name] = normalized
+        return _DecodedRewindState(engine=engine, monitors=monitors, extensions=extensions)
 
     def _decode_engine_state(self, raw: Mapping[str, JsonValue]) -> _DecodedEngineState:
         """Decode the engine-owned part of the payload into private locals."""
@@ -774,6 +879,29 @@ class StreamingEngine:
         verdict_counts = _decode_verdict_counts(raw["verdict_counts"], f"{where}.verdict_counts")
         dropped_events = _nonnegative_int(raw["dropped_events"], f"{where}.dropped_events")
         event_total = _nonnegative_int(raw["event_total"], f"{where}.event_total")
+        rewound_total = _nonnegative_int(raw["rewound_total"], f"{where}.rewound_total")
+        if rewound_total > episode_total:
+            raise ValueError(
+                f"{where}.rewound_total: expected a value <= episode_total "
+                f"{episode_total}, got {rewound_total}"
+            )
+        termination_outcome_counts = _decode_string_count_map(
+            raw["termination_outcome_counts"], f"{where}.termination_outcome_counts"
+        )
+        termination_code_counts = _decode_string_count_map(
+            raw["termination_code_counts"], f"{where}.termination_code_counts"
+        )
+        termination_source_counts = _decode_string_count_map(
+            raw["termination_source_counts"], f"{where}.termination_source_counts"
+        )
+        episode_counts_by_env = _decode_int_list(
+            raw["episode_counts_by_env"], f"{where}.episode_counts_by_env", num_envs
+        )
+        if sum(episode_counts_by_env) != episode_total:
+            raise ValueError(
+                f"{where}.episode_counts_by_env: counts sum to "
+                f"{sum(episode_counts_by_env)} but episode_total is {episode_total}"
+            )
         return _DecodedEngineState(
             bound=bound,
             run_ended=run_ended,
@@ -797,6 +925,11 @@ class StreamingEngine:
             episode_total=episode_total,
             tick_total=tick_total,
             verdict_counts=verdict_counts,
+            rewound_total=rewound_total,
+            termination_outcome_counts=termination_outcome_counts,
+            termination_code_counts=termination_code_counts,
+            termination_source_counts=termination_source_counts,
+            episode_counts_by_env=episode_counts_by_env,
         )
 
     def _apply_engine_state(self, decoded: _DecodedEngineState) -> None:
@@ -823,6 +956,11 @@ class StreamingEngine:
         self._episode_total = decoded.episode_total
         self._tick_total = decoded.tick_total
         self._verdict_counts = decoded.verdict_counts
+        self._rewound_total = decoded.rewound_total
+        self._termination_outcome_counts = decoded.termination_outcome_counts
+        self._termination_code_counts = decoded.termination_code_counts
+        self._termination_source_counts = decoded.termination_source_counts
+        self._episode_counts_by_env = decoded.episode_counts_by_env
 
     # ------------------------------------------------------------------ #
     # Frame and output validation
@@ -872,6 +1010,7 @@ class StreamingEngine:
             self._episode_events = [{} for _ in range(frame.num_envs)]
             self._episode_command = [None] * frame.num_envs
             self._episode_reset = [{} for _ in range(frame.num_envs)]
+            self._episode_counts_by_env = [0] * frame.num_envs
             self._bound = True
             return
         if frame.num_envs != self._num_envs:
@@ -1062,10 +1201,25 @@ class StreamingEngine:
         return "core"
 
     def _finalize_record(self, record: EpisodeRecord) -> None:
-        """Accumulate and, when retention asks, retain one finalized record."""
+        """Accumulate the retention-independent counters and maybe retain."""
         self._episode_total += 1
         self._tick_total += record.ticks
         self._verdict_counts[record.verdict] = self._verdict_counts.get(record.verdict, 0) + 1
+        if record.rewound:
+            self._rewound_total += 1
+        self._episode_counts_by_env[record.env_id] += 1
+        for termination in _record_terminations(record):
+            outcome = termination.outcome.value
+            self._termination_outcome_counts[outcome] = (
+                self._termination_outcome_counts.get(outcome, 0) + 1
+            )
+            self._termination_code_counts[termination.code] = (
+                self._termination_code_counts.get(termination.code, 0) + 1
+            )
+            source = termination.source.value
+            self._termination_source_counts[source] = (
+                self._termination_source_counts.get(source, 0) + 1
+            )
         if self._retention.retain_episodes:
             self._records.append(record)
 
@@ -1090,6 +1244,16 @@ def _require_monitor_name(name: object) -> str:
             f"engine monitor.name: {name!r} must not contain '/'; names namespace signals"
         )
     return name
+
+
+def _record_terminations(record: EpisodeRecord) -> tuple[Termination, ...]:
+    """Return every core/pack termination fact retained by one episode record."""
+    facts: list[Termination] = []
+    if record.first_terminal is not None:
+        facts.append(record.first_terminal)
+    if record.core_termination is not None:
+        facts.extend(record.core_termination.all)
+    return tuple(facts)
 
 
 def _require_env_id(value: object, num_envs: int, where: str) -> int:
@@ -1181,12 +1345,43 @@ def _monitor_snapshot(monitor: Monitor) -> JsonValue | None:
     return ensure_json_value(snapshot(), where=f"monitor {monitor.name!r} rewind snapshot")
 
 
-def _require_keys(document: Mapping[str, JsonValue], expected: frozenset[str], where: str) -> None:
+def _stateful_extensions(
+    extensions: Sequence[ReportExtension],
+) -> dict[str, ReportExtension]:
+    """Return the stateful extensions keyed by name.
+
+    ``validate_report_extensions`` already guaranteed that ``stateful`` is an
+    explicit bool and that a stateful extension implements snapshot/restore.
+    """
+    return {extension.name: extension for extension in extensions if extension.stateful}
+
+
+def _extension_snapshot(extension: ReportExtension) -> JsonValue:
+    """Return one stateful extension's JSON-safe, private-copied state."""
+    snapshot = getattr(extension, "snapshot", None)
+    if not callable(snapshot):
+        raise TypeError(
+            f"report extension {extension.name!r}: stateful=True requires a callable " "snapshot()"
+        )
+    return ensure_json_value(
+        snapshot(), where=f"report extension {extension.name!r} rewind snapshot"
+    )
+
+
+def _require_keys(
+    document: Mapping[str, JsonValue],
+    expected: frozenset[str],
+    where: str,
+    *,
+    optional: frozenset[str] = frozenset(),
+) -> None:
+    allowed = expected | optional
     missing = sorted(expected - document.keys())
-    unknown = sorted(document.keys() - expected)
+    unknown = sorted(document.keys() - allowed)
     if missing or unknown:
         raise ValueError(
-            f"{where}: expected keys {sorted(expected)}, missing {missing}, unknown {unknown}"
+            f"{where}: expected keys {sorted(expected)} (optional {sorted(optional)}), "
+            f"missing {missing}, unknown {unknown}"
         )
 
 
@@ -1382,4 +1577,15 @@ def _decode_verdict_counts(value: JsonValue, where: str) -> dict[str, int]:
         if verdict not in VERDICTS:
             raise ValueError(f"{where}: unknown verdict {verdict!r}; allowed {sorted(VERDICTS)}")
         counts[verdict] = _nonnegative_int(count, f"{where}[{verdict!r}]")
+    return counts
+
+
+def _decode_string_count_map(value: JsonValue, where: str) -> dict[str, int]:
+    if not isinstance(value, dict):
+        raise TypeError(f"{where}: expected an object, got {type(value).__name__}")
+    counts: dict[str, int] = {}
+    for key, count in value.items():
+        if not key:
+            raise ValueError(f"{where}: keys must be non-empty strings, got {key!r}")
+        counts[key] = _nonnegative_int(count, f"{where}[{key!r}]")
     return counts
