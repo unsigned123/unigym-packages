@@ -31,6 +31,7 @@ Core is not on PyPI yet, so use a core checkout:
 git clone https://github.com/unsigned123/unigym ../unigym-core
 pip install -e ../unigym-core
 pip install -e 'packages/unigym-rl[gymnasium,skrl]'
+pip install -e packages/unigym-bench
 ```
 
 Tests and static checks for `unigym-rl`:
@@ -41,6 +42,16 @@ PYTHONPATH=../unigym-core:packages/unigym-rl/src \
 
 python -m ruff check packages/unigym-rl/src packages/unigym-rl/tests packages/unigym-rl/examples
 python -m ruff format --check packages/unigym-rl/src packages/unigym-rl/tests packages/unigym-rl/examples
+```
+
+Tests and static checks for `unigym-bench`:
+
+```bash
+PYTHONPATH=../unigym-core:packages/unigym-bench/src \
+  python -m pytest packages/unigym-bench/tests -q
+
+python -m ruff check packages/unigym-bench/src packages/unigym-bench/tests
+python -m ruff format --check packages/unigym-bench/src packages/unigym-bench/tests
 ```
 
 `test-packs/` is tested from inside that directory with its own nested

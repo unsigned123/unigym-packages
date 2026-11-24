@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "unigym-bench"
+description = "External benchmark pack for unigym built on the public sink contract"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [{name = "UniGym contributors"}]
+requires-python = ">=3.11"
+dynamic = ["version"]
+dependencies = [
+    "unigym>=0.106,<0.107",
+    "PyYAML>=6.0,<7.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0,<10.0",
+    "ruff==0.8.6",
+]
+
+[project.urls]
+Homepage = "https://github.com/unsigned123/unigym-packages"
+Source = "https://github.com/unsigned123/unigym-packages/tree/main/packages/unigym-bench"
+Core = "https://github.com/unsigned123/unigym"
+Issues = "https://github.com/unsigned123/unigym-packages/issues"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+unigym_bench = ["py.typed"]
+
+[tool.setuptools.dynamic]
+version = {attr = "unigym_bench.version.__version__"}
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "D"]
+extend-ignore = ["D105", "D107"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["D1", "D2", "D3", "D4"]

@@ -12,6 +12,7 @@ does not replace it. Core (`unigym`) stays in its own repository
 | Path | Distribution | Purpose |
 | --- | --- | --- |
 | `packages/unigym-rl` | `unigym-rl` | L2 task-environment layer over core: `TaskEnv`, programmatic `EnvSpec`, optional Gymnasium `VectorEnv` face and skrl smoke. |
+| `packages/unigym-bench` | `unigym-bench` | External benchmark layer over the core sink/view contracts: monitor-driven scoring, custom reports and scenario commands. |
 | `packages/unigym-robots` | `unigym-robots` | Pinned Unitree Go1/Go2/G1 MJCF and USD assets, downloaded from GitHub Release tarballs. No core dependency and no binaries in the wheel. |
 | `test-packs/` | repo-only | Test-pack plugin and content-pack distributions plus their USD assets. Not a workspace member and not published by default; see `test-packs/README.md`. |
 
@@ -29,6 +30,7 @@ separate.
 ```text
 unigym (core repo, version 0.106.x)  ->  dependency
   -> packages/unigym-rl
+  -> packages/unigym-bench
   -> user / RL framework training loop
 
 packages/unigym-robots  -> standalone asset downloader (no core dependency)
@@ -50,9 +52,12 @@ python -m venv .venv
 . .venv/bin/activate
 pip install -e ../unigym-core
 pip install -e 'packages/unigym-rl[gymnasium,skrl]'
+pip install -e packages/unigym-bench
 
 PYTHONPATH=../unigym-core:packages/unigym-rl/src \
   python -m pytest packages/unigym-rl/tests -q
+PYTHONPATH=../unigym-core:packages/unigym-bench/src \
+  python -m pytest packages/unigym-bench/tests -q
 ```
 
 Static checks:
@@ -60,6 +65,8 @@ Static checks:
 ```bash
 python -m ruff check packages/unigym-rl/src packages/unigym-rl/tests packages/unigym-rl/examples
 python -m ruff format --check packages/unigym-rl/src packages/unigym-rl/tests packages/unigym-rl/examples
+python -m ruff check packages/unigym-bench/src packages/unigym-bench/tests
+python -m ruff format --check packages/unigym-bench/src packages/unigym-bench/tests
 ```
 
 `unigym-robots` needs neither core nor the network for its tests:
@@ -88,8 +95,9 @@ python examples/cartpole/train_skrl.py --num-envs 1 --max-iterations 1
 - Each package keeps its own `pyproject.toml`, version and tag.
 - `unigym-rl` releases are tagged `unigym-rl-v<version>` (for example
   `unigym-rl-v0.1.0`). Tags trigger `.github/workflows/release.yml`.
+- `unigym-bench` releases are tagged `unigym-bench-v<version>`.
 - Core compatibility is recorded per release in `COMPATIBILITY.md`; the current
-  lane is `unigym-rl 0.1.x` -> `unigym >=0.106,<0.107`.
+  lanes are `unigym-rl 0.1.x` and `unigym-bench 0.1.x` -> `unigym >=0.106,<0.107`.
 - `unigym-robots` code is versioned independently. Its robot assets are attached
   to the GitHub Release `unigym-robots-assets-v0.1.0` and are never published to
   PyPI. See `packages/unigym-robots/PROVENANCE.md`.
