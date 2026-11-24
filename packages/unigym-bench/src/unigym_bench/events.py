@@ -16,18 +16,32 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Literal, TypeAlias
 
-from unigym.core.episode_termination import validate_code
+from unigym.core.episode_termination import Termination, validate_code
 
 from .json import JsonValue, ensure_json_value
 
-__all__ = ["SEVERITIES", "Event", "Severity"]
+__all__ = [
+    "SEVERITIES",
+    "VERDICTS",
+    "EpisodeRecord",
+    "EpisodeSummary",
+    "EpisodeVerdict",
+    "Event",
+    "Severity",
+]
 
 Severity: TypeAlias = Literal["info", "warning", "violation", "fatal"]
 
 #: Every severity accepted for an :class:`Event`.
 SEVERITIES: frozenset[str] = frozenset({"info", "warning", "violation", "fatal"})
+
+EpisodeVerdict: TypeAlias = Literal["terminal", "deadline", "core", "incomplete", "rewound"]
+
+#: Every verdict accepted for a finalized :class:`EpisodeRecord`.
+VERDICTS: frozenset[str] = frozenset({"terminal", "deadline", "core", "incomplete", "rewound"})
 
 _EVENT_KEYS = frozenset({"name", "code", "env_ids", "severity", "data"})
 
@@ -142,6 +156,134 @@ class Event:
             severity=severity,
             data=data,
         )
+
+
+@dataclass(frozen=True)
+class EpisodeRecord:
+    """A finalized episode's small, immutable facts.
+
+    The streaming engine builds one record per due environment.  A record holds
+    only scalars, the first pack terminal (if any), per-episode event counts and
+    a verdict; it never retains a view, frame, tensor or backend handle.  The
+    report layer owns serialization into the external report schema.
+    """
+
+    env_id: int
+    episode_seq: int
+    ticks: int
+    verdict: EpisodeVerdict
+    first_terminal: Termination | None = None
+    event_counts: Mapping[str, int] = field(default_factory=dict)
+    rewound: bool = False
+
+    def __post_init__(self) -> None:
+        """Validate the record and freeze its event counts."""
+        if isinstance(self.env_id, bool) or not isinstance(self.env_id, int):
+            raise TypeError(f"episode record.env_id: expected an int, got {self.env_id!r}")
+        if self.env_id < 0:
+            raise ValueError(f"episode record.env_id: expected an int >= 0, got {self.env_id}")
+        _require_nonnegative_int(self.episode_seq, "episode record.episode_seq")
+        _require_nonnegative_int(self.ticks, "episode record.ticks")
+        if self.verdict not in VERDICTS:
+            raise ValueError(
+                f"episode record.verdict: expected one of {sorted(VERDICTS)}, "
+                f"got {self.verdict!r}"
+            )
+        if self.first_terminal is not None and not isinstance(self.first_terminal, Termination):
+            raise TypeError(
+                "episode record.first_terminal: expected a Termination or None, "
+                f"got {type(self.first_terminal).__name__}"
+            )
+        if self.verdict == "terminal" and self.first_terminal is None:
+            raise ValueError("episode record: verdict 'terminal' requires a first_terminal")
+        if not isinstance(self.event_counts, Mapping):
+            raise TypeError(
+                "episode record.event_counts: expected a mapping, "
+                f"got {type(self.event_counts).__name__}"
+            )
+        counts: dict[str, int] = {}
+        for code, count in self.event_counts.items():
+            if not isinstance(code, str) or not code:
+                raise TypeError(
+                    f"episode record.event_counts key must be a non-empty str, got {code!r}"
+                )
+            _require_nonnegative_int(count, f"episode record.event_counts[{code!r}]")
+            counts[code] = count
+        object.__setattr__(self, "event_counts", MappingProxyType(counts))
+        if not isinstance(self.rewound, bool):
+            raise TypeError(f"episode record.rewound: expected a bool, got {self.rewound!r}")
+
+    def to_json(self) -> dict[str, JsonValue]:
+        """Return a fresh JSON-safe record document."""
+        return {
+            "env_id": self.env_id,
+            "episode_seq": self.episode_seq,
+            "ticks": self.ticks,
+            "verdict": self.verdict,
+            "first_terminal": (
+                None if self.first_terminal is None else self.first_terminal.to_json()
+            ),
+            "event_counts": dict(self.event_counts),
+            "rewound": self.rewound,
+        }
+
+
+@dataclass(frozen=True)
+class EpisodeSummary:
+    """Run-scoped episode totals owned by the streaming engine.
+
+    The summary is deliberately aggregate-only: it carries no episode payloads
+    and no tensors.  A report builder may combine it with retained
+    :class:`EpisodeRecord` values without asking the engine to score anything.
+    """
+
+    episodes: int = 0
+    total_ticks: int = 0
+    verdict_counts: Mapping[str, int] = field(default_factory=dict)
+    event_count: int = 0
+    dropped_events: int = 0
+    conflicts: int = 0
+
+    def __post_init__(self) -> None:
+        """Validate the aggregate counters and freeze the verdict map."""
+        _require_nonnegative_int(self.episodes, "episode summary.episodes")
+        _require_nonnegative_int(self.total_ticks, "episode summary.total_ticks")
+        _require_nonnegative_int(self.event_count, "episode summary.event_count")
+        _require_nonnegative_int(self.dropped_events, "episode summary.dropped_events")
+        _require_nonnegative_int(self.conflicts, "episode summary.conflicts")
+        if not isinstance(self.verdict_counts, Mapping):
+            raise TypeError(
+                "episode summary.verdict_counts: expected a mapping, "
+                f"got {type(self.verdict_counts).__name__}"
+            )
+        counts: dict[str, int] = {}
+        for verdict, count in self.verdict_counts.items():
+            if verdict not in VERDICTS:
+                raise ValueError(
+                    f"episode summary.verdict_counts: unknown verdict {verdict!r}; "
+                    f"allowed {sorted(VERDICTS)}"
+                )
+            _require_nonnegative_int(count, f"episode summary.verdict_counts[{verdict!r}]")
+            counts[verdict] = count
+        object.__setattr__(self, "verdict_counts", MappingProxyType(counts))
+
+    def to_json(self) -> dict[str, JsonValue]:
+        """Return a fresh JSON-safe summary document."""
+        return {
+            "episodes": self.episodes,
+            "total_ticks": self.total_ticks,
+            "verdict_counts": dict(self.verdict_counts),
+            "event_count": self.event_count,
+            "dropped_events": self.dropped_events,
+            "conflicts": self.conflicts,
+        }
+
+
+def _require_nonnegative_int(value: object, where: str) -> None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{where}: expected an int, got {value!r}")
+    if value < 0:
+        raise ValueError(f"{where}: expected an int >= 0, got {value}")
 
 
 def _require_severity(value: JsonValue, where: str) -> Severity:

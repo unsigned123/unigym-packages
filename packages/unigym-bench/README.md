@@ -5,11 +5,12 @@ streaming, monitor-driven benchmarking layer on the public sink, signal and
 evaluation contracts, without importing `unigym.benchmarks`,
 `unigym.runner.evaluation` or `unigym.runner.episodes`.
 
-Status: P2. The package contains the skeleton — version metadata, the
+Status: P3. The package contains the skeleton — version metadata, the
 core-contract import fence, strict JSON helpers, the closed YAML task-spec
-loader (`unigym_bench.specs`), and the monitor protocol with the v1 built-in
-monitors (`unigym_bench.monitors`). There is no benchmark engine, sink, report,
-scenario or sampler implementation yet.
+loader (`unigym_bench.specs`), the monitor protocol with the v1 built-in
+monitors (`unigym_bench.monitors`), and the streaming engine
+(`unigym_bench.engine`). There is no sink, report, scenario or sampler
+implementation yet.
 
 ## Monitors
 

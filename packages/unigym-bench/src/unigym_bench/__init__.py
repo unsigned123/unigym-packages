@@ -3,8 +3,9 @@
 P1 provides version metadata, the core-contract import fence, strict JSON
 helpers and the closed task-spec loader in :mod:`unigym_bench.specs`.  P2 adds
 the monitor protocol and the built-in monitors in
-:mod:`unigym_bench.monitors`.  There is no benchmark engine, sink, report,
-scenario or sampler implementation yet.
+:mod:`unigym_bench.monitors`.  P3 adds the per-run streaming engine in
+:mod:`unigym_bench.engine`.  There is no sink, report, scenario or sampler
+implementation yet.
 """
 
 from __future__ import annotations
