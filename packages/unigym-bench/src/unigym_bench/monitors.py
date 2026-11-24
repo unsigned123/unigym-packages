@@ -24,7 +24,7 @@ Ownership boundaries:
 
 Built-ins that read a value take an explicit :class:`Probe` callable.  The
 probe is composed at the pack's composition boundary and returns one level
-tensor with shape ``(num_envs,)`` on the frame device.  A probe is never
+tensor with shape ``(num_envs,)`` on the context device.  A probe is never
 inferred from a name, so a monitor cannot silently read the wrong quantity.
 """
 
@@ -44,9 +44,9 @@ from unigym.core.episode_termination import (
     TerminationSource,
     validate_code,
 )
+from unigym.evaluation import EnvStepContext
 
 from .events import SEVERITIES, Event, Severity, termination_from_json
-from .frames import TickFrame
 from .json import JsonValue, ensure_json_value
 
 __all__ = [
@@ -101,16 +101,16 @@ class _DecodedMonitorSnapshot:
 
 
 class Probe(Protocol):
-    """Read one per-env level from a tick frame.
+    """Read one per-env level from a tick context.
 
-    The returned tensor must have shape ``(frame.num_envs,)`` and live on
-    ``frame.device``.  A numeric probe returns a floating tensor; a boolean
+    The returned tensor must have shape ``(context.num_envs,)`` and live on
+    ``context.device``.  A numeric probe returns a floating tensor; a boolean
     probe returns ``torch.bool``.  The monitor copies the values immediately
     and never retains the tensor.
     """
 
-    def __call__(self, frame: TickFrame) -> Tensor:
-        """Return the per-env level for ``frame``."""
+    def __call__(self, context: EnvStepContext) -> Tensor:
+        """Return the per-env level for ``context``."""
         ...
 
 
@@ -120,7 +120,7 @@ class Monitor(Protocol):
 
     name: str
 
-    def on_tick(self, frame: TickFrame) -> None:
+    def on_tick(self, context: EnvStepContext) -> None:
         """Observe one tick."""
 
     def signals(self) -> Mapping[str, Tensor]:
@@ -171,7 +171,7 @@ class BaseMonitor:
         """The monitor name declared by the task."""
         return self._name
 
-    def on_tick(self, frame: TickFrame) -> None:
+    def on_tick(self, context: EnvStepContext) -> None:
         """Observe one tick; the base monitor does nothing."""
 
     def signals(self) -> Mapping[str, Tensor]:
@@ -355,20 +355,21 @@ class _StatefulMonitor(BaseMonitor):
             pending_terminals=terminals,
         )
 
-    def _bind_frame(self, frame: TickFrame) -> None:
+    def _bind_context(self, context: EnvStepContext) -> None:
         """Bind the run shape on the first tick and reject a mismatch later."""
         if self._num_envs is None:
-            self._num_envs = frame.num_envs
-        elif frame.num_envs != self._num_envs:
+            self._num_envs = context.num_envs
+        elif context.num_envs != self._num_envs:
             raise ValueError(
                 f"monitor {self._name!r}: num_envs changed from {self._num_envs} "
-                f"to {frame.num_envs}"
+                f"to {context.num_envs}"
             )
         if self._device is None:
-            self._device = frame.device
-        elif frame.device != self._device:
+            self._device = context.device
+        elif context.device != self._device:
             raise ValueError(
-                f"monitor {self._name!r}: device changed from {self._device} " f"to {frame.device}"
+                f"monitor {self._name!r}: device changed from {self._device} "
+                f"to {context.device}"
             )
 
     def _ensure_length(self, values: list[_T], default: _T) -> list[_T]:
@@ -485,10 +486,10 @@ class ThresholdMonitor(_StatefulMonitor):
         self._active_ticks = 0
         self._episodes = 0
 
-    def on_tick(self, frame: TickFrame) -> None:
+    def on_tick(self, context: EnvStepContext) -> None:
         """Update the condition and emit the rising edges."""
-        self._bind_frame(frame)
-        values = _read_float_probe(self._probe, frame, f"monitor {self.name!r}.probe")
+        self._bind_context(context)
+        values = _read_float_probe(self._probe, context, f"monitor {self.name!r}.probe")
         self._active = self._ensure_length(self._active, False)
         self._last_values = self._ensure_length(self._last_values, 0.0)
         for env_id, value in enumerate(values):
@@ -648,10 +649,10 @@ class HoldMonitor(_StatefulMonitor):
         self._max_streak = 0
         self._episodes = 0
 
-    def on_tick(self, frame: TickFrame) -> None:
+    def on_tick(self, context: EnvStepContext) -> None:
         """Update streaks and emit the hold edges."""
-        self._bind_frame(frame)
-        values = _read_float_probe(self._probe, frame, f"monitor {self.name!r}.probe")
+        self._bind_context(context)
+        values = _read_float_probe(self._probe, context, f"monitor {self.name!r}.probe")
         self._streak = self._ensure_length(self._streak, 0)
         self._reached = self._ensure_length(self._reached, False)
         self._last_values = self._ensure_length(self._last_values, 0.0)
@@ -814,10 +815,10 @@ class EventCounterMonitor(_StatefulMonitor):
         self._occurrences = 0
         self._episodes = 0
 
-    def on_tick(self, frame: TickFrame) -> None:
+    def on_tick(self, context: EnvStepContext) -> None:
         """Count rising edges."""
-        self._bind_frame(frame)
-        current = _read_bool_probe(self._probe, frame, f"monitor {self.name!r}.probe")
+        self._bind_context(context)
+        current = _read_bool_probe(self._probe, context, f"monitor {self.name!r}.probe")
         self._previous = self._ensure_length(self._previous, False)
         self._counts = self._ensure_length(self._counts, 0)
         for env_id, value in enumerate(current):
@@ -937,10 +938,10 @@ class PhaseMonitor(_StatefulMonitor):
         self._episode_phases = [0] * (len(self._boundaries) + 1)
         self._episodes = 0
 
-    def on_tick(self, frame: TickFrame) -> None:
+    def on_tick(self, context: EnvStepContext) -> None:
         """Update phases and emit transitions."""
-        self._bind_frame(frame)
-        values = _read_float_probe(self._probe, frame, f"monitor {self.name!r}.probe")
+        self._bind_context(context)
+        values = _read_float_probe(self._probe, context, f"monitor {self.name!r}.probe")
         self._phase = self._ensure_length(self._phase, None)
         self._last_values = self._ensure_length(self._last_values, None)
         for env_id, value in enumerate(values):
@@ -1110,10 +1111,10 @@ class SafetyMonitor(_StatefulMonitor):
         self._violation_ticks = 0
         self._episodes = 0
 
-    def on_tick(self, frame: TickFrame) -> None:
+    def on_tick(self, context: EnvStepContext) -> None:
         """Update the violation condition and emit rising edges."""
-        self._bind_frame(frame)
-        values = _read_float_probe(self._probe, frame, f"monitor {self.name!r}.probe")
+        self._bind_context(context)
+        values = _read_float_probe(self._probe, context, f"monitor {self.name!r}.probe")
         self._violating = self._ensure_length(self._violating, False)
         self._last_values = self._ensure_length(self._last_values, 0.0)
         for env_id, value in enumerate(values):
@@ -1264,43 +1265,43 @@ class ScenarioCoverageMonitor(_StatefulMonitor):
         self._unmatched = 0
         self._episodes = 0
 
-    def on_tick(self, frame: TickFrame) -> None:
+    def on_tick(self, context: EnvStepContext) -> None:
         """Capture each environment's command at the start of its episode."""
-        self._bind_frame(frame)
-        cmd = frame.cmd
+        self._bind_context(context)
+        cmd = context.cmd
         if cmd is None:
             raise ValueError(
-                f"monitor {self.name!r}: scenario coverage requires frame.cmd, got None"
+                f"monitor {self.name!r}: scenario coverage requires context.cmd, got None"
             )
         if cmd.ndim != 2:
             raise ValueError(
-                f"monitor {self.name!r}: frame.cmd must be 2-D "
+                f"monitor {self.name!r}: context.cmd must be 2-D "
                 f"(num_envs, {self._dim}), got shape {tuple(cmd.shape)}"
             )
-        if cmd.shape != (frame.num_envs, self._dim):
+        if cmd.shape != (context.num_envs, self._dim):
             raise ValueError(
-                f"monitor {self.name!r}: frame.cmd must have shape "
-                f"({frame.num_envs}, {self._dim}), got {tuple(cmd.shape)}"
+                f"monitor {self.name!r}: context.cmd must have shape "
+                f"({context.num_envs}, {self._dim}), got {tuple(cmd.shape)}"
             )
-        if cmd.device != frame.device:
+        if cmd.device != context.device:
             raise ValueError(
-                f"monitor {self.name!r}: frame.cmd device {cmd.device} does not match "
-                f"frame device {frame.device}"
+                f"monitor {self.name!r}: context.cmd device {cmd.device} does not match "
+                f"context device {context.device}"
             )
         if not cmd.is_floating_point():
             raise TypeError(
-                f"monitor {self.name!r}: frame.cmd must be floating point, " f"got {cmd.dtype}"
+                f"monitor {self.name!r}: context.cmd must be floating point, " f"got {cmd.dtype}"
             )
         self._captured = self._ensure_length(self._captured, None)
         rows = cmd.detach().to(device="cpu", dtype=torch.float32).tolist()
-        for env_id in range(frame.num_envs):
+        for env_id in range(context.num_envs):
             if self._captured[env_id] is not None:
                 continue
             captured = tuple(float(value) for value in rows[env_id])
             for item_index, number in enumerate(captured):
                 if not math.isfinite(number):
                     raise ValueError(
-                        f"monitor {self.name!r}: frame.cmd[{env_id}][{item_index}] "
+                        f"monitor {self.name!r}: context.cmd[{env_id}][{item_index}] "
                         f"must be finite, got {number!r}"
                     )
             self._captured[env_id] = captured
@@ -1540,17 +1541,17 @@ def _require_commands(value: object, where: str) -> tuple[tuple[float, ...], ...
     return tuple(commands)
 
 
-def _read_float_probe(probe: Probe, frame: TickFrame, where: str) -> list[float]:
-    value = probe(frame)
+def _read_float_probe(probe: Probe, context: EnvStepContext, where: str) -> list[float]:
+    value = probe(context)
     if not isinstance(value, Tensor):
         raise TypeError(f"{where}: expected a torch.Tensor, got {type(value).__name__}")
-    if value.ndim != 1 or value.shape[0] != frame.num_envs:
+    if value.ndim != 1 or value.shape[0] != context.num_envs:
         raise ValueError(
-            f"{where}: expected shape (num_envs={frame.num_envs},), got {tuple(value.shape)}"
+            f"{where}: expected shape (num_envs={context.num_envs},), got {tuple(value.shape)}"
         )
-    if value.device != frame.device:
+    if value.device != context.device:
         raise ValueError(
-            f"{where}: probe device {value.device} does not match frame device {frame.device}"
+            f"{where}: probe device {value.device} does not match context device {context.device}"
         )
     if not value.is_floating_point():
         raise TypeError(f"{where}: expected a floating tensor, got {value.dtype}")
@@ -1561,17 +1562,17 @@ def _read_float_probe(probe: Probe, frame: TickFrame, where: str) -> list[float]
     return values
 
 
-def _read_bool_probe(probe: Probe, frame: TickFrame, where: str) -> list[bool]:
-    value = probe(frame)
+def _read_bool_probe(probe: Probe, context: EnvStepContext, where: str) -> list[bool]:
+    value = probe(context)
     if not isinstance(value, Tensor):
         raise TypeError(f"{where}: expected a torch.Tensor, got {type(value).__name__}")
-    if value.ndim != 1 or value.shape[0] != frame.num_envs:
+    if value.ndim != 1 or value.shape[0] != context.num_envs:
         raise ValueError(
-            f"{where}: expected shape (num_envs={frame.num_envs},), got {tuple(value.shape)}"
+            f"{where}: expected shape (num_envs={context.num_envs},), got {tuple(value.shape)}"
         )
-    if value.device != frame.device:
+    if value.device != context.device:
         raise ValueError(
-            f"{where}: probe device {value.device} does not match frame device {frame.device}"
+            f"{where}: probe device {value.device} does not match context device {context.device}"
         )
     if value.dtype != torch.bool:
         raise TypeError(f"{where}: expected a bool tensor, got {value.dtype}")

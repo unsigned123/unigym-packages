@@ -10,10 +10,12 @@ P10 moves the import fence and version pin to core C13: the pack requires
 `unigym>=0.107,<0.108`, `CORE_SURFACE_VERSION` is `3`, and the fence checks
 `unigym.values` (`ValueStore`, `ValueView`, `ValuePublisher`, `StepValues`)
 and `unigym.evaluation.EnvStepContext` instead of the removed
-`unigym.signals`. Runtime migration is pending: the streaming engine, sink,
-sampler, frames and monitors still use the P9 signal/frame vocabulary; the
-engine and sink are migrated in P11/P15, the sampler in P12, and the
-frame/monitor vocabulary in later cards. The package
+`unigym.signals`. Runtime migration is in progress: P11 replaces the pack
+`TickFrame` with `BenchmarkStepContext` (a core `EnvStepContext` subclass), and
+the streaming engine now reads only `bundle["step"]` while monitors take the
+core context. The sink and sampler still use the P9 signal vocabulary, and
+value publication plus final-context recording are migrated in P15; the sampler
+follows in P12. The package
 already contains the P0-P9 tree: version metadata, the core-contract import
 fence, strict JSON helpers, the closed YAML task-spec loader
 (`unigym_bench.specs`), the monitor protocol with the v1 built-in monitors
@@ -48,10 +50,10 @@ the core `benchmark_report.json` or `results.json`.
 > **P9-era construction path on core C13.** The example and `make_sink` details
 > below describe the P9 pack as it ran against core `0.106.x`. Core C13
 > (`0.107.0`) exposes `SinkContext.values` backed by `ValueStore`/`ValueView`
-> and has removed the signal surface. P10 does not migrate production pack code:
-> the sink, engine and sampler still import `unigym.signals`, so `make_sink` and
-> the P9 pack suite are expected to be red or unusable until P11/P15 (engine,
-> sink) and P12 (sampler) migrate them.
+> and has removed the signal surface. P11 migrates only the engine's step
+> context and monitor signatures; the sink and sampler still use the P9 signal
+> vocabulary, so `make_sink` and the P9 pack suite are expected to be red or
+> unusable until P15 (sink value publication) and P12 (sampler) migrate them.
 
 The pack is mounted as a core custom sink. A real benchmark run therefore keeps
 the run config in charge of the body/backend and gives the pack only its
@@ -136,7 +138,7 @@ memory only in this revision: no event log file is written.
 ## Monitors
 
 `unigym_bench.monitors.Monitor` is the stateful per-env contract. A monitor
-observes a `TickFrame`, returns per-env level signals, drains one-shot `Event`
+observes a `BenchmarkStepContext` (a core `EnvStepContext` subclass), returns per-env level signals, drains one-shot `Event`
 occurrences and core `Termination` requests, observes the due env ids through
 `on_episode_end(env_ids)`, clears per-env measurement state through `reset`,
 and contributes a JSON-safe `report_view`. Stateful built-ins implement the
@@ -158,9 +160,9 @@ Monitors never retain a frame, view or tensor.
 > `ctx.signals` and `bind_signals` statements below describe the P9 pack against
 > core `0.106.x`. Core C13 (`0.107.0`) removed `unigym.signals` and exposes
 > `SinkContext.values` plus `ValueStore`/`ValueView`/`ValuePublisher`/
-> `StepValues`. The un-migrated sampler and engine are expected to be red or
-> unusable until P12 (sampler) and P11/P15 (engine, sink) migrate them; the
-> command names and latency described here are P9-era, not a P10 claim.
+> `StepValues`. The un-migrated sampler and sink value publication are expected
+> to be red or unusable until P12 (sampler) and P15 (sink, final context); the
+> command names and latency described here are P9-era, not a current claim.
 
 In the P9 code that still ships, the pack engine published every monitor's
 per-env level signals under `<monitor>/<signal>`. A monitor named `scenario`

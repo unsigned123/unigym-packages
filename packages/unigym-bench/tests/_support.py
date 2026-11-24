@@ -1,8 +1,9 @@
-"""Construction helpers for monitor tests: real frames and simple probes.
+"""Construction helpers for monitor tests: real contexts and simple probes.
 
-These are test inputs, not stand-ins for pack components: every frame is built
-from the real :class:`unigym_bench.frames.TickFrame`, and every probe is a
-small callable that returns a real tensor for the frame's device.
+These are test inputs, not stand-ins for pack components: every context is
+built from a real :class:`unigym.evaluation.EnvView` and a
+:class:`unigym.values.StepValues` snapshot, and every probe is a small callable
+that returns a real tensor for the context's device.
 """
 
 from __future__ import annotations
@@ -18,13 +19,13 @@ from unigym.core.episode_termination import (
     Termination,
     TerminationSource,
 )
-from unigym.evaluation import EnvView
+from unigym.evaluation import EnvStepContext, EnvView
 from unigym.run import SinkContext
 from unigym.run.spec import build_spec
-from unigym.signals import SignalPublisher
+from unigym.values import StepValues, ValueView
+from unigym_bench.context import BenchmarkStepContext
 from unigym_bench.engine import StreamingEngine
 from unigym_bench.events import Event
-from unigym_bench.frames import TickFrame
 from unigym_bench.json import JsonValue
 from unigym_bench.monitors import BaseMonitor, Monitor, ThresholdMonitor
 from unigym_bench.sink import BenchmarkSink, make_sink
@@ -35,32 +36,32 @@ def make_view(num_envs: int = 2, *, device: str | torch.device = "cpu") -> EnvVi
     return EnvView(record={}, obs=None, env_id=None, num_envs=num_envs, device=device)
 
 
-def make_frame(
+def make_context(
     *,
     num_envs: int = 2,
     t: int = 0,
     cmd: torch.Tensor | None = None,
     view: EnvView | None = None,
+    values: ValueView | None = None,
     reset_state: Mapping[int, JsonValue] | None = None,
     step_index: torch.Tensor | None = None,
     time_s: torch.Tensor | None = None,
     device: torch.device | None = None,
-) -> TickFrame:
-    """Build a frame with a real view and default per-env bookkeeping."""
+) -> BenchmarkStepContext:
+    """Build a real benchmark context from a view and value snapshot."""
     target = torch.device("cpu") if device is None else device
     if view is None:
         view = make_view(num_envs, device=target)
     if step_index is None:
         step_index = torch.zeros(num_envs, dtype=torch.int64, device=target)
-    return TickFrame(
+    return BenchmarkStepContext(
         view=view,
+        values=StepValues({}) if values is None else values,
         t=t,
         step_index=step_index,
         time_s=time_s,
         cmd=cmd,
         reset_state={} if reset_state is None else reset_state,
-        num_envs=num_envs,
-        device=target,
     )
 
 
@@ -76,20 +77,19 @@ def make_bundle(
     device: str | torch.device = "cpu",
     terminations: Mapping[int, object] | None = None,
 ) -> dict[str, object]:
-    """Build a real runner-shaped bundle for an engine tick."""
+    """Build a real runner-shaped bundle carrying one step context."""
     target = torch.device(device)
-    if view is None:
-        view = make_view(num_envs, device=target)
-    if step_index is None:
-        step_index = torch.zeros(num_envs, dtype=torch.int64, device=target)
-    bundle: dict[str, object] = {
-        "t": t,
-        "step_index": step_index,
-        "time_s": time_s,
-        "cmd": cmd,
-        "reset_state": {} if reset_state is None else reset_state,
-        "view": view,
-    }
+    context = make_context(
+        num_envs=num_envs,
+        t=t,
+        cmd=cmd,
+        view=view,
+        reset_state=reset_state,
+        step_index=step_index,
+        time_s=time_s,
+        device=target,
+    )
+    bundle: dict[str, object] = {"step": context}
     if terminations is not None:
         bundle["terminations"] = terminations
     return bundle
@@ -132,12 +132,12 @@ class ScriptedMonitor(BaseMonitor):
         self.episode_ends: list[tuple[int, ...]] = []
         self.resets: list[tuple[int, ...]] = []
 
-    def on_tick(self, frame: TickFrame) -> None:
-        step = self._script.get(frame.t)
+    def on_tick(self, context: EnvStepContext) -> None:
+        step = self._script.get(context.t)
         if step is None:
             self._signals = {}
             return
-        self._signals = {name: value.to(frame.device) for name, value in step.signals.items()}
+        self._signals = {name: value.to(context.device) for name, value in step.signals.items()}
         self._events = list(step.events)
         self._terminals = dict(step.terminals)
 
@@ -163,53 +163,53 @@ class ScriptedMonitor(BaseMonitor):
 
 def constant_probe(
     values: Sequence[float], *, dtype: torch.dtype = torch.float32
-) -> Callable[[TickFrame], torch.Tensor]:
+) -> Callable[[EnvStepContext], torch.Tensor]:
     """Return a probe that always reports the same per-env row."""
     row = [float(value) for value in values]
 
-    def probe(frame: TickFrame) -> torch.Tensor:
-        return torch.tensor(row, dtype=dtype, device=frame.device)
+    def probe(context: EnvStepContext) -> torch.Tensor:
+        return torch.tensor(row, dtype=dtype, device=context.device)
 
     return probe
 
 
-def bool_probe(values: Sequence[bool]) -> Callable[[TickFrame], torch.Tensor]:
+def bool_probe(values: Sequence[bool]) -> Callable[[EnvStepContext], torch.Tensor]:
     """Return a boolean probe that always reports the same per-env row."""
     row = [bool(value) for value in values]
 
-    def probe(frame: TickFrame) -> torch.Tensor:
-        return torch.tensor(row, dtype=torch.bool, device=frame.device)
+    def probe(context: EnvStepContext) -> torch.Tensor:
+        return torch.tensor(row, dtype=torch.bool, device=context.device)
 
     return probe
 
 
 def series_probe(
     rows: Sequence[Sequence[float]], *, dtype: torch.dtype = torch.float32
-) -> Callable[[TickFrame], torch.Tensor]:
+) -> Callable[[EnvStepContext], torch.Tensor]:
     """Return a probe that advances one row per call."""
     remaining = [[float(value) for value in row] for row in rows]
     state = {"index": 0}
 
-    def probe(frame: TickFrame) -> torch.Tensor:
+    def probe(context: EnvStepContext) -> torch.Tensor:
         index = state["index"]
         if index >= len(remaining):
             raise AssertionError(f"series probe exhausted after {len(remaining)} calls")
         state["index"] = index + 1
-        return torch.tensor(remaining[index], dtype=dtype, device=frame.device)
+        return torch.tensor(remaining[index], dtype=dtype, device=context.device)
 
     return probe
 
 
 def table_probe(
     rows: Sequence[Sequence[float]], *, dtype: torch.dtype = torch.float32
-) -> Callable[[TickFrame], torch.Tensor]:
-    """Return a probe that selects a row by the frame's policy tick."""
+) -> Callable[[EnvStepContext], torch.Tensor]:
+    """Return a probe that selects a row by the context's policy tick."""
     table = [[float(value) for value in row] for row in rows]
 
-    def probe(frame: TickFrame) -> torch.Tensor:
-        if frame.t >= len(table):
-            raise AssertionError(f"table probe has no row for tick {frame.t}")
-        return torch.tensor(table[frame.t], dtype=dtype, device=frame.device)
+    def probe(context: EnvStepContext) -> torch.Tensor:
+        if context.t >= len(table):
+            raise AssertionError(f"table probe has no row for tick {context.t}")
+        return torch.tensor(table[context.t], dtype=dtype, device=context.device)
 
     return probe
 
@@ -238,7 +238,7 @@ _SINK_CONTEXT_CFG: dict[str, JsonValue] = {
 def make_sink_context(
     *,
     options: Mapping[str, JsonValue] | None = None,
-    signals: SignalPublisher | None = None,
+    signals: object | None = None,
     auto_reset: bool | None = None,
 ) -> SinkContext:
     """Build a real SinkContext over a real, backend-free RunSpec."""
@@ -283,7 +283,7 @@ class IntegrationProbeMonitor(BaseMonitor):
         super().__init__(name)
         self.ticks = 0
 
-    def on_tick(self, frame: TickFrame) -> None:
+    def on_tick(self, context: EnvStepContext) -> None:
         """Count one observed policy tick."""
         self.ticks += 1
 

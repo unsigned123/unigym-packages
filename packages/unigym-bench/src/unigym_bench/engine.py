@@ -1,8 +1,8 @@
 """Per-run streaming engine for the external benchmark pack.
 
-The engine is the pack's only state owner for a run.  It receives the runner
-bundle once per tick, builds a :class:`~unigym_bench.frames.TickFrame`, drives
-the task monitors in declaration order and owns the consequences:
+The engine is the pack's only state owner for a run.  It reads the core step
+context from the runner bundle once per tick, drives the task monitors in
+declaration order and owns the consequences:
 
 - per-env open flags and the first-terminal latch;
 - a run-scoped event journal with an explicit retention cap and dropped count;
@@ -11,7 +11,8 @@ the task monitors in declaration order and owns the consequences:
   :class:`~unigym_bench.events.EpisodeRecord` values, including the
   JSON-safe start command and reset facts captured on the episode's first tick.
 
-The engine never keeps an ``EnvView``, a frame, a tensor or a backend handle.
+The engine never keeps an ``EnvView``, a step context, a tensor or a backend
+handle.
 Signals are validated and published one tick at a time; they are not stored.
 
 Lifecycle (delegated by the sink in the next card)::
@@ -52,7 +53,9 @@ from unigym.core.episode_termination import (
     TerminationSource,
     validate_code,
 )
+from unigym.evaluation import EnvStepContext
 
+from .context import BenchmarkStepContext
 from .events import (
     VERDICTS,
     EpisodeRecord,
@@ -61,7 +64,6 @@ from .events import (
     Event,
     termination_from_json,
 )
-from .frames import TickFrame
 from .json import JsonValue, ensure_json_value
 from .monitors import Monitor
 from .report import ReportExtension, validate_report_extensions
@@ -478,22 +480,23 @@ class StreamingEngine:
         """Consume one pre-reset engine step.
 
         Args:
-            bundle: The core runner bundle.  ``view``, ``t``, ``step_index``,
-                ``time_s``, ``cmd`` and ``reset_state`` are read into a borrowed
-                :class:`~unigym_bench.frames.TickFrame`.
+            bundle: The core runner bundle.  Only its ``step`` entry is read;
+                it is a :class:`~unigym.evaluation.EnvStepContext`, optionally
+                already specialized as a
+                :class:`~unigym_bench.context.BenchmarkStepContext`.
 
         Raises:
-            EngineStateError: The run has ended or a monitor requested a
-                terminal for a closed environment.
-            TypeError: A bundle field, monitor output or signal violates the
-                contract.
+            EngineStateError: The run has ended, ``bundle["step"]`` is missing,
+                or a monitor requested a terminal for a closed environment.
+            TypeError: ``bundle["step"]`` has the wrong type, or a monitor
+                output or signal violates the contract.
             ValueError: A shape, device, source or code is invalid.
         """
         self._require_running()
         if not isinstance(bundle, Mapping):
             raise TypeError(f"engine bundle: expected a mapping, got {type(bundle).__name__}")
-        frame = self._build_frame(bundle)
-        self._bind(frame)
+        context = self._build_context(bundle)
+        self._bind(context)
 
         num_envs = self._require_bound()
         for env_id in range(num_envs):
@@ -501,10 +504,10 @@ class StreamingEngine:
                 self._episode_ticks[env_id] += 1
         for env_id in range(num_envs):
             if self._open[env_id] and self._episode_ticks[env_id] == 1:
-                self._capture_episode_start(env_id, frame)
+                self._capture_episode_start(env_id, context)
 
         for monitor in self._monitors:
-            monitor.on_tick(frame)
+            monitor.on_tick(context)
 
         collected: list[
             tuple[Monitor, dict[str, Tensor], tuple[Event, ...], dict[int, Termination]]
@@ -513,7 +516,7 @@ class StreamingEngine:
             collected.append(
                 (
                     monitor,
-                    self._collect_signals(monitor, frame),
+                    self._collect_signals(monitor, context),
                     self._collect_events(monitor),
                     self._collect_terminals(monitor, num_envs),
                 )
@@ -963,65 +966,56 @@ class StreamingEngine:
         self._episode_counts_by_env = decoded.episode_counts_by_env
 
     # ------------------------------------------------------------------ #
-    # Frame and output validation
+    # Step context and output validation
     # ------------------------------------------------------------------ #
-    def _build_frame(self, bundle: Mapping[str, object]) -> TickFrame:
-        """Build the borrowed tick frame from the runner bundle."""
-        view = bundle.get("view")
-        if view is None:
-            raise TypeError("engine bundle.view: expected an EnvView, got None")
-        num_envs = getattr(view, "num_envs", None)
-        if isinstance(num_envs, bool) or not isinstance(num_envs, int) or num_envs <= 0:
-            raise TypeError(
-                "engine bundle.view.num_envs: expected a positive int, " f"got {num_envs!r}"
-            )
-        raw_device = getattr(view, "device", None)
-        if raw_device is None:
-            raise TypeError("engine bundle.view.device: expected a torch device, got None")
-        try:
-            device = torch.device(raw_device)
-        except (TypeError, RuntimeError) as exc:
-            raise TypeError(
-                f"engine bundle.view.device: expected a torch device, got {raw_device!r}"
-            ) from exc
-        for key in ("t", "step_index"):
-            if key not in bundle:
-                raise TypeError(f"engine bundle.{key}: required field is missing")
-        return TickFrame(
-            view=view,
-            t=bundle["t"],
-            step_index=bundle["step_index"],
-            time_s=bundle.get("time_s"),
-            cmd=bundle.get("cmd"),
-            reset_state=bundle.get("reset_state", {}),
-            num_envs=num_envs,
-            device=device,
-        )
+    def _build_context(self, bundle: Mapping[str, object]) -> BenchmarkStepContext:
+        """Return the pack step context from the runner bundle.
 
-    def _bind(self, frame: TickFrame) -> None:
+        Only ``bundle["step"]`` is read.  The core already validated the step
+        shape, so this method never re-validates tensors or reads the retired
+        ``view`` and ``t`` bundle entries.
+        """
+        step = bundle.get("step")
+        if step is None:
+            raise EngineStateError(
+                "engine bundle.step: expected an EnvStepContext under key 'step', "
+                "but the key is missing or None"
+            )
+        if isinstance(step, BenchmarkStepContext):
+            return step
+        if not isinstance(step, EnvStepContext):
+            raise TypeError(
+                "engine bundle.step: expected an EnvStepContext, "
+                f"got {type(step).__name__}"
+            )
+        return BenchmarkStepContext.from_env_step(step)
+
+    def _bind(self, context: BenchmarkStepContext) -> None:
         """Bind the run shape on the first tick and reject later changes."""
         if not self._bound:
-            self._num_envs = frame.num_envs
-            self._device = frame.device
-            self._open = [True] * frame.num_envs
-            self._rewound = [False] * frame.num_envs
-            self._episode_seq = [0] * frame.num_envs
-            self._episode_ticks = [0] * frame.num_envs
-            self._episode_events = [{} for _ in range(frame.num_envs)]
-            self._episode_command = [None] * frame.num_envs
-            self._episode_reset = [{} for _ in range(frame.num_envs)]
-            self._episode_counts_by_env = [0] * frame.num_envs
+            self._num_envs = context.num_envs
+            self._device = context.device
+            self._open = [True] * context.num_envs
+            self._rewound = [False] * context.num_envs
+            self._episode_seq = [0] * context.num_envs
+            self._episode_ticks = [0] * context.num_envs
+            self._episode_events = [{} for _ in range(context.num_envs)]
+            self._episode_command = [None] * context.num_envs
+            self._episode_reset = [{} for _ in range(context.num_envs)]
+            self._episode_counts_by_env = [0] * context.num_envs
             self._bound = True
             return
-        if frame.num_envs != self._num_envs:
-            raise ValueError(f"engine: num_envs changed from {self._num_envs} to {frame.num_envs}")
-        if frame.device != self._device:
-            raise ValueError(f"engine: device changed from {self._device} to {frame.device}")
+        if context.num_envs != self._num_envs:
+            raise ValueError(
+                f"engine: num_envs changed from {self._num_envs} to {context.num_envs}"
+            )
+        if context.device != self._device:
+            raise ValueError(f"engine: device changed from {self._device} to {context.device}")
 
-    def _capture_episode_start(self, env_id: int, frame: TickFrame) -> None:
+    def _capture_episode_start(self, env_id: int, context: BenchmarkStepContext) -> None:
         """Record the JSON-safe command and reset facts of a new episode."""
-        self._episode_reset[env_id] = dict(frame.reset_state.get(env_id, {}))
-        cmd = frame.cmd
+        self._episode_reset[env_id] = dict(context.reset_state.get(env_id, {}))
+        cmd = context.cmd
         if cmd is None:
             self._episode_command[env_id] = None
             return
@@ -1070,7 +1064,9 @@ class StreamingEngine:
             return None
         return EpisodeTermination.from_terminations(core_terms)
 
-    def _collect_signals(self, monitor: Monitor, frame: TickFrame) -> dict[str, Tensor]:
+    def _collect_signals(
+        self, monitor: Monitor, context: BenchmarkStepContext
+    ) -> dict[str, Tensor]:
         """Validate one monitor's fresh per-env level tensors."""
         signals = monitor.signals()
         if not isinstance(signals, Mapping):
@@ -1095,15 +1091,15 @@ class StreamingEngine:
                     f"monitor {monitor.name!r}.signals[{local_name!r}]: expected a "
                     f"tensor, got {type(value).__name__}"
                 )
-            if value.ndim < 1 or value.shape[0] != frame.num_envs:
+            if value.ndim < 1 or value.shape[0] != context.num_envs:
                 raise ValueError(
                     f"monitor {monitor.name!r}.signals[{local_name!r}]: expected leading "
-                    f"dimension num_envs={frame.num_envs}, got shape {tuple(value.shape)}"
+                    f"dimension num_envs={context.num_envs}, got shape {tuple(value.shape)}"
                 )
-            if value.device != frame.device:
+            if value.device != context.device:
                 raise ValueError(
                     f"monitor {monitor.name!r}.signals[{local_name!r}]: device "
-                    f"{value.device} does not match frame device {frame.device}"
+                    f"{value.device} does not match context device {context.device}"
                 )
             checked[local_name] = value
         return checked

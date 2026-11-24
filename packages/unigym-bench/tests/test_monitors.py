@@ -19,8 +19,7 @@ import unigym_bench
 from _support import (
     bool_probe,
     constant_probe,
-    make_frame,
-    make_view,
+    make_context,
     series_probe,
     table_probe,
 )
@@ -30,8 +29,8 @@ from unigym.core.episode_termination import (
     TerminationExtension,
     TerminationSource,
 )
+from unigym.evaluation import EnvStepContext
 from unigym_bench.events import Event
-from unigym_bench.frames import TickFrame
 from unigym_bench.json import ensure_json_value
 from unigym_bench.monitors import (
     BaseMonitor,
@@ -46,7 +45,7 @@ from unigym_bench.monitors import (
 )
 
 
-def _assert_roundtrip(monitor: object, clone: object, frames: Sequence[TickFrame]) -> None:
+def _assert_roundtrip(monitor: object, clone: object, frames: Sequence[EnvStepContext]) -> None:
     for frame in frames:
         monitor.on_tick(frame)
     snapshot = monitor.snapshot()
@@ -72,7 +71,7 @@ def test_base_monitor_defaults() -> None:
     assert tuple(monitor.drain_events()) == ()
     assert dict(monitor.drain_terminals()) == {}
 
-    frame = make_frame()
+    frame = make_context()
     monitor.on_tick(frame)
     monitor.on_episode_end((0,))
     monitor.reset([0])
@@ -118,10 +117,10 @@ def test_threshold_emits_once_per_rising_edge() -> None:
     levels = [[0.0, 0.0], [1.0, 0.0], [1.0, 0.0], [0.0, 1.0]]
     monitor = ThresholdMonitor("contact", table_probe(levels), threshold=0.5)
 
-    monitor.on_tick(make_frame(t=0))
+    monitor.on_tick(make_context(t=0))
     assert tuple(monitor.drain_events()) == ()
 
-    monitor.on_tick(make_frame(t=1))
+    monitor.on_tick(make_context(t=1))
     events = monitor.drain_events()
     assert len(events) == 1
     event = events[0]
@@ -131,10 +130,10 @@ def test_threshold_emits_once_per_rising_edge() -> None:
     assert event.severity == "info"
     assert event.data["value"] == 1.0
 
-    monitor.on_tick(make_frame(t=2))
+    monitor.on_tick(make_context(t=2))
     assert tuple(monitor.drain_events()) == ()
 
-    monitor.on_tick(make_frame(t=3))
+    monitor.on_tick(make_context(t=3))
     events = monitor.drain_events()
     assert [event.env_ids for event in events] == [(1,)]
 
@@ -158,7 +157,7 @@ def test_threshold_terminal_is_custom_and_one_shot() -> None:
         terminal_outcome="failure",
     )
 
-    monitor.on_tick(make_frame(num_envs=1))
+    monitor.on_tick(make_context(num_envs=1))
     terminals = monitor.drain_terminals()
     assert set(terminals) == {0}
     terminal = terminals[0]
@@ -170,7 +169,7 @@ def test_threshold_terminal_is_custom_and_one_shot() -> None:
     assert terminal.time_s is None
     assert terminal.metrics["value"] == 1.0
 
-    monitor.on_tick(make_frame(num_envs=1, t=1))
+    monitor.on_tick(make_context(num_envs=1, t=1))
     assert dict(monitor.drain_terminals()) == {}
 
 
@@ -182,12 +181,12 @@ def test_threshold_reset_clears_edge_state() -> None:
         terminal_outcome="success",
     )
 
-    monitor.on_tick(make_frame(num_envs=1))
+    monitor.on_tick(make_context(num_envs=1))
     assert len(monitor.drain_events()) == 1
     assert len(monitor.drain_terminals()) == 1
 
     monitor.reset([0])
-    monitor.on_tick(make_frame(num_envs=1, t=1))
+    monitor.on_tick(make_context(num_envs=1, t=1))
     assert len(monitor.drain_events()) == 1
     assert len(monitor.drain_terminals()) == 1
 
@@ -206,12 +205,12 @@ def test_threshold_reset_clears_edge_state() -> None:
     ],
 )
 def test_float_probe_validates_type_shape_and_device(
-    probe: Callable[[TickFrame], object], error: type[BaseException]
+    probe: Callable[[EnvStepContext], object], error: type[BaseException]
 ) -> None:
     monitor = ThresholdMonitor("probe_check", probe, threshold=0.0)
 
     with pytest.raises(error):
-        monitor.on_tick(make_frame(num_envs=2))
+        monitor.on_tick(make_context(num_envs=2))
 
 
 def test_probe_and_operator_validation() -> None:
@@ -234,10 +233,10 @@ def test_probe_and_operator_validation() -> None:
 
 def test_monitor_rejects_changed_num_envs() -> None:
     monitor = ThresholdMonitor("stable", constant_probe([0.0, 0.0]), threshold=0.0)
-    monitor.on_tick(make_frame(num_envs=2))
+    monitor.on_tick(make_context(num_envs=2))
 
     with pytest.raises(ValueError, match="num_envs changed"):
-        monitor.on_tick(make_frame(num_envs=1))
+        monitor.on_tick(make_context(num_envs=1))
 
 
 def test_hold_requires_consecutive_ticks() -> None:
@@ -246,7 +245,7 @@ def test_hold_requires_consecutive_ticks() -> None:
     event_counts = []
     streaks = []
     for t in range(len(rows)):
-        monitor.on_tick(make_frame(num_envs=1, t=t))
+        monitor.on_tick(make_context(num_envs=1, t=t))
         event_counts.append(len(monitor.drain_events()))
         streaks.append(int(monitor.signals()["streak"][0]))
 
@@ -268,16 +267,16 @@ def test_hold_rearms_after_reset() -> None:
         terminal_outcome="success",
     )
 
-    monitor.on_tick(make_frame(num_envs=1))
+    monitor.on_tick(make_context(num_envs=1))
     assert len(monitor.drain_events()) == 0
-    monitor.on_tick(make_frame(num_envs=1, t=1))
+    monitor.on_tick(make_context(num_envs=1, t=1))
     assert len(monitor.drain_events()) == 1
     assert len(monitor.drain_terminals()) == 1
 
     monitor.reset([0])
-    monitor.on_tick(make_frame(num_envs=1, t=2))
+    monitor.on_tick(make_context(num_envs=1, t=2))
     assert len(monitor.drain_events()) == 0
-    monitor.on_tick(make_frame(num_envs=1, t=3))
+    monitor.on_tick(make_context(num_envs=1, t=3))
     assert len(monitor.drain_events()) == 1
     assert len(monitor.drain_terminals()) == 1
 
@@ -291,14 +290,14 @@ def test_hold_validates_hold_steps() -> None:
 def test_event_counter_counts_rising_edges_and_is_report_only() -> None:
     state = {"row": [False, False]}
 
-    def probe(frame: TickFrame) -> torch.Tensor:
+    def probe(frame: EnvStepContext) -> torch.Tensor:
         return torch.tensor(state["row"], dtype=torch.bool, device=frame.device)
 
     monitor = EventCounterMonitor("occurrences", probe, severity="warning")
 
     def tick(row: list[bool], t: int) -> None:
         state["row"] = row
-        monitor.on_tick(make_frame(t=t))
+        monitor.on_tick(make_context(t=t))
 
     tick([False, False], 0)
     tick([True, True], 1)
@@ -334,7 +333,7 @@ def test_phase_tracks_transitions_and_initializes_silently() -> None:
     events_per_tick = []
     phases = []
     for t in range(len(values)):
-        monitor.on_tick(make_frame(num_envs=1, t=t))
+        monitor.on_tick(make_context(num_envs=1, t=t))
         events_per_tick.append(len(monitor.drain_events()))
         phases.append(int(monitor.signals()["phase"][0]))
 
@@ -348,7 +347,7 @@ def test_phase_tracks_transitions_and_initializes_silently() -> None:
     assert report["phase_ticks"] == {"0": 2, "1": 2, "2": 1}
 
     monitor.reset([0])
-    monitor.on_tick(make_frame(num_envs=1, t=0))
+    monitor.on_tick(make_context(num_envs=1, t=0))
     assert tuple(monitor.drain_events()) == ()
 
 
@@ -359,7 +358,7 @@ def test_phase_names_and_snapshot() -> None:
         boundaries=[0.0, 1.0],
         phase_names=["low", "mid", "high"],
     )
-    monitor.on_tick(make_frame(num_envs=1))
+    monitor.on_tick(make_context(num_envs=1))
     monitor.on_episode_end((0,))
 
     report = monitor.report_view()
@@ -406,7 +405,7 @@ def test_safety_emits_severity_and_counts_violations() -> None:
     events_per_tick = []
     terminals_per_tick = []
     for t in range(len(values)):
-        monitor.on_tick(make_frame(num_envs=1, t=t))
+        monitor.on_tick(make_context(num_envs=1, t=t))
         events = monitor.drain_events()
         events_per_tick.append(len(events))
         if events:
@@ -431,7 +430,7 @@ def test_scenario_coverage_tracks_start_commands() -> None:
     monitor = ScenarioCoverageMonitor("coverage", commands=[[0.0, 0.0], [1.0, 1.0]])
 
     commands = torch.tensor([[0.0, 0.0], [1.0, 1.0]])
-    monitor.on_tick(make_frame(num_envs=2, cmd=commands))
+    monitor.on_tick(make_context(num_envs=2, cmd=commands))
     assert dict(monitor.signals()) == {}
     monitor.on_episode_end((0, 1))
 
@@ -445,7 +444,7 @@ def test_scenario_coverage_tracks_start_commands() -> None:
 
     monitor.reset([0, 1])
     next_commands = torch.tensor([[0.0, 0.0], [2.0, 2.0]])
-    monitor.on_tick(make_frame(num_envs=2, t=1, cmd=next_commands))
+    monitor.on_tick(make_context(num_envs=2, t=1, cmd=next_commands))
     monitor.on_episode_end((0, 1))
 
     report = monitor.report_view()
@@ -497,25 +496,24 @@ def test_scenario_coverage_validates_observed_command(
 ) -> None:
     monitor = ScenarioCoverageMonitor("coverage", commands=[[0.0, 0.0], [1.0, 1.0]])
     with pytest.raises(error):
-        monitor.on_tick(make_frame(num_envs=2, cmd=cmd))
+        monitor.on_tick(make_context(num_envs=2, cmd=cmd))
 
 
-def test_frame_is_not_retained() -> None:
-    view = make_view(1)
-    frame = make_frame(num_envs=1, view=view)
+def test_step_context_is_not_retained() -> None:
+    step_index = torch.zeros(1, dtype=torch.int64)
+    context = make_context(num_envs=1, step_index=step_index)
     monitor = ThresholdMonitor("no_retain", constant_probe([1.0]), threshold=0.5)
 
-    monitor.on_tick(frame)
-    frame_ref = weakref.ref(frame)
-    del frame
-    del view
+    monitor.on_tick(context)
+    tensor_ref = weakref.ref(step_index)
+    del context, step_index
     gc.collect()
 
-    assert frame_ref() is None
+    assert tensor_ref() is None
 
 
 def test_threshold_snapshot_restore_roundtrip() -> None:
-    frames = [make_frame(num_envs=1)]
+    frames = [make_context(num_envs=1)]
     original = ThresholdMonitor(
         "threshold_rt", constant_probe([1.0]), threshold=0.5, terminal_outcome="failure"
     )
@@ -527,7 +525,7 @@ def test_threshold_snapshot_restore_roundtrip() -> None:
 
 
 def test_hold_snapshot_restore_roundtrip() -> None:
-    frames = [make_frame(num_envs=1)]
+    frames = [make_context(num_envs=1)]
     original = HoldMonitor(
         "hold_rt", constant_probe([1.0]), threshold=0.5, hold_steps=1, terminal_outcome="success"
     )
@@ -539,7 +537,7 @@ def test_hold_snapshot_restore_roundtrip() -> None:
 
 
 def test_event_counter_snapshot_restore_roundtrip() -> None:
-    frames = [make_frame(num_envs=1)]
+    frames = [make_context(num_envs=1)]
     original = EventCounterMonitor("counter_rt", bool_probe([True]))
     clone = EventCounterMonitor("counter_rt", bool_probe([True]))
 
@@ -548,7 +546,7 @@ def test_event_counter_snapshot_restore_roundtrip() -> None:
 
 def test_phase_snapshot_restore_roundtrip() -> None:
     levels = [0.0, 2.0]
-    frames = [make_frame(num_envs=1, t=0), make_frame(num_envs=1, t=1)]
+    frames = [make_context(num_envs=1, t=0), make_context(num_envs=1, t=1)]
     probe = table_probe([[level] for level in levels])
     original = PhaseMonitor("phase_rt", probe, boundaries=[0.0, 1.0])
     clone = PhaseMonitor("phase_rt", probe, boundaries=[0.0, 1.0])
@@ -557,7 +555,7 @@ def test_phase_snapshot_restore_roundtrip() -> None:
 
 
 def test_safety_snapshot_restore_roundtrip() -> None:
-    frames = [make_frame(num_envs=1)]
+    frames = [make_context(num_envs=1)]
     original = SafetyMonitor(
         "safety_rt", constant_probe([1.0]), threshold=0.5, terminal_outcome="failure"
     )
@@ -573,7 +571,7 @@ def test_scenario_coverage_snapshot_restore_roundtrip() -> None:
     probe_commands = ScenarioCoverageMonitor("coverage_rt", commands=[[0.0], [1.0]])
     clone = ScenarioCoverageMonitor("coverage_rt", commands=[[0.0], [1.0]])
 
-    probe_commands.on_tick(make_frame(num_envs=2, cmd=commands))
+    probe_commands.on_tick(make_context(num_envs=2, cmd=commands))
     snapshot = probe_commands.snapshot()
     clone.restore(snapshot)
     assert clone.snapshot() == snapshot
@@ -587,7 +585,7 @@ def test_snapshot_and_restore_use_private_copies() -> None:
     monitor = ThresholdMonitor(
         "copies", constant_probe([1.0]), threshold=0.5, terminal_outcome="failure"
     )
-    monitor.on_tick(make_frame(num_envs=1))
+    monitor.on_tick(make_context(num_envs=1))
 
     snapshot = monitor.snapshot()
     baseline = monitor.snapshot()
@@ -620,7 +618,7 @@ def test_snapshot_before_first_tick_roundtrips() -> None:
 
 def test_restore_rejects_mismatched_snapshots() -> None:
     monitor = ThresholdMonitor("strict", constant_probe([0.0]), threshold=0.0)
-    monitor.on_tick(make_frame(num_envs=1))
+    monitor.on_tick(make_context(num_envs=1))
     snapshot = monitor.snapshot()
 
     wrong_name = ensure_json_value(snapshot)
@@ -646,10 +644,10 @@ def test_restore_rejects_mismatched_snapshots() -> None:
 
 def test_restore_rejects_num_envs_mismatch() -> None:
     source = ThresholdMonitor("strict", constant_probe([0.0, 0.0]), threshold=0.0)
-    source.on_tick(make_frame(num_envs=2))
+    source.on_tick(make_context(num_envs=2))
 
     target = ThresholdMonitor("strict", constant_probe([0.0]), threshold=0.0)
-    target.on_tick(make_frame(num_envs=1))
+    target.on_tick(make_context(num_envs=1))
 
     with pytest.raises(ValueError, match="num_envs"):
         target.restore(source.snapshot())
@@ -657,7 +655,7 @@ def test_restore_rejects_num_envs_mismatch() -> None:
 
 def test_restore_rejects_different_threshold_config() -> None:
     source = ThresholdMonitor("cfg", constant_probe([0.0]), threshold=0.5)
-    source.on_tick(make_frame(num_envs=1))
+    source.on_tick(make_context(num_envs=1))
     clone = ThresholdMonitor("cfg", constant_probe([0.0]), threshold=0.75)
 
     with pytest.raises(ValueError, match="config"):
@@ -668,7 +666,7 @@ def test_restore_rejects_different_terminal_config() -> None:
     source = ThresholdMonitor(
         "cfg", constant_probe([0.0]), threshold=0.5, terminal_outcome="failure"
     )
-    source.on_tick(make_frame(num_envs=1))
+    source.on_tick(make_context(num_envs=1))
     clone = ThresholdMonitor("cfg", constant_probe([0.0]), threshold=0.5)
 
     with pytest.raises(ValueError, match="config"):
@@ -678,7 +676,7 @@ def test_restore_rejects_different_terminal_config() -> None:
 def test_restore_rejects_different_coverage_pool() -> None:
     commands = torch.tensor([[0.0], [1.0]])
     source = ScenarioCoverageMonitor("cfg", commands=[[0.0], [1.0]])
-    source.on_tick(make_frame(num_envs=2, cmd=commands))
+    source.on_tick(make_context(num_envs=2, cmd=commands))
     clone = ScenarioCoverageMonitor("cfg", commands=[[0.0], [2.0]])
 
     with pytest.raises(ValueError, match="config"):
@@ -688,11 +686,11 @@ def test_restore_rejects_different_coverage_pool() -> None:
 def test_failed_restore_leaves_monitor_unchanged_and_usable() -> None:
     row = {"value": [0.0]}
 
-    def probe(frame: TickFrame) -> torch.Tensor:
+    def probe(frame: EnvStepContext) -> torch.Tensor:
         return torch.tensor(row["value"], dtype=torch.float32, device=frame.device)
 
     monitor = ThresholdMonitor("atomic", probe, threshold=0.5)
-    monitor.on_tick(make_frame(num_envs=1))
+    monitor.on_tick(make_context(num_envs=1))
     before = monitor.snapshot()
 
     bad = ensure_json_value(before)
@@ -711,15 +709,15 @@ def test_failed_restore_leaves_monitor_unchanged_and_usable() -> None:
     assert fresh_snapshot["device"] is None
 
     row["value"] = [1.0]
-    monitor.on_tick(make_frame(num_envs=1, t=1))
+    monitor.on_tick(make_context(num_envs=1, t=1))
     assert len(monitor.drain_events()) == 1
-    fresh.on_tick(make_frame(num_envs=1, t=1))
+    fresh.on_tick(make_context(num_envs=1, t=1))
     assert len(fresh.drain_events()) == 1
 
 
 def test_on_episode_end_validates_env_ids() -> None:
     monitor = ThresholdMonitor("episode", constant_probe([0.0]), threshold=0.0)
-    monitor.on_tick(make_frame(num_envs=1))
+    monitor.on_tick(make_context(num_envs=1))
 
     with pytest.raises(ValueError):
         monitor.on_episode_end((1,))
@@ -733,7 +731,7 @@ def test_restore_rejects_out_of_range_pending_drains() -> None:
     source = ThresholdMonitor(
         "bounds", constant_probe([1.0]), threshold=0.0, terminal_outcome="failure"
     )
-    source.on_tick(make_frame(num_envs=1))
+    source.on_tick(make_context(num_envs=1))
     snapshot = source.snapshot()
 
     bad_terminal = ensure_json_value(snapshot)
@@ -762,7 +760,7 @@ def test_restore_rejects_out_of_range_pending_drains() -> None:
 
 def test_terminal_snapshot_roundtrips_negative_priority_and_extensions() -> None:
     monitor = ThresholdMonitor("term_rt", constant_probe([0.0]), threshold=1.0)
-    monitor.on_tick(make_frame(num_envs=1))
+    monitor.on_tick(make_context(num_envs=1))
     termination = Termination(
         outcome=EpisodeOutcome.FAILURE,
         code="custom.term_rt.external",
@@ -813,23 +811,6 @@ def test_event_validation_and_json_roundtrip() -> None:
         Event(name="bad", code="task.bad", env_ids=(0, 0))
     with pytest.raises(TypeError):
         Event(name="bad", code="task.bad", env_ids=(True,))
-
-
-def test_tick_frame_validates_tensor_contracts() -> None:
-    with pytest.raises(TypeError):
-        make_frame(num_envs=2, step_index=torch.zeros(2))
-    with pytest.raises(ValueError):
-        make_frame(num_envs=2, step_index=torch.zeros(3, dtype=torch.int64))
-    with pytest.raises(TypeError):
-        make_frame(num_envs=2, time_s=torch.zeros(2, dtype=torch.int64))
-    with pytest.raises(ValueError):
-        make_frame(num_envs=2, cmd=torch.zeros(3, 1))
-    with pytest.raises(ValueError):
-        make_frame(num_envs=2, reset_state={2: {"a": 1}})
-    with pytest.raises(TypeError):
-        make_frame(num_envs=2, reset_state={True: {"a": 1}})
-    with pytest.raises(TypeError):
-        make_frame(num_envs=2, reset_state={0: {"tensor": torch.zeros(1)}})
 
 
 _FENCE_SCRIPT = """
