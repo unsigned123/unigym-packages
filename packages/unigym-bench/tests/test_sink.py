@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 import torch
@@ -15,13 +16,15 @@ from unigym.core.episode_termination import (
 from unigym.errors import ConfigError
 from unigym.signals import SignalBus
 
+import unigym_bench.sink as sink_module
 from unigym_bench.engine import StreamingEngine
 from unigym_bench.events import Event, EpisodeRecord
 from unigym_bench.json import ensure_json_value
-from unigym_bench.report import REPORT_SCHEMA
+from unigym_bench.report import REPORT_FILENAME, REPORT_SCHEMA, RunMetadata
 from unigym_bench.sink import BenchmarkSink, make_sink
 from unigym_bench.specs import RetentionSpec
 from _support import (
+    CountingReportExtension,
     ScriptedMonitor,
     TickScript,
     make_bundle,
@@ -72,6 +75,72 @@ def test_make_sink_rejects_unknown_keys_and_loop_modes() -> None:
         make_sink(make_sink_context(options={"typo": 1}))
     with pytest.raises(ConfigError, match="loop_mode"):
         make_sink(make_sink_context(options={"loop_mode": "closed"}))
+
+
+def test_make_sink_write_report_is_opt_in_and_typed() -> None:
+    sink = make_sink(make_sink_context(options={"write_report": True}))
+
+    assert sink.report_path is not None
+    assert str(sink.report_path) == f"data_out/sink-context/{REPORT_FILENAME}"
+    with pytest.raises(ConfigError, match="write_report"):
+        make_sink(make_sink_context(options={"write_report": 1}))
+
+
+def test_benchmark_sink_write_report_requires_construction_out_dir() -> None:
+    with pytest.raises(ConfigError, match="write_report"):
+        BenchmarkSink([], write_report=True)
+
+
+def test_write_report_defaults_off_and_true_writes(tmp_path) -> None:
+    out_dir = tmp_path / "nested" / "run"
+    metadata = RunMetadata(out_dir=str(out_dir))
+
+    off = BenchmarkSink([], metadata=metadata)
+    assert off.report_path is None
+    off_report = off.on_run_end()["BenchmarkSink"]
+    assert not out_dir.exists()
+
+    on = BenchmarkSink([], metadata=metadata, write_report=True)
+    assert on.report_path == out_dir / REPORT_FILENAME
+    on_report = on.on_run_end()["BenchmarkSink"]
+    assert on_report == off_report
+    written = json.loads((out_dir / REPORT_FILENAME).read_text(encoding="utf-8"))
+    assert written == on_report
+
+
+def test_write_failure_is_raised_and_retried_without_reassembling(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out_dir = tmp_path / "run"
+    extension = CountingReportExtension()
+    sink = BenchmarkSink(
+        [],
+        extensions=(extension,),
+        metadata=RunMetadata(out_dir=str(out_dir)),
+        write_report=True,
+    )
+    real_replace = os.replace
+    attempts = {"count": 0}
+
+    def flaky_replace(source, destination) -> None:
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise OSError("simulated write failure")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(sink_module.os, "replace", flaky_replace)
+
+    with pytest.raises(OSError, match="simulated write failure"):
+        sink.on_run_end()
+    assert extension.run_end_calls == 1
+    assert not (out_dir / REPORT_FILENAME).exists()
+    assert list(out_dir.glob(f".{REPORT_FILENAME}.*.tmp")) == []
+
+    report = sink.on_run_end()["BenchmarkSink"]
+    assert extension.run_end_calls == 1
+    assert attempts["count"] == 2
+    written = json.loads((out_dir / REPORT_FILENAME).read_text(encoding="utf-8"))
+    assert written == report
 
 
 def test_make_sink_rejects_auto_reset_false() -> None:

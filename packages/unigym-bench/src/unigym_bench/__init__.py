@@ -13,7 +13,9 @@ validated command scenario in :mod:`unigym_bench.scenario` and the
 rewind-capable scenario sampler in :mod:`unigym_bench.sampler`. P8 adds the
 closed-loop convention: a ``scenario`` monitor publishes ``scenario/*`` level
 signals through the engine, and the sampler applies a valid desired command at
-the next update.
+the next update.  P9 adds the real tiny-arm integration, bounded-retention and
+built-in fact-parity tests, plus opt-in report persistence (``write_report``)
+to the pack-owned ``external_benchmark_report.json``.
 """
 
 from __future__ import annotations

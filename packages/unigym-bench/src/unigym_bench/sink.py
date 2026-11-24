@@ -20,6 +20,11 @@ Construction seam (P4/P6 boundary)
 - ``monitor_extensions``: optional JSON object mapping a monitor name to the
   extension name it declares through ``report_extension``.  A declared monitor
   is omitted from the report's ``monitors`` fallback block.
+- ``write_report``: optional JSON boolean (default ``false``).  When true the
+  sink writes its report to :data:`unigym_bench.report.REPORT_FILENAME` under
+  the construction context's ``out_dir`` at run end.  Writing is opt-in because
+  it is a filesystem side effect; the fixed pack-owned filename never replaces
+  the core ``benchmark_report.json`` or ``results.json``.
 
 There is deliberately no YAML ``TaskDocument -> monitors/extensions``
 composition here yet: that is a later composition layer.  Tests and other
@@ -57,8 +62,12 @@ engine so open episodes are marked ``rewound``.
 from __future__ import annotations
 
 import importlib
+import json
+import os
 import re
+import tempfile
 from collections.abc import Callable, Mapping, Sequence
+from pathlib import Path
 from typing import TYPE_CHECKING, TypeAlias, cast
 
 from unigym.errors import ConfigError
@@ -67,6 +76,7 @@ from .engine import StreamingEngine
 from .json import JsonValue
 from .monitors import Monitor
 from .report import (
+    REPORT_FILENAME,
     ReportBuilder,
     ReportExtension,
     RunMetadata,
@@ -105,7 +115,13 @@ _MONITOR_FACTORY_PATH = re.compile(
 )
 
 _OPTION_KEYS = frozenset(
-    {"loop_mode", "monitor_factory", "extension_factory", "monitor_extensions"}
+    {
+        "loop_mode",
+        "monitor_factory",
+        "extension_factory",
+        "monitor_extensions",
+        "write_report",
+    }
 )
 
 _MonitorFactory: TypeAlias = Callable[[], Sequence[Monitor]]
@@ -170,6 +186,12 @@ def make_sink(ctx: SinkContext) -> BenchmarkSink:
             monitor_names=tuple(monitor.name for monitor in monitors),
             extension_names=tuple(extension.name for extension in extensions),
         )
+    raw_write_report = options.get("write_report", False)
+    if not isinstance(raw_write_report, bool):
+        raise ConfigError(
+            "unigym-bench sink write_report: expected a bool, "
+            f"got {type(raw_write_report).__name__}"
+        )
     metadata = RunMetadata(
         run_identity=ctx.run_identity,
         run_name=ctx.spec.run_name,
@@ -190,6 +212,7 @@ def make_sink(ctx: SinkContext) -> BenchmarkSink:
         extensions=extensions,
         metadata=metadata,
         monitor_extensions=monitor_extensions,
+        write_report=raw_write_report,
     )
 
 
@@ -222,10 +245,15 @@ class BenchmarkSink:
         monitor_extensions: Optional ``monitor name -> extension name`` map from
             each monitor's declared ``report_extension``.  A declared monitor is
             omitted from the report's ``monitors`` fallback block.
+        write_report: When true, write the assembled report to
+            :data:`unigym_bench.report.REPORT_FILENAME` under the metadata's
+            ``out_dir`` at run end.  Requires construction metadata with a
+            non-empty ``out_dir``.  Never writes a core artifact.
 
     Raises:
         ConfigError: ``loop_mode`` is unknown, a sink-steered sink has no
-            publisher, or ``reset_after_episode`` is false.
+            publisher, ``reset_after_episode`` is false, or ``write_report`` is
+            true without a construction ``out_dir``.
         TypeError: Both or neither of ``monitors``/``engine`` are supplied, or
             an injected engine is mixed with separately supplied resources.
         ValueError: A monitor/extension name is duplicated or a declared
@@ -244,8 +272,19 @@ class BenchmarkSink:
         extensions: Sequence[ReportExtension] | None = None,
         metadata: RunMetadata | None = None,
         monitor_extensions: Mapping[str, str] | None = None,
+        write_report: bool = False,
     ) -> None:
         _validate_loop_mode(loop_mode)
+        if not isinstance(write_report, bool):
+            raise TypeError(
+                "BenchmarkSink: write_report must be a bool, " f"got {type(write_report).__name__}"
+            )
+        if write_report and (metadata is None or not metadata.out_dir):
+            raise ConfigError(
+                "BenchmarkSink: write_report requires construction metadata with a "
+                "non-empty out_dir; build the sink through make_sink(ctx) or pass "
+                "RunMetadata(out_dir=...)"
+            )
         if not isinstance(reset_after_episode, bool):
             raise TypeError(
                 "BenchmarkSink: reset_after_episode must be a bool, "
@@ -284,6 +323,7 @@ class BenchmarkSink:
             )
         self._loop_mode = loop_mode
         self._metadata = metadata
+        self._write_report = write_report
         self._pending_reset: tuple[int, ...] = ()
         self._builder = ReportBuilder(
             monitors=self._engine.monitors,
@@ -291,6 +331,7 @@ class BenchmarkSink:
             monitor_extensions=monitor_extensions,
         )
         self._report: dict[str, JsonValue] | None = None
+        self._report_written = False
 
     @property
     def loop_mode(self) -> str:
@@ -301,6 +342,15 @@ class BenchmarkSink:
     def rewind_provider(self) -> StreamingEngine:
         """The run's core rewind provider, owned by the streaming engine."""
         return self._engine
+
+    @property
+    def report_path(self) -> Path | None:
+        """The pack-owned report path when persistence is enabled, else ``None``."""
+        if not self._write_report:
+            return None
+        if self._metadata is None:
+            return None
+        return Path(self._metadata.out_dir) / REPORT_FILENAME
 
     def on_step(self, t: int, bundle: dict[str, object]) -> None:
         """Delegate one pre-reset tick to the engine."""
@@ -324,8 +374,11 @@ class BenchmarkSink:
     def on_run_end(self) -> dict[str, object]:
         """Finalize the run, assemble the pack report and return it.
 
-        The report is cached so a second teardown call cannot drive extension
-        ``on_run_end`` twice.  No core report artifact is written.
+        The report is assembled once and cached, so a second teardown call
+        cannot drive extension ``on_run_end`` twice.  With ``write_report`` the
+        cached report is serialized to :attr:`report_path`; a failed write is
+        raised and retried on the next call instead of leaving a cached
+        "success".  No core artifact is written.
         """
         if self._report is None:
             aggregate = self._engine.on_run_end()
@@ -350,6 +403,10 @@ class BenchmarkSink:
                 for extension in self._engine.extensions
             }
             self._report = self._builder.assemble(summary, blocks)
+        path = self.report_path
+        if path is not None and not self._report_written:
+            _write_report_file(path, self._report)
+            self._report_written = True
         return {SUMMARY_KEY: self._report}
 
     def stop_when(self) -> bool:
@@ -359,6 +416,30 @@ class BenchmarkSink:
     def on_rewind(self, info: dict[str, object]) -> None:
         """Mark the currently open episodes as belonging to a forked timeline."""
         self._engine.on_rewind(info)
+
+
+def _write_report_file(path: Path, report: dict[str, JsonValue]) -> None:
+    """Write the pack report atomically, creating the output directory if needed."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False) + "\n"
+    handle = tempfile.NamedTemporaryFile(
+        "w",
+        encoding="utf-8",
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        delete=False,
+    )
+    temp_path = Path(handle.name)
+    try:
+        with handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    except BaseException:
+        temp_path.unlink(missing_ok=True)
+        raise
 
 
 def _validate_loop_mode(value: object) -> None:

@@ -56,6 +56,7 @@ from .specs import RetentionSpec
 from .version import __version__
 
 __all__ = [
+    "REPORT_FILENAME",
     "REPORT_SCHEMA",
     "ReportBuilder",
     "ReportExtension",
@@ -66,6 +67,11 @@ __all__ = [
 
 #: Schema id of the pack-owned external benchmark report.
 REPORT_SCHEMA = "external_benchmark_report/1"
+
+#: Pack-owned report filename written under a run's ``out_dir``.
+#: It can never collide with the core ``benchmark_report.json`` / ``results.json``
+#: artifacts because the name is fixed and pack-specific.
+REPORT_FILENAME = "external_benchmark_report.json"
 
 #: The mandatory top-level blocks, in assembly order.
 _BASE_BLOCKS: tuple[str, ...] = (

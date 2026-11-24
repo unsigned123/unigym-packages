@@ -22,10 +22,12 @@ from unigym.evaluation import EnvView
 from unigym.run import SinkContext
 from unigym.run.spec import build_spec
 from unigym.signals import SignalPublisher
+from unigym_bench.engine import StreamingEngine
 from unigym_bench.events import Event
 from unigym_bench.frames import TickFrame
 from unigym_bench.json import JsonValue
 from unigym_bench.monitors import BaseMonitor, Monitor, ThresholdMonitor
+from unigym_bench.sink import BenchmarkSink, make_sink
 
 
 def make_view(num_envs: int = 2, *, device: str | torch.device = "cpu") -> EnvView:
@@ -267,6 +269,92 @@ def make_threshold_monitors() -> tuple[Monitor, ...]:
             terminal_outcome="success",
         ),
     )
+
+
+class IntegrationProbeMonitor(BaseMonitor):
+    """Minimal monitor used by the real-run integration test.
+
+    It counts ticks and contributes one JSON-safe report view; it owns no
+    tensor, view or episode state, so it can run unmodified through the core
+    runner.
+    """
+
+    def __init__(self, name: str = "integration") -> None:
+        super().__init__(name)
+        self.ticks = 0
+
+    def on_tick(self, frame: TickFrame) -> None:
+        """Count one observed policy tick."""
+        self.ticks += 1
+
+    def report_view(self) -> Mapping[str, JsonValue]:
+        """Return the observed tick count."""
+        return {"ticks": self.ticks}
+
+
+def make_integration_monitors() -> tuple[Monitor, ...]:
+    """Importable zero-argument monitor factory for the real-run test."""
+    return (IntegrationProbeMonitor(),)
+
+
+class BundleProbeSink:
+    """Test harness forwarding to the real pack sink while recording bundles.
+
+    The pack sink still owns every callback and all report state; this wrapper
+    only records which keys the core runner put in each bundle and which core
+    ``EpisodeTermination`` facts accompanied an episode boundary.  It exists so
+    the integration test can prove the retired ``bundle["env"]`` key is absent
+    and compare the pack's termination counts with the core facts of the same
+    run.
+    """
+
+    def __init__(self, inner: BenchmarkSink) -> None:
+        self.inner = inner
+        self.step_bundle_keys: list[tuple[str, ...]] = []
+        self.episode_terminations: list[dict[int, object]] = []
+
+    @property
+    def rewind_provider(self) -> StreamingEngine:
+        """Forward the pack engine rewind provider unchanged."""
+        return self.inner.rewind_provider
+
+    def on_step(self, t: int, bundle: dict[str, object]) -> None:
+        """Record the bundle's key set, then drive the pack sink."""
+        self.step_bundle_keys.append(tuple(sorted(bundle)))
+        self.inner.on_step(t, bundle)
+
+    def on_episode_end(self, env_ids: object, bundle: dict[str, object]) -> None:
+        """Record this boundary's core termination facts, then delegate."""
+        terminations = bundle.get("terminations")
+        self.episode_terminations.append(
+            dict(terminations) if isinstance(terminations, Mapping) else {}
+        )
+        self.inner.on_episode_end(env_ids, bundle)
+
+    def on_step_end(self, t: int, bundle: dict[str, object]) -> None:
+        """Forward the post-reset callback."""
+        self.inner.on_step_end(t, bundle)
+
+    def on_run_end(self) -> dict[str, object]:
+        """Return the pack sink's summary unchanged."""
+        return self.inner.on_run_end()
+
+    def drain_terminations(self) -> Mapping[int, object]:
+        """Forward the pack terminal drain."""
+        return self.inner.drain_terminations()
+
+    def stop_when(self) -> bool:
+        """Forward the pack stop policy."""
+        return self.inner.stop_when()
+
+    def on_rewind(self, info: dict[str, object]) -> None:
+        """Forward the rewind notification."""
+        self.inner.on_rewind(info)
+
+
+def make_observed_sink(ctx: SinkContext) -> BundleProbeSink:
+    """Importable real-run sink factory wrapping ``make_sink``."""
+    return BundleProbeSink(make_sink(ctx))
 
 
 class StaticReportExtension:
