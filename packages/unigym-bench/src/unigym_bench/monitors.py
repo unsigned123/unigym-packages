@@ -2,8 +2,9 @@
 
 A monitor is the stateful per-env unit of a benchmark task.  It observes ticks,
 publishes per-env level signals, emits one-shot events and requests per-env
-episode terminals.  This module owns the monitor contract and the six v1
-built-ins; it owns no engine, sink, report or scenario code.
+episode terminals.  This module owns the monitor contract, the six legacy
+built-ins and the compositional :class:`PredicateMonitor`; it owns no engine,
+sink, report or scenario code.
 
 Ownership boundaries:
 
@@ -34,7 +35,7 @@ import math
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Literal, Protocol, TypeAlias, TypeVar, runtime_checkable
+from typing import Literal, Protocol, TypeAlias, TypeVar, cast, runtime_checkable
 
 import torch
 from torch import Tensor
@@ -46,8 +47,11 @@ from unigym.core.episode_termination import (
 )
 from unigym.evaluation import EnvStepContext
 
+from .conditions import Condition, ConditionError, parse_condition
 from .events import SEVERITIES, Event, Severity, termination_from_json
 from .json import JsonValue, ensure_json_value
+from .predicates import EmitSpec, TriggerKind, TriggerSpec
+from .sources import SourceResolver
 
 __all__ = [
     "BaseMonitor",
@@ -56,6 +60,7 @@ __all__ = [
     "HoldMonitor",
     "Monitor",
     "PhaseMonitor",
+    "PredicateMonitor",
     "Probe",
     "RewindableMonitor",
     "SafetyMonitor",
@@ -132,7 +137,7 @@ class Monitor(Protocol):
     def drain_terminals(self) -> Mapping[int, Termination]:
         """Return and clear the terminal requests since the previous drain."""
 
-    def on_episode_end(self, env_ids: Sequence[int]) -> None:
+    def on_episode_end(self, env_ids: Sequence[int], context: EnvStepContext | None = None) -> None:
         """Observe the episode boundary for the due ``env_ids``."""
 
     def reset(self, env_ids: Sequence[int]) -> None:
@@ -186,7 +191,7 @@ class BaseMonitor:
         """Return no terminals."""
         return {}
 
-    def on_episode_end(self, env_ids: Sequence[int]) -> None:
+    def on_episode_end(self, env_ids: Sequence[int], context: EnvStepContext | None = None) -> None:
         """Observe an episode boundary; the base monitor does nothing."""
         _validate_env_ids(env_ids, None, "on_episode_end.env_ids")
 
@@ -527,7 +532,7 @@ class ThresholdMonitor(_StatefulMonitor):
             "active": torch.tensor(self._active, dtype=torch.bool, device=self._device),
         }
 
-    def on_episode_end(self, env_ids: Sequence[int]) -> None:
+    def on_episode_end(self, env_ids: Sequence[int], context: EnvStepContext | None = None) -> None:
         """Count observed episodes."""
         self._episodes += len(_validate_env_ids(env_ids, self._num_envs, "on_episode_end.env_ids"))
 
@@ -701,7 +706,7 @@ class HoldMonitor(_StatefulMonitor):
             "holding": torch.tensor(self._reached, dtype=torch.bool, device=self._device),
         }
 
-    def on_episode_end(self, env_ids: Sequence[int]) -> None:
+    def on_episode_end(self, env_ids: Sequence[int], context: EnvStepContext | None = None) -> None:
         """Count observed episodes."""
         self._episodes += len(_validate_env_ids(env_ids, self._num_envs, "on_episode_end.env_ids"))
 
@@ -833,7 +838,7 @@ class EventCounterMonitor(_StatefulMonitor):
             return {}
         return {"count": torch.tensor(self._counts, dtype=torch.int64, device=self._device)}
 
-    def on_episode_end(self, env_ids: Sequence[int]) -> None:
+    def on_episode_end(self, env_ids: Sequence[int], context: EnvStepContext | None = None) -> None:
         """Count observed episodes."""
         self._episodes += len(_validate_env_ids(env_ids, self._num_envs, "on_episode_end.env_ids"))
 
@@ -891,6 +896,431 @@ class EventCounterMonitor(_StatefulMonitor):
         self._counts = decoded.counts
         self._occurrences = decoded.occurrences
         self._episodes = decoded.episodes
+
+
+_PREDICATE_STATE_KEYS: frozenset[str] = frozenset(
+    {
+        "previous",
+        "streak",
+        "reached",
+        "once_fired",
+        "fired",
+        "fired_total",
+        "fired_counts",
+        "episode_end_total",
+        "episode_end_counts",
+        "episodes",
+        "episode_terminals",
+    }
+)
+
+
+@dataclass(frozen=True)
+class _PredicateState:
+    """Fully validated private predicate state, held as private locals."""
+
+    previous: list[bool]
+    streak: list[int]
+    reached: list[bool]
+    once_fired: list[bool]
+    fired: list[bool]
+    fired_total: int
+    fired_counts: list[int]
+    episode_end_total: int
+    episode_end_counts: list[int]
+    episodes: int
+    episode_terminals: dict[int, Termination]
+
+
+class PredicateMonitor(_StatefulMonitor):
+    """One condition tree, one trigger and one emit configuration.
+
+    The monitor resolves the condition at each evaluated boundary and stores
+    only the per-env booleans, streaks, once flags and run counters.  It owns no
+    view, tensor or borrowed boundary value.  ``on_tick`` publishes the trigger
+    firing mask.
+
+    Terminals follow the trigger cadence and are not latched here: the engine
+    owns first-terminal conflict accounting, so a repeated firing may request a
+    terminal again.  ``episode_end`` predicates are evaluated only by
+    :meth:`on_episode_end` with a final context.  Their terminal output is
+    report/scoring-only (OD-5) and is drained through
+    :meth:`drain_episode_terminals`, never through :meth:`drain_terminals`.
+    P15 consumes that separate face and records it without runner-drain
+    semantics.
+    """
+
+    kind = "predicate"
+
+    def __init__(
+        self,
+        name: str,
+        condition: Condition | Mapping[str, object],
+        trigger: TriggerSpec | TriggerKind | Mapping[str, object],
+        emit: EmitSpec | Mapping[str, object] | None = None,
+    ) -> None:
+        """Build a predicate monitor.
+
+        Args:
+            name: Monitor name matching ``[a-z][a-z0-9_]*``.
+            condition: A parsed condition or a mapping accepted by
+                :func:`unigym_bench.conditions.parse_condition`.  It must expose
+                a JSON-safe ``to_mapping`` for the config fingerprint.
+            trigger: A :class:`TriggerSpec`, trigger kind string or closed
+                trigger mapping.
+            emit: Optional :class:`EmitSpec`, emit mapping or ``None`` for the
+                default ``fired`` level value and no event/terminal.
+
+        Raises:
+            TypeError: An argument has the wrong type or the condition has no
+                JSON-safe config form.
+            ValueError: The trigger or emit configuration is invalid.
+        """
+        super().__init__(name)
+        parsed_condition = _coerce_predicate_condition(condition)
+        self._condition = parsed_condition
+        condition_config = ensure_json_value(
+            _condition_to_mapping(parsed_condition),
+            where=f"monitor {self.name!r}.condition",
+        )
+        if not isinstance(condition_config, dict):
+            raise TypeError(f"monitor {self.name!r}: condition config must be an object")
+        self._condition_config: dict[str, JsonValue] = condition_config
+        self._trigger = _coerce_trigger_spec(trigger)
+        self._emit = _coerce_emit_spec(emit)
+        self._resolver = SourceResolver()
+        self._previous: list[bool] = []
+        self._streak: list[int] = []
+        self._reached: list[bool] = []
+        self._once_fired: list[bool] = []
+        self._fired: list[bool] = []
+        self._fired_total = 0
+        self._fired_counts: list[int] = []
+        self._episode_end_total = 0
+        self._episode_end_counts: list[int] = []
+        self._episodes = 0
+        self._pending_episode_terminals: dict[int, Termination] = {}
+
+    def on_tick(self, context: EnvStepContext) -> None:
+        """Evaluate the condition, advance the trigger and queue outputs.
+
+        ``episode_end`` triggers bind the run shape but never evaluate the
+        condition on a normal tick, so a final-only source can be absent here.
+
+        Args:
+            context: The step boundary borrowed for this callback.
+
+        Raises:
+            ConditionError: The condition fails or returns an invalid mask.
+        """
+        self._bind_context(context)
+        self._ensure_predicate_state()
+        if self._trigger.kind == "episode_end":
+            self._fired = [False for _ in range(self._num_envs or 0)]
+            return
+        assert isinstance(self._num_envs, int)
+        mask = self._condition.evaluate(context, self._resolver)
+        current = _require_predicate_mask(mask, context, f"monitor {self.name!r}.condition")
+        fired = self._apply_predicate_trigger(current)
+        self._fired = fired
+        if any(fired):
+            self._record_predicate_firing(fired)
+
+    def signals(self) -> Mapping[str, Tensor]:
+        """Return a fresh per-env boolean tensor of the current firing mask."""
+        if self._device is None or not self._fired:
+            return {}
+        values = torch.tensor(self._fired, dtype=torch.bool, device=self._device)
+        return {self._emit.value: values}
+
+    def on_episode_end(self, env_ids: Sequence[int], context: EnvStepContext | None = None) -> None:
+        """Count the episode boundary and evaluate due ``episode_end`` rows.
+
+        Only an ``episode_end`` trigger with a supplied final context evaluates
+        the condition.  Every other trigger only counts the boundary.  A fired
+        ``episode_end`` row refreshes its level bit, emits a report/scoring
+        event when configured and queues a report/scoring terminal in
+        :meth:`drain_episode_terminals` when configured; it never queues a
+        runner terminal.
+
+        Args:
+            env_ids: The due environment ids.
+            context: Optional final step context owned by the caller for this
+                callback.
+
+        Raises:
+            TypeError: ``context`` is not an ``EnvStepContext``.
+            ValueError: An env id is invalid.
+            ConditionError: The final condition evaluation fails.
+        """
+        ids = _validate_env_ids(env_ids, self._num_envs, "on_episode_end.env_ids")
+        if context is not None:
+            if not isinstance(context, EnvStepContext):
+                raise TypeError(
+                    "on_episode_end.context must be an EnvStepContext or None, "
+                    f"got {type(context).__name__}"
+                )
+            self._bind_context(context)
+            ids = _validate_env_ids(env_ids, self._num_envs, "on_episode_end.env_ids")
+        self._episodes += len(ids)
+        if self._trigger.kind != "episode_end" or context is None:
+            return
+        self._ensure_predicate_state()
+        if not ids:
+            return
+        for env_id in ids:
+            self._pending_episode_terminals.pop(env_id, None)
+        mask = self._condition.evaluate(context, self._resolver)
+        current = _require_predicate_mask(mask, context, f"monitor {self.name!r}.condition")
+        for env_id in ids:
+            self._fired[env_id] = current[env_id]
+        fired_ids = [env_id for env_id in ids if current[env_id]]
+        if not fired_ids:
+            return
+        assert isinstance(self._num_envs, int)
+        for env_id in fired_ids:
+            self._episode_end_counts[env_id] += 1
+            self._episode_end_total += 1
+            self._queue_episode_terminal(env_id)
+        if self._emit.event is not None:
+            self._pending_events.append(
+                Event(
+                    name=self._emit.event,
+                    code=f"task.{self.name}.{self._emit.event}",
+                    env_ids=tuple(fired_ids),
+                    severity=self._emit.severity,
+                    data=self._predicate_event_data(),
+                )
+            )
+
+    def drain_episode_terminals(self) -> Mapping[int, Termination]:
+        """Return and clear report/scoring terminals from episode-end rows.
+
+        This face is separate from :meth:`drain_terminals`: the runner must
+        never drain it.  P15 records these facts in the final report without
+        runner-terminal semantics.  A later boundary for the same environment
+        replaces an undrained request for that environment.
+        """
+        terminals = dict(self._pending_episode_terminals)
+        self._pending_episode_terminals.clear()
+        return terminals
+
+    def reset(self, env_ids: Sequence[int]) -> None:
+        """Clear per-env trigger state; run counters and pending drains persist."""
+        for env_id in _validate_env_ids(env_ids, self._num_envs, "reset.env_ids"):
+            if env_id < len(self._previous):
+                self._previous[env_id] = False
+            if env_id < len(self._streak):
+                self._streak[env_id] = 0
+            if env_id < len(self._reached):
+                self._reached[env_id] = False
+            if env_id < len(self._once_fired):
+                self._once_fired[env_id] = False
+            if env_id < len(self._fired):
+                self._fired[env_id] = False
+
+    def report_view(self) -> Mapping[str, JsonValue]:
+        """Return the JSON-safe config, fired counts and episode-end counts."""
+        outcome = self._emit.terminal_outcome
+        return self._json_report(
+            {
+                "name": self.name,
+                "kind": self.kind,
+                "condition": dict(self._condition_config),
+                "trigger": self._trigger.to_mapping(),
+                "emit": self._emit.to_mapping(),
+                "value": self._emit.value,
+                "event": self._emit.event,
+                "severity": self._emit.severity,
+                "terminal_reason": self._emit.terminal_reason,
+                "terminal_outcome": None if outcome is None else outcome.value,
+                "fired": self._fired_total,
+                "fired_counts": list(self._fired_counts),
+                "episode_end_fired": self._episode_end_total,
+                "episode_end_counts": list(self._episode_end_counts),
+                "episodes": self._episodes,
+            }
+        )
+
+    def _ensure_predicate_state(self) -> None:
+        """Initialize every per-env list to the bound environment count."""
+        self._previous = self._ensure_length(self._previous, False)
+        self._streak = self._ensure_length(self._streak, 0)
+        self._reached = self._ensure_length(self._reached, False)
+        self._once_fired = self._ensure_length(self._once_fired, False)
+        self._fired = self._ensure_length(self._fired, False)
+        self._fired_counts = self._ensure_length(self._fired_counts, 0)
+        self._episode_end_counts = self._ensure_length(self._episode_end_counts, 0)
+
+    def _apply_predicate_trigger(self, current: list[bool]) -> list[bool]:
+        """Advance one trigger evaluation and return the per-env firing mask."""
+        kind = self._trigger.kind
+        if kind == "tick":
+            return list(current)
+        if kind == "edge":
+            fired = [active and not previous for active, previous in zip(current, self._previous)]
+            self._previous = list(current)
+            return fired
+        if kind == "hold":
+            assert self._trigger.steps is not None
+            steps = self._trigger.steps
+            fired = [False for _ in current]
+            for env_id, active in enumerate(current):
+                if not active:
+                    self._streak[env_id] = 0
+                    self._reached[env_id] = False
+                    continue
+                self._streak[env_id] += 1
+                if not self._reached[env_id] and self._streak[env_id] >= steps:
+                    self._reached[env_id] = True
+                    fired[env_id] = True
+            return fired
+        if kind == "once":
+            fired = [active and not already for active, already in zip(current, self._once_fired)]
+            self._once_fired = [
+                already or active for active, already in zip(current, self._once_fired)
+            ]
+            return fired
+        raise ValueError(f"monitor {self.name!r}: trigger {kind!r} cannot be evaluated on a tick")
+
+    def _record_predicate_firing(self, fired: list[bool]) -> None:
+        """Count fired rows and queue this firing's events and terminals."""
+        fired_ids: list[int] = []
+        for env_id, active in enumerate(fired):
+            if not active:
+                continue
+            fired_ids.append(env_id)
+            self._fired_counts[env_id] += 1
+            self._fired_total += 1
+            if self._emit.terminal_outcome is not None:
+                assert self._emit.terminal_reason is not None
+                self._emit_terminal(
+                    env_id,
+                    outcome=self._emit.terminal_outcome,
+                    reason=self._emit.terminal_reason,
+                    metrics={},
+                )
+        if fired_ids and self._emit.event is not None:
+            self._pending_events.append(
+                Event(
+                    name=self._emit.event,
+                    code=f"task.{self.name}.{self._emit.event}",
+                    env_ids=tuple(fired_ids),
+                    severity=self._emit.severity,
+                    data=self._predicate_event_data(),
+                )
+            )
+
+    def _queue_episode_terminal(self, env_id: int) -> None:
+        """Queue one report/scoring terminal for a fired episode-end row."""
+        reason = self._emit.terminal_reason
+        outcome = self._emit.terminal_outcome
+        if reason is None or outcome is None:
+            return
+        code = f"custom.{self.name}.{reason}"
+        validate_code(code)
+        self._pending_episode_terminals[env_id] = Termination(
+            outcome=outcome,
+            code=code,
+            source=TerminationSource.CUSTOM,
+            metrics={},
+        )
+
+    def _predicate_event_data(self) -> Mapping[str, JsonValue]:
+        """Return the JSON-safe event detail payload."""
+        data: dict[str, JsonValue] = {"trigger": self._trigger.kind}
+        if self._trigger.steps is not None:
+            data["steps"] = self._trigger.steps
+        return data
+
+    def _state_fields(self) -> Mapping[str, JsonValue]:
+        return {
+            "previous": list(self._previous),
+            "streak": list(self._streak),
+            "reached": list(self._reached),
+            "once_fired": list(self._once_fired),
+            "fired": list(self._fired),
+            "fired_total": self._fired_total,
+            "fired_counts": list(self._fired_counts),
+            "episode_end_total": self._episode_end_total,
+            "episode_end_counts": list(self._episode_end_counts),
+            "episodes": self._episodes,
+            "episode_terminals": {
+                str(env_id): termination.to_json()
+                for env_id, termination in sorted(self._pending_episode_terminals.items())
+            },
+        }
+
+    def _config_fields(self) -> Mapping[str, JsonValue]:
+        return {
+            "condition": dict(self._condition_config),
+            "trigger": self._trigger.to_mapping(),
+            "emit": self._emit.to_mapping(),
+        }
+
+    def _decode_state(
+        self, state: Mapping[str, JsonValue], num_envs: int | None
+    ) -> _PredicateState:
+        where = f"monitor {self.name!r} restore.state"
+        unknown = sorted(repr(key) for key in state if key not in _PREDICATE_STATE_KEYS)
+        missing = sorted(_PREDICATE_STATE_KEYS - set(state))
+        if unknown or missing:
+            raise ValueError(
+                f"{where}: expected keys {sorted(_PREDICATE_STATE_KEYS)}, "
+                f"missing {missing}, unknown {unknown}"
+            )
+        raw_terminals = state["episode_terminals"]
+        if not isinstance(raw_terminals, dict):
+            raise TypeError(
+                f"{where}.episode_terminals: expected an object, "
+                f"got {type(raw_terminals).__name__}"
+            )
+        episode_terminals: dict[int, Termination] = {}
+        for key, item in raw_terminals.items():
+            env_id = _decode_env_key(key, f"{where}.episode_terminals")
+            if num_envs is not None and env_id >= num_envs:
+                raise ValueError(
+                    f"{where}.episode_terminals: env id {env_id} is outside "
+                    f"[0, num_envs={num_envs})"
+                )
+            episode_terminals[env_id] = termination_from_json(
+                item, f"{where}.episode_terminals[{key}]"
+            )
+        return _PredicateState(
+            previous=_decode_bool_list(state["previous"], f"{where}.previous", num_envs),
+            streak=_decode_int_list(state["streak"], f"{where}.streak", num_envs),
+            reached=_decode_bool_list(state["reached"], f"{where}.reached", num_envs),
+            once_fired=_decode_bool_list(state["once_fired"], f"{where}.once_fired", num_envs),
+            fired=_decode_bool_list(state["fired"], f"{where}.fired", num_envs),
+            fired_total=_decode_nonnegative_int(state["fired_total"], f"{where}.fired_total"),
+            fired_counts=_decode_int_list(state["fired_counts"], f"{where}.fired_counts", num_envs),
+            episode_end_total=_decode_nonnegative_int(
+                state["episode_end_total"], f"{where}.episode_end_total"
+            ),
+            episode_end_counts=_decode_int_list(
+                state["episode_end_counts"], f"{where}.episode_end_counts", num_envs
+            ),
+            episodes=_decode_nonnegative_int(state["episodes"], f"{where}.episodes"),
+            episode_terminals=episode_terminals,
+        )
+
+    def _apply_state(self, decoded: object) -> None:
+        if not isinstance(decoded, _PredicateState):
+            raise TypeError(
+                f"monitor {self.name!r}: invalid predicate state bundle "
+                f"{type(decoded).__name__}"
+            )
+        self._previous = decoded.previous
+        self._streak = decoded.streak
+        self._reached = decoded.reached
+        self._once_fired = decoded.once_fired
+        self._fired = decoded.fired
+        self._fired_total = decoded.fired_total
+        self._fired_counts = decoded.fired_counts
+        self._episode_end_total = decoded.episode_end_total
+        self._episode_end_counts = decoded.episode_end_counts
+        self._episodes = decoded.episodes
+        self._pending_episode_terminals = decoded.episode_terminals
 
 
 @dataclass(frozen=True)
@@ -972,7 +1402,7 @@ class PhaseMonitor(_StatefulMonitor):
             "phase": torch.tensor(self._phase, dtype=torch.int64, device=self._device),
         }
 
-    def on_episode_end(self, env_ids: Sequence[int]) -> None:
+    def on_episode_end(self, env_ids: Sequence[int], context: EnvStepContext | None = None) -> None:
         """Count final phases and observed episodes."""
         ids = _validate_env_ids(env_ids, self._num_envs, "on_episode_end.env_ids")
         self._episodes += len(ids)
@@ -1152,7 +1582,7 @@ class SafetyMonitor(_StatefulMonitor):
             "violating": torch.tensor(self._violating, dtype=torch.bool, device=self._device),
         }
 
-    def on_episode_end(self, env_ids: Sequence[int]) -> None:
+    def on_episode_end(self, env_ids: Sequence[int], context: EnvStepContext | None = None) -> None:
         """Count observed episodes."""
         self._episodes += len(_validate_env_ids(env_ids, self._num_envs, "on_episode_end.env_ids"))
 
@@ -1306,7 +1736,7 @@ class ScenarioCoverageMonitor(_StatefulMonitor):
                     )
             self._captured[env_id] = captured
 
-    def on_episode_end(self, env_ids: Sequence[int]) -> None:
+    def on_episode_end(self, env_ids: Sequence[int], context: EnvStepContext | None = None) -> None:
         """Match each ending environment's start command and clear it."""
         ids = _validate_env_ids(env_ids, self._num_envs, "on_episode_end.env_ids")
         self._episodes += len(ids)
@@ -1403,6 +1833,80 @@ def _require_probe(probe: object, where: str) -> Probe:
     if not callable(probe):
         raise TypeError(f"{where}: expected a callable probe, got {type(probe).__name__}")
     return probe
+
+
+def _coerce_predicate_condition(condition: Condition | Mapping[str, object]) -> Condition:
+    """Normalize a parsed condition or a closed condition mapping."""
+    if isinstance(condition, Mapping):
+        return parse_condition(condition)
+    if not isinstance(condition, Condition):
+        raise TypeError(
+            "PredicateMonitor.condition must satisfy Condition (an object with "
+            f"evaluate) or be a condition mapping, got {type(condition).__name__}"
+        )
+    return condition
+
+
+def _condition_to_mapping(condition: Condition) -> dict[str, JsonValue]:
+    """Return the JSON-safe config form of a built-in condition tree."""
+    encode = getattr(condition, "to_mapping", None)
+    if not callable(encode):
+        raise TypeError(
+            f"PredicateMonitor.condition of type {type(condition).__name__} has no "
+            "'to_mapping' method; a predicate monitor needs a JSON-safe condition "
+            "config (use Comparison/All or parse_condition)"
+        )
+    mapping = encode()
+    if not isinstance(mapping, dict):
+        raise TypeError(
+            f"PredicateMonitor.condition to_mapping returned "
+            f"{type(mapping).__name__}, expected an object"
+        )
+    return mapping
+
+
+def _coerce_trigger_spec(
+    trigger: TriggerSpec | TriggerKind | Mapping[str, object],
+) -> TriggerSpec:
+    """Normalize a trigger spec, kind string or closed mapping."""
+    if isinstance(trigger, TriggerSpec):
+        return trigger
+    if isinstance(trigger, str):
+        return TriggerSpec(kind=cast(TriggerKind, trigger))
+    if isinstance(trigger, Mapping):
+        return TriggerSpec.from_mapping(trigger)
+    raise TypeError(
+        "PredicateMonitor.trigger must be a TriggerSpec, trigger kind string or "
+        f"trigger mapping, got {type(trigger).__name__}"
+    )
+
+
+def _coerce_emit_spec(emit: EmitSpec | Mapping[str, object] | None) -> EmitSpec:
+    """Normalize an emit spec, closed mapping or ``None``."""
+    if emit is None:
+        return EmitSpec()
+    if isinstance(emit, EmitSpec):
+        return emit
+    if isinstance(emit, Mapping):
+        return EmitSpec.from_mapping(emit)
+    raise TypeError(
+        "PredicateMonitor.emit must be an EmitSpec, emit mapping or None, "
+        f"got {type(emit).__name__}"
+    )
+
+
+def _require_predicate_mask(mask: object, context: EnvStepContext, where: str) -> list[bool]:
+    """Validate a condition mask and return plain per-env booleans."""
+    if not isinstance(mask, Tensor):
+        raise ConditionError(f"{where} returned {type(mask).__name__}, expected a torch.Tensor")
+    expected = (context.num_envs,)
+    if tuple(mask.shape) != expected:
+        raise ConditionError(f"{where} returned shape {tuple(mask.shape)}, expected {expected}")
+    if mask.dtype != torch.bool:
+        raise ConditionError(f"{where} returned dtype {mask.dtype}, expected torch.bool")
+    if mask.device != context.device:
+        raise ConditionError(f"{where} returned device {mask.device}, expected {context.device}")
+    return [bool(value) for value in mask.tolist()]
 
 
 def _require_finite_float(value: object, where: str) -> float:

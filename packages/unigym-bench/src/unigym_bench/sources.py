@@ -199,6 +199,17 @@ class SourceRef:
         # ``kind`` was validated against _KIND_SET above.
         return cls(kind=cast(SourceKind, kind), key=key)
 
+    def to_mapping(self) -> dict[str, JsonValue]:
+        """Return the closed mapping used for explicit source construction.
+
+        This is the inverse of :meth:`from_mapping`; it is **not** the
+        authoring ``kind:key`` form accepted by :meth:`parse`.  Condition
+        ``to_mapping`` keeps the ``kind:key`` string so
+        :func:`unigym_bench.conditions.parse_condition` can round-trip a tree
+        without adding a second source grammar.
+        """
+        return {"kind": self.kind, "key": self.key}
+
     def __str__(self) -> str:
         """Return the canonical ``kind:key`` form."""
         return f"{self.kind}:{self.key}"

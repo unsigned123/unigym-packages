@@ -35,6 +35,7 @@ import torch
 from torch import Tensor
 from unigym.evaluation import EnvStepContext
 
+from .json import JsonValue
 from .sources import SourceError, SourceRef, SourceResolver
 
 __all__ = [
@@ -185,6 +186,22 @@ class Comparison:
             )
         return _compare(values.to(dtype=torch.float64), self.op, self.value)
 
+    def to_mapping(self) -> dict[str, JsonValue]:
+        """Return the closed, JSON-safe leaf mapping accepted by the parser.
+
+        ``source`` stays in the authoring ``kind:key`` string form.  The
+        mapping form of :class:`unigym_bench.sources.SourceRef` exists only for
+        explicit source construction and is not a second condition grammar.
+        """
+        mapping: dict[str, JsonValue] = {
+            "source": str(self.ref),
+            "op": self.op,
+            "value": self.value,
+        }
+        if self.dim is not None:
+            mapping["dim"] = self.dim
+        return mapping
+
 
 @dataclass(frozen=True, slots=True)
 class All:
@@ -231,6 +248,28 @@ class All:
             combined = current if combined is None else combined & current
         assert combined is not None
         return combined
+
+    def to_mapping(self) -> dict[str, JsonValue]:
+        """Return the closed, JSON-safe conjunction mapping.
+
+        Every child must expose ``to_mapping``.  A custom condition without that
+        JSON-safe form cannot be used in a monitor config fingerprint and fails
+        here with a teaching error.
+
+        Raises:
+            ConditionError: A child has no ``to_mapping`` method.
+        """
+        children: list[JsonValue] = []
+        for index, condition in enumerate(self.conditions):
+            encode = getattr(condition, "to_mapping", None)
+            if not callable(encode):
+                raise ConditionError(
+                    f"All.conditions[{index}] of type {type(condition).__name__} has no "
+                    "'to_mapping' method; a condition used by a predicate monitor must "
+                    "have a JSON-safe config form (use Comparison/All or parse_condition)"
+                )
+            children.append(encode())
+        return {"all": children}
 
 
 def parse_condition(document: object) -> Condition:
