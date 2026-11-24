@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from unigym import values as core_values
 from unigym.core import episode_termination
 
 import unigym_bench
@@ -28,6 +29,8 @@ _TERMINATION_SURFACES = (
     "TerminationSource",
     "validate_code",
 )
+
+_VALUE_SURFACES = ("ValueStore", "ValueView", "ValuePublisher", "StepValues")
 
 _FENCE_SCRIPT = f"""
 import sys
@@ -72,6 +75,13 @@ def test_core_contract_passes_on_current_core() -> None:
     assert assert_core_contract() is None
 
 
+def test_core_contract_declares_the_c13_value_and_context_surfaces() -> None:
+    required = dict(compat._REQUIRED_SURFACES)
+    assert set(_VALUE_SURFACES) <= set(required["unigym.values"])
+    assert "EnvStepContext" in required["unigym.evaluation"]
+    assert "unigym.signals" not in required
+
+
 def test_core_contract_names_a_missing_surface(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         compat,
@@ -102,3 +112,13 @@ def test_core_contract_requires_each_termination_surface(
     with pytest.raises(RuntimeError) as excinfo:
         compat.assert_core_contract()
     assert f"unigym.core.episode_termination.{attribute}" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("attribute", _VALUE_SURFACES)
+def test_core_contract_requires_each_value_surface(
+    monkeypatch: pytest.MonkeyPatch, attribute: str
+) -> None:
+    monkeypatch.delattr(core_values, attribute)
+    with pytest.raises(RuntimeError) as excinfo:
+        compat.assert_core_contract()
+    assert f"unigym.values.{attribute}" in str(excinfo.value)

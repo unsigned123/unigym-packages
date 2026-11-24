@@ -1,23 +1,30 @@
 # unigym-bench
 
 `unigym-bench` is an external benchmark pack for `unigym` that builds a
-streaming, monitor-driven benchmarking layer on the public sink, signal and
-evaluation contracts, without importing `unigym.benchmarks`,
+streaming, monitor-driven benchmarking layer on the public sink, evaluation,
+value and step-context contracts, without importing `unigym.benchmarks`,
 `unigym.runner.evaluation` or `unigym.runner.episodes`.
 
-Status: P9 (integration, parity, retention/memory and docs; no throughput
-claim). The package contains
-version metadata, the core-contract import fence, strict JSON helpers, the
-closed YAML task-spec loader (`unigym_bench.specs`), the monitor protocol with
-the v1 built-in monitors (`unigym_bench.monitors`), the streaming engine
+Status: P10 (core `0.107.0` value/context baseline; no throughput claim).
+P10 moves the import fence and version pin to core C13: the pack requires
+`unigym>=0.107,<0.108`, `CORE_SURFACE_VERSION` is `3`, and the fence checks
+`unigym.values` (`ValueStore`, `ValueView`, `ValuePublisher`, `StepValues`)
+and `unigym.evaluation.EnvStepContext` instead of the removed
+`unigym.signals`. Runtime migration is pending: the streaming engine, sink,
+sampler, frames and monitors still use the P9 signal/frame vocabulary; the
+engine and sink are migrated in P11/P15, the sampler in P12, and the
+frame/monitor vocabulary in later cards. The package
+already contains the P0-P9 tree: version metadata, the core-contract import
+fence, strict JSON helpers, the closed YAML task-spec loader
+(`unigym_bench.specs`), the monitor protocol with the v1 built-in monitors
+(`unigym_bench.monitors`), the streaming engine
 (`unigym_bench.engine`), the core sink shell (`unigym_bench.sink`), the rewind
 provider, the report builder with report extensions (`unigym_bench.report`),
 and the validated command scenario with its rewind-capable sampler
-(`unigym_bench.scenario`, `unigym_bench.sampler`). The sampler also consumes the
-pack's documented closed-loop signals. P9 adds a real tiny-arm MuJoCo
-integration test through `Run.runner` (the core SyncRunner tick engine),
-zero-episode and multi-env conformance coverage, a bounded-journal retention
-test, and the parity limitations documented below.
+(`unigym_bench.scenario`, `unigym_bench.sampler`). The P9 tree includes a real
+tiny-arm MuJoCo integration test through `Run.runner` (the core SyncRunner
+tick engine), zero-episode and multi-env conformance coverage, a
+bounded-journal retention test, and the parity limitations documented below.
 
 ## Report
 
@@ -37,6 +44,14 @@ that declares an extension is emitted only through that extension's
 the core `benchmark_report.json` or `results.json`.
 
 ## Authoring a run
+
+> **P9-era construction path on core C13.** The example and `make_sink` details
+> below describe the P9 pack as it ran against core `0.106.x`. Core C13
+> (`0.107.0`) exposes `SinkContext.values` backed by `ValueStore`/`ValueView`
+> and has removed the signal surface. P10 does not migrate production pack code:
+> the sink, engine and sampler still import `unigym.signals`, so `make_sink` and
+> the P9 pack suite are expected to be red or unusable until P11/P15 (engine,
+> sink) and P12 (sampler) migrate them.
 
 The pack is mounted as a core custom sink. A real benchmark run therefore keeps
 the run config in charge of the body/backend and gives the pack only its
@@ -73,10 +88,13 @@ summary = runner.run(stop_when=instance.stop_when)
 `monitor_factory` and `extension_factory` are zero-argument callables, given as
 `module:callable` paths, that return the instances in task declaration order;
 they must be importable from the run process. A factory is the only injection
-seam because monitor/extension instances are not JSON-safe. `make_sink(ctx)`
-still fails fast on unknown options, an unknown loop mode, a `sink-steered` run
-without `ctx.signals`, `runner.auto_reset: false`, or a declared
-`monitor_extensions` reference that does not exist.
+seam because monitor/extension instances are not JSON-safe. In the un-migrated
+P9 code, `make_sink(ctx)` fails fast on unknown options, an unknown loop mode, a
+`sink-steered` run without `ctx.signals`, `runner.auto_reset: false`, or a
+declared `monitor_extensions` reference that does not exist. On core C13 the
+equivalent construction context is `ctx.values` (`ValueStore`/`ValueView`); the
+`ctx.signals` branch is P9-era and is removed by the P11/P15 sink and engine
+migration.
 
 With `write_report: true` the sink writes the assembled document to
 `<out_dir>/external_benchmark_report.json` at run end. The filename and the
@@ -136,33 +154,43 @@ Monitors never retain a frame, view or tensor.
 
 ## Closed loop
 
-The pack engine publishes every monitor's per-env level signals under
-`<monitor>/<signal>`. A monitor named `scenario` therefore publishes the
-closed-loop convention:
+> **P9-era closed loop, not P10 behavior.** The `SignalView`, `SignalBus`,
+> `ctx.signals` and `bind_signals` statements below describe the P9 pack against
+> core `0.106.x`. Core C13 (`0.107.0`) removed `unigym.signals` and exposes
+> `SinkContext.values` plus `ValueStore`/`ValueView`/`ValuePublisher`/
+> `StepValues`. The un-migrated sampler and engine are expected to be red or
+> unusable until P12 (sampler) and P11/P15 (engine, sink) migrate them; the
+> command names and latency described here are P9-era, not a P10 claim.
+
+In the P9 code that still ships, the pack engine published every monitor's
+per-env level signals under `<monitor>/<signal>`. A monitor named `scenario`
+therefore published the closed-loop convention:
 
 - `scenario/desired_cmd`: a `float32` tensor of shape `(num_envs, dim)` on the
   run device; every value must be finite;
 - `scenario/command_valid`: an optional `bool` tensor of shape `(num_envs,)`;
   `False` rows keep their previous command, `True` rows take the desired row.
 
-`ScenarioSampler.bind_signals` requires the full read-only `SignalView`
-(`get` and `snapshot`) and stores it; `update` reads only those two names. It
-applies a valid desired command to `self.cmd` for the next env step and never
-advances the sampler cursor or RNG; without a desired command the pool/cursor
-behavior is unchanged. The sampler never scans the namespace, never falls back
-to another monitor's signals and never duplicates monitor detection. Invalid
-signal type, shape, dtype or device fails fast.
+`ScenarioSampler.bind_signals` (the P9 name, not a P10 API) requires the full
+read-only `SignalView` (`get` and `snapshot`) and stores it; `update` reads only
+those two names. It applies a valid desired command to `self.cmd` for the next
+env step and never advances the sampler cursor or RNG; without a desired command
+the pool/cursor behavior is unchanged. The sampler never scans the namespace,
+never falls back to another monitor's signals and never duplicates monitor
+detection. Invalid signal type, shape, dtype or device fails fast.
 
 Episode boundaries remain episode-granular: `on_episode_end` advances the
 cursor and `reset(env_ids)` writes the pool command, so a reset can overwrite
 a desired command for those envs until the next `update` re-applies the
 still-published level signal. A signal never drives the episode clock.
 
-The runner order is `sink.on_step(t)` (publish) then `sampler.update(t+1)`
-(read) then `env.step(t+2)` (act), so in-episode closed loop has two
-policy-tick latency. The applied `cmd` is part of the sampler rewind state; the
-signal store rides the core `SignalBus` rewind provider, and the pack does not
-duplicate either.
+In P9 the runner order was `sink.on_step(t)` (publish) then
+`sampler.update(t+1)` (read) then `env.step(t+2)` (act), so in-episode closed
+loop had two policy-tick latency. The applied `cmd` is part of the sampler
+rewind state; the signal store rode the core `SignalBus` rewind provider, and
+the pack did not duplicate either. On core C13 the store is `ValueStore`/`ValueView`
+and the removed `SignalBus` provider is not available until the P11/P12/P15
+migration lands.
 
 ## Task documents
 
@@ -236,13 +264,13 @@ bounded by `max_events`.
 
 ## Dependencies
 
-Development requires Python >=3.11 with a compatible `unigym` (`>=0.106.0`)
+Development requires Python >=3.11 with a compatible `unigym` (`>=0.107.0`)
 installed, plus the `dev` extra. The YAML loader requires `PyYAML>=6.0,<7.0`,
 which is a direct runtime dependency of the pack. Pytest adds `src` to its own
 path, so tests do not need a caller-provided `PYTHONPATH`; the import-fence
 subprocess also sets its own path from the imported package.
 
-`unigym_bench.__version__` stays at `0.1.0` while the pack is a pre-release;
-this revision does not bump it. `CORE_SURFACE_VERSION` is a pack-local revision
-of the required `unigym` public surface (currently `2`, after adding the core
-termination facts), not the distribution version.
+`unigym_bench.__version__` is `0.2.0` for the core `0.107.0` baseline release.
+`CORE_SURFACE_VERSION` is a pack-local revision
+of the required `unigym` public surface (currently `3`, after adopting the
+core value/context seams), not the distribution version.

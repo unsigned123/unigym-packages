@@ -28,13 +28,16 @@ separate.
 ## Core is separate
 
 ```text
-unigym (core repo, version 0.106.x)  ->  dependency
-  -> packages/unigym-rl
-  -> packages/unigym-bench
-  -> user / RL framework training loop
+unigym (core repo)
+  -> 0.107.x  -> packages/unigym-bench 0.2.x  -> user / RL framework
+  -> 0.106.x  -> packages/unigym-rl 0.1.x     -> user / RL framework
 
 packages/unigym-robots  -> standalone asset downloader (no core dependency)
 ```
+
+The two package lanes track different core versions: `unigym-bench 0.2.x` ->
+`unigym 0.107.x` (C13 value/context stack) while `unigym-rl 0.1.x` ->
+`unigym 0.106.x`. `COMPATIBILITY.md` is the authority for per-release ranges.
 
 Packages depend on core through a version range declared in their own
 `pyproject.toml`. Do not add path dependencies to published metadata and do
@@ -96,8 +99,11 @@ python examples/cartpole/train_skrl.py --num-envs 1 --max-iterations 1
 - `unigym-rl` releases are tagged `unigym-rl-v<version>` (for example
   `unigym-rl-v0.1.0`). Tags trigger `.github/workflows/release.yml`.
 - `unigym-bench` releases are tagged `unigym-bench-v<version>`.
-- Core compatibility is recorded per release in `COMPATIBILITY.md`; the current
-  lanes are `unigym-rl 0.1.x` and `unigym-bench 0.1.x` -> `unigym >=0.106,<0.107`.
+- Core compatibility is recorded per release in `COMPATIBILITY.md`, which is the
+  authority; the current lanes are `unigym-rl 0.1.x` -> `unigym >=0.106,<0.107`
+  and `unigym-bench 0.2.x` -> `unigym >=0.107,<0.108`.
+- Release ordering: core `0.107.0` (C13) must be on core `main` before
+  `unigym-bench 0.2.x` can resolve its dependency or its CI lane can run.
 - `unigym-robots` code is versioned independently. Its robot assets are attached
   to the GitHub Release `unigym-robots-assets-v0.1.0` and are never published to
   PyPI. See `packages/unigym-robots/PROVENANCE.md`.
