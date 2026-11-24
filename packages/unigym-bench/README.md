@@ -5,13 +5,15 @@ streaming, monitor-driven benchmarking layer on the public sink, signal and
 evaluation contracts, without importing `unigym.benchmarks`,
 `unigym.runner.evaluation` or `unigym.runner.episodes`.
 
-Status: P6. The package contains the skeleton — version metadata, the
-core-contract import fence, strict JSON helpers, the closed YAML task-spec
-loader (`unigym_bench.specs`), the monitor protocol with the v1 built-in
-monitors (`unigym_bench.monitors`), the streaming engine
-(`unigym_bench.engine`), the core sink shell (`unigym_bench.sink`), the rewind
-provider and the report builder with report extensions
-(`unigym_bench.report`). There is no scenario or sampler implementation yet.
+Status: P8. The package contains version metadata, the core-contract import
+fence, strict JSON helpers, the closed YAML task-spec loader
+(`unigym_bench.specs`), the monitor protocol with the v1 built-in monitors
+(`unigym_bench.monitors`), the streaming engine (`unigym_bench.engine`), the
+core sink shell (`unigym_bench.sink`), the rewind provider, the report builder
+with report extensions (`unigym_bench.report`), and the validated command
+scenario with its rewind-capable sampler (`unigym_bench.scenario`,
+`unigym_bench.sampler`). The sampler also consumes the pack's documented
+closed-loop signals.
 
 ## Report
 
@@ -48,6 +50,36 @@ The v1 built-ins are `ThresholdMonitor`, `HoldMonitor`,
 callable that returns one `(num_envs,)` tensor on the frame device; the
 composition layer, not the monitor, decides where that value comes from.
 Monitors never retain a frame, view or tensor.
+
+## Closed loop
+
+The pack engine publishes every monitor's per-env level signals under
+`<monitor>/<signal>`. A monitor named `scenario` therefore publishes the
+closed-loop convention:
+
+- `scenario/desired_cmd`: a `float32` tensor of shape `(num_envs, dim)` on the
+  run device; every value must be finite;
+- `scenario/command_valid`: an optional `bool` tensor of shape `(num_envs,)`;
+  `False` rows keep their previous command, `True` rows take the desired row.
+
+`ScenarioSampler.bind_signals` requires the full read-only `SignalView`
+(`get` and `snapshot`) and stores it; `update` reads only those two names. It
+applies a valid desired command to `self.cmd` for the next env step and never
+advances the sampler cursor or RNG; without a desired command the pool/cursor
+behavior is unchanged. The sampler never scans the namespace, never falls back
+to another monitor's signals and never duplicates monitor detection. Invalid
+signal type, shape, dtype or device fails fast.
+
+Episode boundaries remain episode-granular: `on_episode_end` advances the
+cursor and `reset(env_ids)` writes the pool command, so a reset can overwrite
+a desired command for those envs until the next `update` re-applies the
+still-published level signal. A signal never drives the episode clock.
+
+The runner order is `sink.on_step(t)` (publish) then `sampler.update(t+1)`
+(read) then `env.step(t+2)` (act), so in-episode closed loop has two
+policy-tick latency. The applied `cmd` is part of the sampler rewind state; the
+signal store rides the core `SignalBus` rewind provider, and the pack does not
+duplicate either.
 
 ## Task documents
 

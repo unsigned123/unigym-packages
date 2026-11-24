@@ -537,13 +537,33 @@ class SamplerEnv:
 
 
 class SamplerSignals:
-    """Minimal read-only signal view used by command-sampler bind tests."""
+    """Static read-only signal view for command-sampler closed-loop tests.
 
-    def get(self, name: str) -> torch.Tensor | None:
-        """Report no value for any name."""
-        del name
-        return None
+    Values are stored verbatim so a test can inject an invalid level (a list,
+    an integer tensor or a wrong-shape tensor) and assert the sampler's
+    teaching error.  The real transport path uses
+    :class:`unigym.signals.SignalBus`.
 
-    def snapshot(self) -> Mapping[str, torch.Tensor]:
-        """Return an empty signal snapshot."""
-        return {}
+    Args:
+        values: Optional initial level values keyed by signal name.
+        record: When true, append every ``get`` name to :attr:`requests` and
+            count every ``snapshot`` call in :attr:`snapshot_calls`.
+    """
+
+    def __init__(self, values: Mapping[str, object] | None = None, *, record: bool = False) -> None:
+        self.values: dict[str, object] = {} if values is None else dict(values)
+        self.requests: list[str] = []
+        self.snapshot_calls = 0
+        self._record = record
+
+    def get(self, name: str) -> object:
+        """Return the stored level for *name*, or ``None`` when absent."""
+        if self._record:
+            self.requests.append(name)
+        return self.values.get(name)
+
+    def snapshot(self) -> Mapping[str, object]:
+        """Return an isolated copy of the stored levels."""
+        if self._record:
+            self.snapshot_calls += 1
+        return dict(self.values)

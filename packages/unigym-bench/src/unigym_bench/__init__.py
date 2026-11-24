@@ -10,7 +10,10 @@ the monitor protocol and the built-in monitors in
 the streaming engine.  P6 adds the report builder, the report-extension
 protocol and the monitor fallback in :mod:`unigym_bench.report`.  P7 adds the
 validated command scenario in :mod:`unigym_bench.scenario` and the
-rewind-capable scenario sampler in :mod:`unigym_bench.sampler`.
+rewind-capable scenario sampler in :mod:`unigym_bench.sampler`. P8 adds the
+closed-loop convention: a ``scenario`` monitor publishes ``scenario/*`` level
+signals through the engine, and the sampler applies a valid desired command at
+the next update.
 """
 
 from __future__ import annotations
