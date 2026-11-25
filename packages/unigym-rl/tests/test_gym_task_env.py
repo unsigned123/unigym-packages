@@ -25,27 +25,10 @@ from test_task_env_mujoco import (  # noqa: E402
     OBS_DIM,
     TinyArmTask,
     _make_run,
-    _tiny_profile,
-)
-from unigym.robots import (  # noqa: E402
-    register_robot,
-    restore_robot_registry,
-    snapshot_robot_registry,
 )
 
 from unigym_rl import TaskConfigError, TaskEnv  # noqa: E402
 from unigym_rl.gym import GymTaskEnv  # noqa: E402
-
-
-@pytest.fixture(autouse=True)
-def _registered_tiny_robot() -> Iterator[None]:
-    """Register the test-only tiny robot and restore the registry afterwards."""
-    snapshot = snapshot_robot_registry()
-    register_robot("tiny", _tiny_profile)
-    try:
-        yield
-    finally:
-        restore_robot_registry(snapshot)
 
 
 @contextmanager

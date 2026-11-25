@@ -112,16 +112,17 @@ GO2_FEET_BODIES = ("FL_calf", "FR_calf", "RL_calf", "RR_calf")
 GO2_CONTACTS = (
     {
         "name": "feet",
-        "articulation": GO2_ARTICULATION,
-        "sensor_bodies": list(GO2_FEET_BODIES),
+        "sensor_refs": [
+            {"owner": "robot", "articulation": GO2_ARTICULATION, "body": body}
+            for body in GO2_FEET_BODIES
+        ],
         "frame": "world",
         "format": "contact",
         "threshold": 1.0,
     },
     {
         "name": "base",
-        "articulation": GO2_ARTICULATION,
-        "sensor_bodies": ["base"],
+        "sensor_refs": [{"owner": "robot", "articulation": GO2_ARTICULATION, "body": "base"}],
         "frame": "world",
         "format": "contact",
         "threshold": 1.0,
@@ -200,8 +201,7 @@ def make_go2_velocity_spec(
         backend=backend,
         seed=seed,
         # external mode: no core episode clock; the task's max_steps owns
-        # truncation.
-        episode_length_s=None,
+        # truncation and TaskEnv ends done rows through runner.terminate.
         no_artifacts=True,
         inspect=False,
     )

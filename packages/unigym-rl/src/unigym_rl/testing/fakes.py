@@ -293,6 +293,24 @@ class FakeRunner:
             terminated=torch.zeros(self.env.num_envs, dtype=torch.bool, device=self.env.device),
         )
 
+    def terminate(self, env_ids, terminations, *, reset: bool) -> StepResult:
+        """End the named episodes, optionally re-opening them via reset."""
+        if self.log is not None:
+            self.log.append("runner.terminate")
+        ids = torch.as_tensor(env_ids, dtype=torch.int64, device=self.env.device)
+        self.calls.append(("terminate", (ids.clone(), dict(terminations), reset)))
+        if reset:
+            self.env.reset_envs(ids)
+        terminated = torch.zeros(self.env.num_envs, dtype=torch.bool, device=self.env.device)
+        terminated[ids] = True
+        return StepResult(
+            t=max(int(self._ticks) - 1, 0),
+            obs=self.env.obs.snapshot(),
+            record=self.env.record(),
+            reset_env_ids=ids,
+            terminated=terminated,
+        )
+
     def reset(self, env_ids=None) -> StepResult:
         if self.log is not None:
             self.log.append("runner.reset")

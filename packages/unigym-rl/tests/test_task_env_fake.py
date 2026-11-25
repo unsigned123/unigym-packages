@@ -105,6 +105,27 @@ def test_fake_runner_reset_none_resets_all() -> None:
     assert len(env.reset_calls) == 1
 
 
+def test_fake_runner_terminate_resets_and_reports_the_ended_ids() -> None:
+    from unigym.core.episode_termination import Termination, TerminationSource
+
+    env = FakeEnv(num_envs=2)
+    runner = FakeRunner(env)
+    facts = {
+        1: Termination(
+            outcome="failure",
+            code="custom.task_terminated",
+            source=TerminationSource.CUSTOM,
+        )
+    }
+    result = runner.terminate([1], facts, reset=True)
+
+    assert result.reset_env_ids.tolist() == [1]
+    assert result.terminated is not None
+    assert result.terminated.tolist() == [False, True]
+    assert env.reset_calls[-1].tolist() == [1]
+    assert runner.calls[-1][0] == "terminate"
+
+
 def test_fake_run_surface_and_flags() -> None:
     run = FakeRun(num_envs=2)
     assert run.spec.termination_mode == "external"

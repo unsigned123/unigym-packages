@@ -2,21 +2,20 @@
 
 The test fixture is a self-contained copy of the MIT-clean two-hinge
 ``tiny_arm.xml`` (``tests/fixtures/tiny_arm.xml``); no core test path is
-imported.  One registered robot profile drives the real ``mujoco`` backend,
-``TaskEnv`` owns reward/termination/truncation, and the runner only ever
-resets the ids the task marked done.
+imported.  One explicit robot profile drives the real ``mujoco`` backend,
+``TaskEnv`` owns reward/termination/truncation, and the runner ends only the
+ids the task marked done.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 import torch
-from unigym.robots import register_robot, restore_robot_registry, snapshot_robot_registry
 from unigym.robots.base import BodyBinding, RobotProfile
 from unigym.run.api import Run
+from unigym.runtime.actions import OrderedActionSpec, PolicyBinding
 from unigym.world import World
 
 from unigym_rl import TaskEnv, TaskState, Transition
@@ -36,6 +35,19 @@ ACTUATION = [
     }
 ]
 
+ACTION_SPEC = OrderedActionSpec.from_mapping(
+    [
+        {
+            "name": "tiny",
+            "articulation": ARTICULATION,
+            "joints": ["shoulder", "elbow"],
+            "target": "position",
+            "role": "body",
+        }
+    ]
+)
+POLICIES = (PolicyBinding.from_mapping({"adapter": "manual", "groups": [[ARTICULATION, "tiny"]]}),)
+
 
 def _tiny_profile() -> RobotProfile:
     """The two-hinge profile matching ``tests/fixtures/tiny_arm.xml``."""
@@ -49,25 +61,17 @@ def _tiny_profile() -> RobotProfile:
         foot_bodies=(),
         body_sets={},
         body_bindings={"base": BodyBinding("base", {"mjcf": "base"})},
+        actuation=ACTUATION,
     )
-
-
-@pytest.fixture(autouse=True)
-def _registered_tiny_robot() -> Iterator[None]:
-    """Register the test-only robot and restore the registry afterwards."""
-    snapshot = snapshot_robot_registry()
-    register_robot("tiny", _tiny_profile)
-    try:
-        yield
-    finally:
-        restore_robot_registry(snapshot)
 
 
 def _make_run(num_envs: int) -> Run:
     """One real MuJoCo run with task-owned (external) termination."""
     return Run(
         world=World.base(mjcf=FIXTURE_MJCF),
-        robot={"name": ARTICULATION, "actuation": ACTUATION},
+        robot=_tiny_profile(),
+        action_spec=ACTION_SPEC,
+        policies=POLICIES,
         observations={"robot": [ARTICULATION]},
         backend="mujoco",
         num_envs=num_envs,
@@ -149,18 +153,18 @@ class TinyArmTask(TaskEnv):
         self.log.append(f"on_episode_end:{env_ids.tolist()}")
 
 
-def _spy_reset(env: TinyArmTask) -> list[list[int] | None]:
-    """Record every ``runner.reset`` id list, in order with the task log."""
-    calls: list[list[int] | None] = []
-    original = env.runner.reset
+def _spy_terminate(env: TinyArmTask) -> list[list[int]]:
+    """Record every ``runner.terminate`` id list, in order with the task log."""
+    calls: list[list[int]] = []
+    original = env.runner.terminate
 
-    def reset(env_ids: object = None) -> object:
-        ids = None if env_ids is None else torch.as_tensor(env_ids, dtype=torch.int64).tolist()
+    def terminate(env_ids: object, terminations: object, *, reset: bool) -> object:
+        ids = torch.as_tensor(env_ids, dtype=torch.int64).tolist()
         calls.append(ids)
-        env.log.append(f"runner.reset:{ids}")
-        return original(env_ids)
+        env.log.append(f"runner.terminate:{ids}")
+        return original(env_ids, terminations, reset=reset)
 
-    env.runner.reset = reset
+    env.runner.terminate = terminate
     return calls
 
 
@@ -207,7 +211,7 @@ def test_manual_rollout_two_envs_termination_resets_done_only() -> None:
     env = TinyArmTask(run)
     try:
         env.reset()
-        reset_calls = _spy_reset(env)
+        terminate_calls = _spy_terminate(env)
         env.log.clear()
 
         zeros = torch.zeros(2, ACTION_DIM)
@@ -218,7 +222,7 @@ def test_manual_rollout_two_envs_termination_resets_done_only() -> None:
             assert not bool(terminated.any()) and not bool(truncated.any())
             assert info["episode_end"] is None
 
-        assert reset_calls == []
+        assert terminate_calls == []
         assert env.log == []
 
         drive = torch.tensor([[1.5, 0.0], [0.0, 0.0]])
@@ -263,13 +267,13 @@ def test_manual_rollout_two_envs_termination_resets_done_only() -> None:
         assert torch.allclose(obs[0], torch.zeros(OBS_DIM), atol=1e-6)
         torch.testing.assert_close(obs[1], pre_obs[1])
 
-        # Ordering: on_episode_end -> runner.reset(done ids) -> on_reset.
+        # Ordering: on_episode_end -> runner.terminate(done ids) -> on_reset.
         assert env.log == [
             "on_episode_end:[0]",
-            "runner.reset:[0]",
+            "runner.terminate:[0]",
             "on_reset:[0]",
         ]
-        assert reset_calls == [[0]]
+        assert terminate_calls == [[0]]
 
         # Env 1 keeps living while env 0 starts a fresh episode.
         obs, reward, terminated, truncated, info = env.step(zeros)
@@ -280,13 +284,13 @@ def test_manual_rollout_two_envs_termination_resets_done_only() -> None:
         run.close()
 
 
-def test_task_truncation_is_separate_from_core_clock() -> None:
+def test_task_truncation_is_task_owned() -> None:
     """A task-owned truncation marks one env done without a termination."""
     run = _make_run(2)
     env = TinyArmTask(run, truncate_env=1, truncate_tick=1)
     try:
         env.reset()
-        reset_calls = _spy_reset(env)
+        terminate_calls = _spy_terminate(env)
         env.log.clear()
         zeros = torch.zeros(2, ACTION_DIM)
 
@@ -310,10 +314,10 @@ def test_task_truncation_is_separate_from_core_clock() -> None:
         assert info["final_info"][1] is not None
         assert env.log == [
             "on_episode_end:[1]",
-            "runner.reset:[1]",
+            "runner.terminate:[1]",
             "on_reset:[1]",
         ]
-        assert reset_calls == [[1]]
+        assert terminate_calls == [[1]]
 
         # Env 0 was not reset and keeps its (zero-action) observation.
         pre_obs = env.observe(episode_end.state)

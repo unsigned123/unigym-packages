@@ -10,6 +10,8 @@ R0 is deliberately strict:
 * the run must declare ``termination_mode: external``;
 * the caller must own reset policy (``auto_reset: false`` and
   ``reset_on_termination: false``);
+* there is no core episode clock: task masks end episodes through
+  ``runner.terminate(..., reset=True)`` and the driver resets only done ids;
 * observations are flat ``(num_envs, obs_dim)`` tensors;
 * actions are flat ``(num_envs, action_dim)`` tensors and are converted to
   joint-addressed ``NamedAction`` objects by ``OrderedActionSpec.unflatten``;
@@ -105,7 +107,8 @@ class TaskEnv:
         if runner_cfg.get("auto_reset") is not False:
             raise TaskConfigError(
                 "TaskEnv requires runner.auto_reset: false (the task layer "
-                f"resets done ids); got runner.auto_reset={runner_cfg.get('auto_reset')!r}"
+                f"ends and resets done ids); got "
+                f"runner.auto_reset={runner_cfg.get('auto_reset')!r}"
             )
         if runner_cfg.get("reset_on_termination", False) is not False:
             raise TaskConfigError(
@@ -198,7 +201,12 @@ class TaskEnv:
         self,
         actions: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, object]]:
-        """Advance one policy tick and return the Gymnasium vector tuple."""
+        """Advance one policy tick and return the Gymnasium vector tuple.
+
+        Task-owned done rows are ended through ``runner.terminate(...,
+        reset=True)``; backend due rows are only reset.  The returned
+        observation is post-reset for done rows.
+        """
         self._ensure_open()
         if not self._started or self._last_obs is None:
             raise TaskEnvError("TaskEnv.step requires reset() first (no previous observation)")
@@ -267,21 +275,12 @@ class TaskEnv:
 
         if bool(done.any()):
             self.on_episode_end(done_ids, pre, transition)
-            reset_result = self.runner.reset(done_ids)
-            post = self._snapshot(
-                t=int(reset_result.t),
-                obs=reset_result.obs,
-                record=reset_result.record,
-                reset_env_ids=reset_result.reset_env_ids,
-            )
+            self._end_done_episodes(done_ids, due_mask, task_terminated, truncated)
+            post_t = int(getattr(self.runner, "ticks_done", int(result.t)))
+            post = self._snapshot(t=post_t, reset_env_ids=done_ids)
             self._reset_buffers(done_ids)
             self.on_reset(done_ids, post)
-            post = self._snapshot(
-                t=int(reset_result.t),
-                obs=self.env.obs.snapshot(),
-                record=reset_result.record,
-                reset_env_ids=reset_result.reset_env_ids,
-            )
+            post = self._snapshot(t=post_t, reset_env_ids=done_ids)
             obs = self._validate_obs(self.observe(post))
         else:
             post = pre
@@ -585,6 +584,61 @@ class TaskEnv:
                 )
             validated[name] = self._validate_mask(mask, f"termination_reasons()[{name!r}]")
         return validated
+
+    def _end_done_episodes(
+        self,
+        done_ids: torch.Tensor,
+        due_mask: torch.Tensor,
+        terminated: torch.Tensor,
+        truncated: torch.Tensor,
+    ) -> None:
+        """End and reset *done_ids* through core's explicit lifecycle.
+
+        Task-owned rows end through ``runner.terminate(..., reset=True)`` with
+        one ``custom.*`` core fact per env; rows the backend already reported
+        as due are only reset (core's tick already ended them).  No core clock
+        is involved.
+        """
+        task_ids = done_ids[~due_mask[done_ids]]
+        due_ids = done_ids[due_mask[done_ids]]
+        facts = self._core_terminations(task_ids, terminated, truncated)
+        if facts:
+            self.runner.terminate(task_ids, facts, reset=True)
+        if due_ids.numel():
+            self.runner.reset(due_ids)
+
+    def _core_terminations(
+        self,
+        env_ids: torch.Tensor,
+        terminated: torch.Tensor,
+        truncated: torch.Tensor,
+    ) -> dict[int, object]:
+        """Build one core ``Termination`` fact per task-owned done env."""
+        if not env_ids.numel():
+            return {}
+        from unigym.core.episode_termination import (
+            EpisodeOutcome,
+            Termination,
+            TerminationSource,
+        )
+
+        facts: dict[int, object] = {}
+        for env_id in env_ids.tolist():
+            if bool(terminated[env_id]):
+                outcome = EpisodeOutcome.FAILURE
+                code = "custom.task_terminated"
+            elif bool(truncated[env_id]):
+                outcome = EpisodeOutcome.DEADLINE
+                code = "custom.task_truncated"
+            else:  # pragma: no cover - done rows are terminated or truncated
+                outcome = EpisodeOutcome.MANUAL
+                code = "custom.task_ended"
+            facts[int(env_id)] = Termination(
+                outcome=outcome,
+                code=code,
+                source=TerminationSource.CUSTOM,
+            )
+        return facts
 
     def _per_env_episode_end(
         self,

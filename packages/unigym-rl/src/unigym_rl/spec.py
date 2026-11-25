@@ -41,9 +41,11 @@ class EnvSpec:
     This class never builds a World, never asks the World for a robot, and
     never infers the action layout from the ``body`` joint set.
     ``make_run`` returns a fresh, lazy ``Run`` on every call, and the caller
-    owns its lifecycle.  ``episode_length_s=None`` (the default) disables the
-    core episode clock: task code, normally ``max_steps``, is the only time
-    authority.
+    owns its lifecycle.  Episode boundaries are task-owned: core owns no
+    episode clock, so the task must end episodes through an explicit
+    ``runner.terminate(...)`` and reset them with ``runner.reset(...)`` (the
+    :class:`~unigym_rl.task.TaskEnv` driver already does this for its own
+    ``terminated`` / ``truncated`` masks).
 
     ``observations`` is the run's top-level ``observations:`` declaration
     (``{"robot": ["go2"], "contact": ["feet"], "command": True, ...}``).  Its
@@ -70,7 +72,6 @@ class EnvSpec:
     adapter: str | Mapping[str, object] = "manual"
     seed: int = 0
     steps: int | None = None
-    episode_length_s: float | None = None
     no_artifacts: bool = True
     inspect: bool = False
 
@@ -135,11 +136,9 @@ class EnvSpec:
         """Validate the contact declaration against the core contact schema.
 
         The outer container must be a tuple (no silent list coercion) and every
-        entry must be a non-empty mapping.  Entries with plain body lists are
-        parsed by the core ``ContactGroupSpec`` immediately; entries still in
-        the declarative reference form (``{contact_group: ...}`` /
-        ``{prop: ...}``) are only shape-checked here because they can only be
-        resolved against the built run's body inventory.
+        entry must be a non-empty mapping in the breaking typed-ref schema
+        (``sensor_refs`` / ``filter_refs``); each entry is parsed by the core
+        ``ContactGroupSpec`` here so a removed key fails fast.
         """
         from unigym.contacts.base import ContactGroupSpec
 
@@ -159,20 +158,16 @@ class EnvSpec:
             if not entry:
                 raise TaskConfigError(
                     f"EnvSpec: contacts[{index}] must not be empty | hint: a "
-                    "contact group needs at least name, sensor_bodies and frame"
+                    "contact group needs at least name, sensor_refs and frame"
                 )
             payload = copy.deepcopy(dict(entry))
-            reference_form = any(
-                isinstance(payload.get(key), Mapping) for key in ("sensor_bodies", "filter_bodies")
-            )
-            if not reference_form:
-                try:
-                    ContactGroupSpec.from_yaml(payload)
-                except (TypeError, ValueError) as exc:
-                    raise TaskConfigError(
-                        f"EnvSpec: contacts[{index}] is not a valid run "
-                        f"top-level `contacts:` entry: {exc}"
-                    ) from exc
+            try:
+                ContactGroupSpec.from_yaml(payload)
+            except (TypeError, ValueError) as exc:
+                raise TaskConfigError(
+                    f"EnvSpec: contacts[{index}] is not a valid run "
+                    f"top-level `contacts:` entry: {exc}"
+                ) from exc
             normalized.append(payload)
         return tuple(normalized)
 
@@ -194,7 +189,6 @@ class EnvSpec:
             adapter=self.adapter,
             seed=self.seed,
             steps=self.steps,
-            episode_length_s=self.episode_length_s,
             no_artifacts=self.no_artifacts,
             inspect=self.inspect,
             termination_mode="external",

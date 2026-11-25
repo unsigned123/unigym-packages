@@ -1,0 +1,6 @@
+{"tick": 0, "ts_wall": 1795590281.706, "ep": 0, "env": null, "kind": "first_contact", "name": "feet", "data": {"envs": [1]}}
+{"tick": 0, "ts_wall": 1795590281.708, "ep": 0, "env": null, "kind": "episode_end", "name": "episode", "data": {"envs": [0, 1], "episodes": 1}}
+{"tick": 1, "ts_wall": 1795590281.954, "ep": 0, "env": null, "kind": "episode_end", "name": "episode", "data": {"envs": [0, 1], "episodes": 1}}
+{"tick": 0, "ts_wall": 1795590491.29, "ep": 0, "env": null, "kind": "first_contact", "name": "feet", "data": {"envs": [1]}}
+{"tick": 0, "ts_wall": 1795590491.292, "ep": 0, "env": null, "kind": "episode_end", "name": "episode", "data": {"envs": [0, 1], "episodes": 1}}
+{"tick": 1, "ts_wall": 1795590491.523, "ep": 0, "env": null, "kind": "episode_end", "name": "episode", "data": {"envs": [0, 1], "episodes": 1}}

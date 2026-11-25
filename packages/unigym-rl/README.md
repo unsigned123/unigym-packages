@@ -16,6 +16,22 @@ core Run / ExternalRunner / reset / state
 It does **not** own the training loop, optimizer, checkpoint format, reward
 implementation, or policy execution/deployment (L3 stays in core).
 
+## Release 0.2.0: core 0.108 lockstep
+
+`unigym-rl 0.2.0` requires `unigym >=0.108,<0.109` and adapts to the
+post-deletion core with no compatibility shims:
+
+- `EnvSpec` no longer declares `episode_length_s`; core has no episode clock
+  and the task owns every boundary.
+- `TaskEnv.step` ends its task-owned done rows through
+  `runner.terminate(env_ids, facts, reset=True)` (one `custom.*` fact per env)
+  and resets backend-due rows; task `on_episode_end` still runs first and the
+  returned observation is post-reset.
+- contact groups use the breaking typed-ref schema (`sensor_refs` /
+  `filter_refs`), not the removed `sensor_bodies` / `filter_bodies`.
+- `termination_mode="external"`, `auto_reset: false` and
+  `reset_on_termination: false` remain mandatory.
+
 ## R0 status
 
 R0 is the package skeleton plus the fake-env `TaskEnv` contract only:
@@ -48,8 +64,9 @@ manual rollout and no RL framework:
 - a `TaskEnv` subclass whose observation is the flattened
   `articulation/tiny/{joint_pos,joint_vel}` state, with deterministic reward
   and task-owned `terminated` / `truncated` / named reason masks;
-- manual `env.reset()` / `env.step(actions)` rollouts asserting done-only
-  `runner.reset`, `on_episode_end` before reset, pre-reset
+- manual `env.reset()` / `env.step(actions)` rollouts asserting that task-owned
+  done rows end through `runner.terminate(..., reset=True)` and are then
+  re-opened, `on_episode_end` before the end boundary, pre-reset
   `final_observation`, post-reset returned observation, and an empty
   all-False core termination group.
 
@@ -102,8 +119,9 @@ type.
 `EnvSpec` builds a fresh, lazy core `Run` from plain fields instead of a yaml
 file. Termination ownership is fixed: every run declares
 `termination_mode="external"` and
-`runner={auto_reset: false, reset_on_termination: false}`, and `EnvSpec`
-exposes no way to override either.
+`runner={auto_reset: false, reset_on_termination: false}`, `EnvSpec` exposes no
+way to override either, and it declares no episode duration (core has no
+episode clock).
 
 ```python
 from unigym.robots.base import RobotProfile
@@ -285,8 +303,8 @@ class MyTask(TaskEnv):
 - `breakdown(transition)` returns the weighted tensor of each enabled reward
   term for logging; `clip` affects only the total.
 - `TerminationResult.reasons` keeps every term's raw mask. The manager does
-  not merge core episode-clock due ids; `TaskEnv` still computes
-  `truncated = (core_due | task_truncated) & ~task_terminated`.
+  not merge backend-owned due ids; `TaskEnv` still computes
+  `truncated = (backend_due | task_truncated) & ~task_terminated`.
 - Names, terms, weights, `clip` and modes are validated at construction;
   `unigym_rl.managers` imports only `torch` and `unigym_rl` itself.
 
@@ -335,7 +353,7 @@ python -m ruff format --check packages/unigym-rl/src packages/unigym-rl/tests pa
 ```
 
 Releases declare a core range in `pyproject.toml`
-(`unigym>=0.106,<0.107`) and are tagged `unigym-rl-v<version>`; see
+(`unigym>=0.108,<0.109`) and are tagged `unigym-rl-v<version>`; see
 `COMPATIBILITY.md` at the repository root.
 
 ## External termination mode
@@ -354,10 +372,13 @@ runner:
 In this mode core builds an empty, never-firing termination group, never
 resets a terminated row itself, and reports `StepResult.terminated` as
 all-False. `TaskEnv` asserts that invariant and raises `TaskContractError` if
-core ever fires. Core still reports per-env episode-clock due ids through
-`StepResult.reset_env_ids`; `TaskEnv` merges those into `truncated` (a due env
-that is also task-terminated stays terminated, not truncated) and resets only
-the done ids.
+core ever fires. Core owns no episode clock: episode boundaries come only from
+the task (or a backend-owned due mask). `TaskEnv` ends its task-owned done
+rows through `runner.terminate(env_ids, facts, reset=True)` with one
+`custom.*` core fact per env, then re-observes the reset rows. A row the
+backend already reported through `StepResult.reset_env_ids` is only reset, so
+it is not ended twice. Backend due ids still merge into `truncated` (a due env
+that is also task-terminated stays terminated, not truncated).
 
 ## TaskEnv hooks
 
@@ -415,9 +436,11 @@ action-group identity). `info` carries:
 - `episode_end`: batch-level `EpisodeEnd` over done rows, or `None`.
 
 Ordering guarantees: reward, termination masks, reasons and the pre-reset
-final observation are all computed before reset; `on_episode_end` runs before
-reset; only done ids are reset; the observation returned by `step` is
-post-reset; the Run is never stopped or closed by `TaskEnv`.
+final observation are all computed before the episode boundary;
+`on_episode_end` runs before the boundary; task-owned rows end via
+`runner.terminate(..., reset=True)` and backend due rows are reset, so only
+done ids are touched; the observation returned by `step` is post-reset; the
+Run is never stopped or closed by `TaskEnv`.
 
 ## Layout
 

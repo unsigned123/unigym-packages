@@ -30,15 +30,14 @@ separate.
 ```text
 unigym (core repo)
   -> 0.108.x  -> packages/unigym-bench 0.3.x  -> user / RL framework
-  -> 0.106.x  -> packages/unigym-rl 0.1.x     -> user / RL framework
+  -> 0.108.x  -> packages/unigym-rl 0.2.x     -> user / RL framework
 
 packages/unigym-robots  -> standalone asset downloader (no core dependency)
 ```
 
-The two package lanes track different core versions: `unigym-bench 0.3.x` ->
-`unigym 0.108.x` (post-deletion explicit sink/lifecycle stack) while
-`unigym-rl 0.1.x` -> `unigym 0.106.x`. `COMPATIBILITY.md` is the authority for
-per-release ranges.
+Both package lanes track core `0.108.x` (the post-deletion explicit
+sink/lifecycle stack, with no core episode clock): `unigym-bench 0.3.x` and
+`unigym-rl 0.2.x`. `COMPATIBILITY.md` is the authority for per-release ranges.
 
 Packages depend on core through a version range declared in their own
 `pyproject.toml`. Do not add path dependencies to published metadata and do
@@ -98,10 +97,10 @@ python examples/cartpole/train_skrl.py --num-envs 1 --max-iterations 1
 
 - Each package keeps its own `pyproject.toml`, version and tag.
 - `unigym-rl` releases are tagged `unigym-rl-v<version>` (for example
-  `unigym-rl-v0.1.0`). Tags trigger `.github/workflows/release.yml`.
+  `unigym-rl-v0.2.0`). Tags trigger `.github/workflows/release.yml`.
 - `unigym-bench` releases are tagged `unigym-bench-v<version>`.
 - Core compatibility is recorded per release in `COMPATIBILITY.md`, which is the
-  authority; the current lanes are `unigym-rl 0.1.x` -> `unigym >=0.106,<0.107`
+  authority; the current lanes are `unigym-rl 0.2.x` -> `unigym >=0.108,<0.109`
   and `unigym-bench 0.3.x` -> `unigym >=0.108,<0.109`.
 - Release ordering: core `0.108.0` must be on core `main` before
   `unigym-bench 0.3.x` can resolve its dependency or its CI lane can run.

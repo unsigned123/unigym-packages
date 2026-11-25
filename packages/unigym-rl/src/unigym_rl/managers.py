@@ -72,7 +72,7 @@ class TerminationResult:
 
     ``reasons`` maps every declared term name to its raw (unmerged) mask;
     ``terminated`` / ``truncated`` are the OR over the terms of each mode.
-    ``TaskEnv`` still merges core episode-clock due ids into ``truncated``.
+    ``TaskEnv`` still merges backend-owned due ids into ``truncated``.
     """
 
     terminated: torch.Tensor
@@ -280,8 +280,8 @@ class TerminationManager:
 
     ``terms`` must be a non-empty sequence of :class:`TerminationTerm` with
     unique names.  Every term's raw mask is reported in
-    :attr:`TerminationResult.reasons`; the manager does not merge core
-    episode-clock due ids (``TaskEnv`` still owns that merge).  The manager
+    :attr:`TerminationResult.reasons`; the manager does not merge
+    backend-owned due ids (``TaskEnv`` still owns that merge).  The manager
     holds no episode or step state.
     """
 

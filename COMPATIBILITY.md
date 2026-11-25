@@ -5,7 +5,7 @@ repository. Each package release declares the core range it supports.
 
 | Package | Package version | Core requirement | Notes |
 | --- | --- | --- | --- |
-| `unigym-rl` | `0.1.x` | `unigym >=0.106,<0.107` | L2 task-environment layer; validated against core `0.106.0` and core `main` at `0d66d29`. |
+| `unigym-rl` | `0.2.x` | `unigym >=0.108,<0.109` | L2 task-environment layer over the post-deletion core explicit reset/terminate lifecycle; no core episode clock; validated against core `0.108.0`. |
 | `unigym-bench` | `0.3.x` | `unigym >=0.108,<0.109` | External benchmark layer over the post-deletion core explicit sink, reset-aware lifecycle, value/context and termination contracts; validated against core `0.108.0`. |
 | `unigym-robots` | `0.1.x` | none | Standalone asset downloader for pinned Unitree Go1/Go2/G1 MJCF and USD assets. Assets are GitHub Release tarballs, not wheel content. |
 

@@ -8,8 +8,6 @@ no logging writers) to keep the lane deterministic and bounded.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
-
 import numpy as np
 import pytest
 import torch
@@ -27,12 +25,6 @@ from test_task_env_mujoco import (  # noqa: E402
     OBS_DIM,
     TinyArmTask,
     _make_run,
-    _tiny_profile,
-)
-from unigym.robots import (  # noqa: E402
-    register_robot,
-    restore_robot_registry,
-    snapshot_robot_registry,
 )
 
 from unigym_rl.gym import GymTaskEnv  # noqa: E402
@@ -100,17 +92,6 @@ class TinyValue(DeterministicMixin, Model):
     def compute(self, inputs, role):
         del role
         return self.net(inputs["observations"]), {}
-
-
-@pytest.fixture(autouse=True)
-def _registered_tiny_robot() -> Iterator[None]:
-    """Register the test-only tiny robot and restore the registry afterwards."""
-    snapshot = snapshot_robot_registry()
-    register_robot("tiny", _tiny_profile)
-    try:
-        yield
-    finally:
-        restore_robot_registry(snapshot)
 
 
 def test_skrl_ppo_smoke_on_tiny_arm() -> None:

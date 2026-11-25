@@ -123,12 +123,14 @@ def test_envspec_rejects_malformed_observations() -> None:
         )
 
 
-def test_make_run_uses_null_episode_length_as_no_core_clock() -> None:
-    """External mode turns the default ``None`` into an explicit null clock."""
-    run = _spec().make_run()
+def test_make_run_has_no_core_episode_clock() -> None:
+    """EnvSpec owns no duration and never emits a removed core clock key."""
+    spec = _spec()
+    assert not hasattr(spec, "episode_length_s")
+    run = spec.make_run()
     try:
         assert run.spec.termination_mode == "external"
-        assert run.spec.cfg["env"]["episode_length_s"] is None
+        assert "episode_length_s" not in run.spec.cfg["env"]
     finally:
         run.close()
 
@@ -269,7 +271,7 @@ def test_envspec_requires_explicit_policy_bindings() -> None:
 
 BASE_CONTACT_GROUP = {
     "name": "base",
-    "sensor_bodies": ["base"],
+    "sensor_refs": [{"owner": "robot", "articulation": "tiny", "body": "base"}],
     "frame": "world",
     "format": "contact",
     "threshold": 1.0,

@@ -124,16 +124,16 @@ def test_spec_uses_flat_world_and_profile_assets() -> None:
     assert spec.inspect is False
 
 
-def test_spec_disables_the_core_episode_clock() -> None:
-    """The Go2 spec is external with a null duration; ``max_steps`` owns time."""
+def test_spec_has_no_core_episode_clock() -> None:
+    """The Go2 spec is external and clock-free; ``max_steps`` owns time."""
     _require_go2_assets()
 
     spec = go2_task.make_go2_velocity_spec(num_envs=1)
+    assert not hasattr(spec, "episode_length_s")
     run = spec.make_run()
     try:
-        assert spec.episode_length_s is None
         assert run.spec.termination_mode == "external"
-        assert run.spec.cfg["env"]["episode_length_s"] is None
+        assert "episode_length_s" not in run.spec.cfg["env"]
         assert run.spec.cfg["world_base"]["mjcf"].endswith("flat_ground.xml")
         assert [entry["name"] for entry in run.spec.cfg["articulations"]] == ["go2"]
         assert run.spec.cfg["articulations"][0]["spawn"] == {"pos": [0.0, 0.0, 0.4]}
@@ -387,9 +387,13 @@ def test_contact_groups_are_explicit_and_reach_the_run_config() -> None:
     """Go2 declares ``feet``/``base`` with explicit calf/base body names."""
     assert [group["name"] for group in go2_task.GO2_CONTACTS] == ["feet", "base"]
     feet, base = go2_task.GO2_CONTACTS
-    assert feet["articulation"] == GO2_ARTICULATION
-    assert feet["sensor_bodies"] == list(GO2_FEET_BODIES)
-    assert base["sensor_bodies"] == ["base"]
+    assert feet["sensor_refs"] == [
+        {"owner": "robot", "articulation": GO2_ARTICULATION, "body": body}
+        for body in GO2_FEET_BODIES
+    ]
+    assert base["sensor_refs"] == [
+        {"owner": "robot", "articulation": GO2_ARTICULATION, "body": "base"}
+    ]
     for group in go2_task.GO2_CONTACTS:
         assert group["frame"] == "world"
         assert group["format"] == "contact"

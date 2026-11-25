@@ -181,14 +181,18 @@ def test_ordering_reward_termination_and_final_obs_before_reset() -> None:
         "task.observe",
         "task.reward",
         "task.on_episode_end",
-        "runner.reset",
+        "runner.terminate",
         "env.reset_envs",
         "task.on_reset",
         "task.observe",
     ]
     assert log == order
-    assert run.runner.calls[-1][0] == "reset"
-    assert run.runner.calls[-1][1].tolist() == [0]
+    kind, payload = run.runner.calls[-1]
+    assert kind == "terminate"
+    env_ids, facts, reset = payload
+    assert env_ids.tolist() == [0]
+    assert reset is True
+    assert facts[0].code == "custom.task_terminated"
 
 
 def test_task_truncation_resets_only_done_ids() -> None:
@@ -206,6 +210,50 @@ def test_task_truncation_resets_only_done_ids() -> None:
     assert run.env.episode_steps.tolist() == [1, 0]
     assert obs[1, 0].item() == pytest.approx(1020.0)
     assert obs[0, 0].item() != pytest.approx(1020.0)
+
+    kind, payload = run.runner.calls[-1]
+    assert kind == "terminate"
+    env_ids, facts, reset = payload
+    assert env_ids.tolist() == [1]
+    assert reset is True
+    assert facts[1].code == "custom.task_truncated"
+    assert facts[1].outcome.value == "deadline"
+
+
+def test_task_termination_uses_a_custom_failure_fact() -> None:
+    run = FakeRun(num_envs=2, due_every=0)
+    task = QueuedTask(run)
+    task.reset()
+    task.term_masks = [_mask([True, False])]
+
+    task.step(torch.zeros(2, 2))
+
+    kind, payload = run.runner.calls[-1]
+    assert kind == "terminate"
+    env_ids, facts, reset = payload
+    assert env_ids.tolist() == [0]
+    assert reset is True
+    assert facts[0].code == "custom.task_terminated"
+    assert facts[0].outcome.value == "failure"
+    assert facts[0].source.value == "custom"
+
+
+def test_backend_due_rows_reset_without_a_second_termination() -> None:
+    """Core already ended due rows; the driver only re-opens them."""
+    run = FakeRun(num_envs=2, due_every=1)
+    task = QueuedTask(run)
+    task.reset()
+    task.term_masks = [_mask([True, False])]
+
+    _, _, terminated, truncated, info = task.step(torch.zeros(2, 2))
+
+    assert terminated.tolist() == [True, False]
+    assert truncated.tolist() == [False, True]
+    assert info["episode_end"].env_ids.tolist() == [0, 1]
+    kinds = [call[0] for call in run.runner.calls]
+    assert "terminate" not in kinds
+    assert kinds[-1] == "reset"
+    assert run.runner.calls[-1][1].tolist() == [0, 1]
 
 
 def test_core_due_becomes_truncation() -> None:
@@ -534,7 +582,7 @@ def test_on_step_is_not_called_on_reset_and_precedes_post_reset_observe() -> Non
         "task.observe",
         "task.reward",
         "task.on_episode_end",
-        "runner.reset",
+        "runner.terminate",
         "env.reset_envs",
         "task.on_reset",
         "task.observe",
