@@ -5,14 +5,15 @@ streaming, monitor-driven benchmarking layer on the public sink, evaluation,
 value and step-context contracts, without importing `unigym.benchmarks`,
 `unigym.runner.evaluation` or `unigym.runner.episodes`.
 
-Status: `0.3.0`, the post-deletion-core release (core `0.108.x`; no throughput
-claim). The pack now requires `unigym>=0.108,<0.109` and
-`CORE_SURFACE_VERSION` is `4`. The post-deletion core owns no run `mode`, no
-episode clock and no built-in benchmark or `EvaluationSession`; the pack
-therefore ends every episode through an explicit `runner.terminate(...)`
-boundary (or a pack sink terminal) and reopens envs through the core
-`ResetAwareSink.on_reset` capability. The fence checks the explicit sink
-selection (`CollectSinkSpec`/`SinkDeclaration`/`SinkSpec`), `ResetAwareSink`,
+Status: `0.4.0`, the flow-owned post-deletion-core release (core `0.109.x`; no
+throughput claim). The pack requires `unigym>=0.109,<0.110` and
+`CORE_SURFACE_VERSION` is `5` (the 0.109 add of
+`ValueStore.subscribe`). The post-deletion core owns no run `mode`, no episode
+clock and no built-in benchmark or `EvaluationSession`; the pack therefore ends
+every episode through an explicit `runner.terminate(...)` boundary (or a pack
+sink terminal) and reopens envs through the core `ResetAwareSink.on_reset`
+capability. The fence checks the explicit sink selection
+(`CollectSinkSpec`/`SinkDeclaration`/`SinkSpec`), `ResetAwareSink`,
 `unigym.values` (`ValueStore`, `ValueView`, `ValuePublisher`, `StepValues`) and
 `unigym.evaluation.EnvStepContext`. This baseline includes the P15 runtime
 migration: P11
@@ -66,7 +67,8 @@ collision is a teaching error. `compose_task(document)` returns a frozen
 `make_sink` accepts a JSON-safe `task_document` path option that runs this
 composition instead of the factory path. The package contains the P0-P16
 implementation tree, first finalized as the `0.2.0` release and carried forward
-as `0.3.0` on the post-deletion core: version metadata, the
+as `0.4.0` with the flow-owned benchmark layer on the post-deletion core:
+version metadata, the
 core-contract import fence, strict JSON helpers, the closed YAML task-spec
 loader (`unigym_bench.specs`), the composition layer (`unigym_bench.compose`),
 the monitor protocol with the configured predicate and phase monitors
@@ -79,7 +81,64 @@ test through `Run.runner` (the core SyncRunner tick engine), zero-episode and
 multi-env conformance coverage, a bounded-journal retention test, and the
 parity limitations documented below.
 
-## Release 0.3.0: post-deletion core lockstep
+## Release 0.4.0: flow-owned benchmark layer
+
+`unigym-bench 0.4.0` is a breaking release with no compatibility shims. It
+requires core `unigym>=0.109,<0.110` and pack-local core surface revision `5`.
+It turns the pack's decision/report layer into one `BenchmarkFlow` seam; core
+adds only the additive `ValueStore.subscribe` surface.
+
+Changed contracts:
+
+- `BenchmarkSink` is a stable shell. It composes exactly one flow, builds the
+  engine/monitor/query context and forwards validated decisions. Custom users
+  implement `BenchmarkFlow`, not a `BenchmarkSink` subclass, and never reach
+  into `_engine`.
+- `Monitor` is values-only. It emits per-env values and a JSON-safe
+  `report_view`; it emits no events, no terminals and no termination
+  candidates. The F2 bridge is removed; there is no monitor event/terminal
+  drain and no `TerminationCandidate` type.
+- `BenchmarkFlow` owns tick events, explicit terminations, episode evidence,
+  the stop request and the final report. `DefaultBenchmarkFlow` applies an
+  explicit `TerminationRule`/`EventRule` table in declaration order (first true
+  rule per env); empty rules mean no automatic termination or events, with no
+  hidden "any monitor active" fallback.
+- `FlowSequence` is one composite flow with name-based `terminal_owner` and
+  `report_owner`. Only the terminal owner may terminate or request stop; only
+  the report owner may return a report; evidence is namespaced by child flow
+  name; events concatenate in declaration order. Stateful children snapshot
+  into a `{flow_name: child_state}` map. Restore pre-flights every child and
+  rolls back best-effort; a child whose restore also fails cannot be rolled
+  back, and the engine aborts the rewind.
+- Task documents are `unigym_extbench/3`, reports are
+  `external_benchmark_report/3`, engine rewind is `unigym_bench.rewind/5` and
+  monitor snapshots are `unigym_bench.monitor/4`. The retired task/report `/2`
+  forms are rejected with a teaching error; there is no dual-schema shim.
+- Report evidence lives only under `episodes.evidence`, keyed by
+  `"<env>/<seq>"` and absent when empty; the fixed eight top-level blocks and
+  their order are unchanged and a flow cannot add a ninth.
+- The flow owns report filtering: `report_monitor_views=` omits named monitor
+  blocks (they stay in `tasks.monitors`) and `report_extensions=` selects the
+  extension subset. The flow invokes each extension's `on_env_end` exactly once
+  per due boundary and `on_run_end` once per run; the engine never auto-runs an
+  extension.
+- The core `ValueStore.subscribe` surface is available to a concrete command
+  consumer but the pack's default `ScenarioSampler` polling path is unchanged;
+  subscriptions are synchronous, exact-name, run-scoped and never rewound.
+- Retention is unchanged: episode/termination/per-env counters stay
+  retention-independent, the event journal stays bounded by `max_events`, and
+  flow evidence is episode-scoped final data rather than an event-journal
+  entry.
+- Parity stays frozen on the tiny-arm fixture: episode count, tick count and
+  the `deadline` outcome are unchanged, and explicit `runner.terminate` facts
+  remain custom-owned `custom.*` facts.
+
+Migration: see [Migrating from task `/2` and report `/2`](#migrating-from-task-2-and-report-2).
+
+## Release 0.3.0: post-deletion core lockstep (historical)
+
+The `0.4.0` notes above supersede the flow, report, evidence and rewind
+contracts; the `0.3.0` core-range and lifecycle notes remain historical.
 
 `unigym-bench 0.3.0` is a breaking release with no compatibility shims. It
 requires core `unigym>=0.108,<0.109` and pack-local core surface revision `4`.
@@ -118,8 +177,8 @@ Changed contracts:
 
 ## Release 0.2.0: breaking API (historical)
 
-The `0.2.0` notes are retained for history; `0.3.0` above supersedes the core
-range, report schema and lifecycle contracts.
+The `0.2.0` notes are retained for history; `0.4.0` above supersedes the core
+range, flow/report/evidence schema and lifecycle contracts.
 
 `unigym-bench 0.2.0` is a breaking release with no compatibility shims. It
 requires core `unigym>=0.107,<0.108` (C13) and pack-local core surface revision
@@ -529,13 +588,22 @@ a desired command for those envs until the next `update` re-applies the
 still-published level value. A value never drives the episode clock.
 
 The runner order is `sink.on_step(t)` (publish the tick context snapshot) then
-`sampler.update(t+1)` (read the store) then `env.step(t+2)` (act), so in-episode
-closed loop has two policy-tick latency. The applied `cmd` is part of the
-sampler rewind state; the core `values` store is a separate core rewind
-provider (`name="values"`), and the pack provider never duplicates either.
-The tick context carries the pre-`on_step` value snapshot; the final context
-carries the post-`on_step` snapshot used for episode-end predicates and their
-final monitor publication.
+`sampler.update(t+1)` (read the store) then `env.step(t+2)` (act), so the
+default polling loop has two policy-tick latency. Core `0.109` adds
+`ValueStore.subscribe(callback, *, names=None)`: a sampler bound to the
+concrete store can subscribe to the exact `scenario/desired_cmd` and
+`scenario/command_valid` names and update its pending command at the
+publication boundary instead of polling. That removes the extra store-read
+tick (one-tick observation-to-action latency) but not causality. Subscriptions
+are synchronous, exact-name only, store/run-scoped, run only after a successful
+publish or value-removing clear, and are never replayed or notified by a rewind;
+a re-entrant store mutation from a callback is a contract error. The pack's
+default `ScenarioSampler.update` polling path is unchanged. The applied `cmd`
+is part of the sampler rewind state; the core `values` store is a separate core
+rewind provider (`name="values"`), and the pack provider never duplicates
+either. The tick context carries the pre-`on_step` value snapshot; the final
+context carries the post-`on_step` snapshot used for episode-end predicates and
+their final monitor publication.
 
 ## Task documents
 
@@ -621,6 +689,29 @@ declaring `builtin: scenario_coverage` under another name uses that name and
 suppresses the automatic extension. A `scenario_coverage` extension without a
 document scenario is a configuration error, as is an automatic-name collision.
 
+## Migrating from task `/2` and report `/2`
+
+There is no compatibility shim. Update the producer; do not post-process old
+artifacts.
+
+- **Task documents.** Change `schema: unigym_extbench/2` to
+  `unigym_extbench/3`. Move monitor `terminal_reason`, `terminal_outcome`,
+  `severity` and `event` fields into the document
+  `flow.termination_rules` / `flow.events`; monitors keep only a value emit.
+  A document without `flow` gets no automatic termination and no automatic
+  events.
+- **Programmatic monitors.** Remove `terminal_outcome`/`terminal_reason`
+  constructor arguments and `drain_events`/`drain_terminals` methods. Express
+  the same decision as a `TerminationRule`/`EventRule` on a `BenchmarkFlow`.
+  A monitor that still implements a drain face is rejected at construction.
+- **Reports.** Regenerate as `external_benchmark_report/3`. Monitor blocks no
+  longer carry `terminal_reason`/`terminal_outcome`; terminal outcome/code/
+  source facts and `episodes.evidence` replace them. Old `/2` files are inert
+  inputs only and are never re-emitted or upgraded.
+- **Rewind and monitor snapshots.** Old `unigym_bench.rewind/4` and
+  `unigym_bench.monitor/3` payloads are rejected; restart from a `/5` engine
+  checkpoint and `/4` monitor snapshot.
+
 ## Limitations and parity
 
 Known limitations in this revision:
@@ -670,7 +761,10 @@ horizon fact was `runtime.episode_horizon` / `runtime`, while an explicit
 boundary is custom-owned (`custom.episode_horizon` / `custom`). That is
 **frozen fact parity plus a documented namespace change**, not report or
 scoring parity. The built-in task `success`/metric block has no pack
-equivalent, and the two report schemas are not byte-compatible. The in-process
+equivalent, and the two report schemas are not byte-compatible. The `0.4.0`
+flow layer is policy/report-only: the values-only monitor contract, the flow
+decision owner and the `/3` report do not change the frozen tiny-arm episode
+count, tick count or `deadline` outcome. The in-process
 integration test additionally checks the same-run core `EpisodeTermination`
 facts against the pack report and the report vocabulary against the core
 `EpisodeOutcome` / `TerminationSource` enums. No throughput claim is made; the
@@ -678,7 +772,8 @@ retention test proves the journal is bounded by `max_events`.
 
 ### Release validation
 
-The `0.3.0` release is validated against the post-deletion core worktree. From
+The `0.4.0` release is validated against the flow-owned post-deletion core
+worktree. From
 `packages/unigym-bench`, using the Python from the core virtual environment:
 
 ```bash
@@ -699,13 +794,14 @@ or Isaac Lab lane is claimed.
 ## Dependencies
 
 Development requires Python >=3.11 with a compatible `unigym`
-(`>=0.108,<0.109`) installed, plus the `dev` extra. The YAML loader requires
+(`>=0.109,<0.110`) installed, plus the `dev` extra. The YAML loader requires
 `PyYAML>=6.0,<7.0`, which is a direct runtime dependency of the pack. Pytest
 adds `src` to its own path, so tests do not need a caller-provided
 `PYTHONPATH`; the import-fence subprocess also sets its own path from the
 imported package.
 
-`unigym_bench.__version__` is `0.3.0` for the post-deletion core `0.108.x`
-baseline release. `CORE_SURFACE_VERSION` is a pack-local revision of the
-required `unigym` public surface (currently `4`, after adopting the explicit
-sink selection and reset-aware lifecycle seams), not the distribution version.
+`unigym_bench.__version__` is `0.4.0` for the flow-owned post-deletion core
+`0.109.x` release. `CORE_SURFACE_VERSION` is a pack-local revision of the
+required `unigym` public surface (currently `5`, after adopting the explicit
+sink selection, reset-aware lifecycle and additive
+`ValueStore.subscribe` seams), not the distribution version.

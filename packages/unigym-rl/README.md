@@ -16,6 +16,13 @@ core Run / ExternalRunner / reset / state
 It does **not** own the training loop, optimizer, checkpoint format, reward
 implementation, or policy execution/deployment (L3 stays in core).
 
+## Release 0.2.1: core 0.109 range
+
+`unigym-rl 0.2.1` is a patch release with no code or API change. It only moves
+the core range to `unigym >=0.109,<0.110` so the lane resolves against the
+additive `ValueStore.subscribe` core release. `unigym-rl` does not use
+subscriptions; its task/lifecycle behavior is the `0.2.0` contract below.
+
 ## Release 0.2.0: core 0.108 lockstep
 
 `unigym-rl 0.2.0` requires `unigym >=0.108,<0.109` and adapts to the
@@ -353,7 +360,7 @@ python -m ruff format --check packages/unigym-rl/src packages/unigym-rl/tests pa
 ```
 
 Releases declare a core range in `pyproject.toml`
-(`unigym>=0.108,<0.109`) and are tagged `unigym-rl-v<version>`; see
+(`unigym>=0.109,<0.110`) and are tagged `unigym-rl-v<version>`; see
 `COMPATIBILITY.md` at the repository root.
 
 ## External termination mode

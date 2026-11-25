@@ -22,7 +22,11 @@ scenario-derived coverage extension and the ``task_document`` sink option.
 P17 finalized the 0.2.0 release documentation and release evidence. The 0.3.0
 release locks the pack to the post-deletion core: no run mode, no episode
 clock, no built-in benchmark/``EvaluationSession``, explicit
-``runner.terminate``/sink terminals and core ``on_reset`` reopening.
+``runner.terminate``/sink terminals and core ``on_reset`` reopening. The 0.4.0
+release makes the pack flow-owned: values-only monitors, one
+``BenchmarkFlow`` decision/report owner, ``FlowSequence`` composition and the
+``unigym_extbench/3`` / ``external_benchmark_report/3`` /
+``unigym_bench.rewind/5`` / ``unigym_bench.monitor/4`` schemas.
 """
 
 from __future__ import annotations
