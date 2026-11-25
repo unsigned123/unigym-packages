@@ -33,8 +33,10 @@ transport:
 - the pack rewind schema is `unigym_bench.rewind/5` and monitor snapshots are
   `unigym_bench.monitor/4`; older payloads are rejected explicitly. F4 added
   finalized episode evidence to the `/5` engine payload, so the `/5` shape
-  changed in F4: pre-F4 `/5` payloads are rejected. F5 finalizes the rewind
-  schema.
+  changed in F4: pre-F4 `/5` payloads are rejected. F5 finalizes the schema with
+  a required run-scoped `engine.stop_requested` flag and an optional `flow`
+  block for stateful flows; pre-F5 `/5` payloads lack the flag and are
+  rejected.
 
 P14 collapses the typed built-in monitors. `ThresholdMonitor`, `HoldMonitor`,
 `SafetyMonitor` and `EventCounterMonitor` are now `PredicateMonitor`
@@ -199,8 +201,10 @@ The engine remains the validation, latch, journal, record and rewind owner.
 The sink drives `begin_tick -> flow.on_tick -> apply_decision` and
 `begin_episode_end -> flow.on_episode_end -> commit_episode_end`; the engine
 validates every decision before it mutates run state. A flow without `on_tick`
-is valid and applies no tick policy. A `stateful=True` flow is rejected until
-the rewind card adds flow snapshots.
+is valid and applies no tick policy. A `stateful=True` flow must implement
+callable `snapshot()`/`restore()`; its policy state joins the single
+`unigym_bench` rewind payload under an optional `flow` block. A stateless flow
+must not implement those methods and adds no checkpoint key.
 
 `DefaultBenchmarkFlow` semantics are intentionally small:
 
@@ -214,12 +218,14 @@ the rewind card adds flow snapshots.
   event code defaults to `task.<monitor>.<name>`;
 - empty rules mean no automatic termination and no automatic events.
 
-The stop flag is transient. A successful rewind restore, and the core
-`on_rewind` notification, clear it so a forked branch never inherits a stop
-from the abandoned timeline. Stop persistence is deferred to the flow-rewind
-card. Episode evidence is engine-persisted and included in the flow rewind
-payload; extension persistence and rewind stay engine-owned while the flow owns
-extension invocation.
+The stop flag is run-scoped. A flow requests it through
+`FlowDecision.stop`; the engine keeps it until run end and snapshots it in the
+required `engine.stop_requested` field. Rewind restores exactly the
+checkpoint's flag, so a forked branch never inherits a stop from the abandoned
+timeline. Episode evidence is engine-persisted and included in the engine
+rewind payload; flow state is stored only in its own `flow` block and does not
+duplicate records or evidence. Extension persistence and rewind stay
+engine-owned while the flow owns extension invocation.
 
 Flow callback exceptions are fail-fast with no rollback. `begin_tick` advances
 the episode tick counters and reads monitor values before `flow.on_tick`, and
@@ -596,9 +602,11 @@ Known limitations in this revision:
   Other builtins must be declared as `module`/API `factory` declarations.
 - **Events are in-memory only.** The capped journal is not persisted; there is
   no `external_benchmark_events.jsonl` writer in this revision.
-- **No early-stop policy.** `BenchmarkSink.stop_when()` always returns false;
-  the caller controls `runner.run(stop_when=...)` or drives `runner.step`.
-  There are no core benchmark limit keys to consume.
+- **No built-in early-stop policy.** A flow may request a stop through
+  `FlowDecision.stop`; `BenchmarkSink.stop_when()` returns that run-scoped flag
+  (restored by rewind). The caller still controls `runner.run(stop_when=...)`
+  or drives `runner.step`, and there are no core benchmark limit keys to
+  consume.
 - **No episode clock.** The pack never infers `episode_length_s`; an episode
   ends only through `runner.terminate(...)` or a pack sink terminal.
 - **MuJoCo integration lane.** The real tiny-arm test needs the D0 MuJoCo lane.
@@ -613,7 +621,7 @@ Parity against the deleted core built-in benchmark is **frozen, not live**:
 | Schema | `benchmark_report` (historical) | `external_benchmark_report/3` | Not byte-compatible; mapping documented here |
 | Episode end | core term group + episode horizon (historical) | explicit `runner.terminate`/sink terminal; verdicts `terminal`, `deadline`, `core`, `incomplete`, `rewound` | Same core boundary facts; pack owns the lifecycle |
 | Scoring | per-task `success` and metrics (historical) | monitor `report_view` and extension blocks; no aggregate success score | Different purpose; not interchangeable |
-| Early stop | `min_episodes` / `max_steps` (historical) | caller-provided `stop_when` | Pack has no built-in stop policy |
+| Early stop | `min_episodes` / `max_steps` (historical) | flow stop flag + caller `stop_when` | Pack has no built-in limit policy |
 | Retention | episode buffer retains for scoring (historical) | counters by default; capped event journal | Pack is lossier by default and reports its drops |
 | Distribution | needed a benchmark task provider/pack runtime | installed sink; no task-provider activation | Pack avoids task-provider activation |
 | Rewind | built-in session/buffer (historical) | pack engine provider `unigym_bench` | Same core rewind seam |

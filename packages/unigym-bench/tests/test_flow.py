@@ -116,9 +116,27 @@ class EvidenceFlow(NoOpFlow):
 
 
 class StatefulFlow(NoOpFlow):
-    """Flow that declares rewindable state before F2 supports it."""
+    """Flow that declares and implements rewindable state."""
 
     name = "stateful"
+    stateful = True
+
+    def __init__(self) -> None:
+        self.cursor = 0
+
+    def snapshot(self) -> dict[str, int]:
+        """Return the current cursor."""
+        return {"cursor": self.cursor}
+
+    def restore(self, state: dict[str, int]) -> None:
+        """Restore the cursor."""
+        self.cursor = state["cursor"]
+
+
+class StatefulWithoutCapabilityFlow(NoOpFlow):
+    """Flow that declares rewindable state without the checkpoint face."""
+
+    name = "stateful_missing"
     stateful = True
 
 
@@ -201,14 +219,22 @@ def test_validate_flow_accepts_a_no_op_flow_without_on_tick() -> None:
     [
         (MissingCallbacksFlow(), TypeError),
         (HiddenSnapshotFlow(), TypeError),
-        (StatefulFlow(), ValueError),
+        (StatefulWithoutCapabilityFlow(), TypeError),
     ],
 )
-def test_validate_flow_rejects_malformed_or_stateful_flows(
+def test_validate_flow_rejects_malformed_or_inconsistent_flows(
     flow: object, error: type[Exception]
 ) -> None:
     with pytest.raises(error):
         validate_flow(flow)
+
+
+def test_validate_flow_accepts_a_stateful_flow_with_both_capabilities() -> None:
+    flow = StatefulFlow()
+
+    assert validate_flow(flow) is flow
+    assert flow.stateful is True
+    assert flow.snapshot() == {"cursor": 0}
 
 
 def test_validate_flow_rejects_a_missing_name_and_non_callable_tick() -> None:
@@ -461,24 +487,26 @@ def test_benchmark_tick_rejects_duplicate_monitor_outputs() -> None:
         BenchmarkTick(step=context, monitor_outputs=(output, output))
 
 
-def test_rewind_and_restore_clear_the_transient_stop_flag() -> None:
+def test_rewind_restores_the_run_scoped_stop_flag() -> None:
     engine = StreamingEngine([])
     sink = BenchmarkSink(engine=engine)
     engine.on_step(make_bundle(num_envs=1, t=0))
-    snapshot = engine.rewind_state()
+    clear = engine.rewind_state()
+    assert clear["engine"]["stop_requested"] is False
 
     tick = engine.begin_tick(make_bundle(num_envs=1, t=1))
     engine.apply_decision(tick, FlowDecision(stop=True))
     assert sink.stop_when() is True
+    stopped = engine.rewind_state()
+    assert stopped["engine"]["stop_requested"] is True
 
-    engine.apply_rewind_state(snapshot)
+    engine.apply_rewind_state(clear)
     assert sink.stop_when() is False
 
-    tick = engine.begin_tick(make_bundle(num_envs=1, t=2))
-    engine.apply_decision(tick, FlowDecision(stop=True))
+    engine.apply_rewind_state(stopped)
     assert sink.stop_when() is True
     sink.on_rewind({})
-    assert sink.stop_when() is False
+    assert sink.stop_when() is True
 
 
 def test_flow_run_accepts_minimal_report_bundle() -> None:

@@ -279,3 +279,17 @@ def test_old_rewind_and_monitor_schemas_are_rejected() -> None:
         engine.validate_rewind_state(old_monitor)
     with pytest.raises(ValueError, match=r"expected schema 'unigym_bench.monitor/4'"):
         engine.apply_rewind_state(old_monitor)
+
+
+def test_pre_f5_payload_without_stop_flag_is_rejected() -> None:
+    sink, engine, _ = _sink()
+    _step(sink, 0, [0.0])
+    state = sink.rewind_provider.rewind_state()
+
+    pre_f5 = json.loads(json.dumps(state))
+    del pre_f5["engine"]["stop_requested"]
+
+    with pytest.raises(ValueError, match="stop_requested"):
+        engine.validate_rewind_state(pre_f5)
+    with pytest.raises(ValueError, match="stop_requested"):
+        engine.apply_rewind_state(pre_f5)

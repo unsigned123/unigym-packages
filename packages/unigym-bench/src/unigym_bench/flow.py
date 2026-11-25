@@ -6,7 +6,9 @@ episode boundaries, returns episode evidence and extension invocation, and
 returns the pack report at run end.  The flow never mutates the engine, a
 monitor or an environment; the sink and engine validate every decision before
 changing run state.  Extension persistence and rewind stay engine-owned; only
-lifecycle invocation moves to the flow.
+lifecycle invocation moves to the flow.  A ``stateful=True`` flow implements
+``snapshot()``/``restore()``; the sink binds it to the engine so its policy
+state joins the single ``unigym_bench`` rewind provider.
 
 Monitors publish values only.  :class:`DefaultBenchmarkFlow` applies explicit
 :class:`TerminationRule` declarations to those values (first true rule per env
@@ -52,6 +54,7 @@ __all__ = [
     "EventRule",
     "FlowDecision",
     "FlowRun",
+    "RewindableFlow",
     "TerminationRule",
     "validate_flow",
 ]
@@ -451,6 +454,25 @@ class BenchmarkFlow(Protocol):
         """Return the pack report document (or delegate to the default)."""
 
 
+@runtime_checkable
+class RewindableFlow(Protocol):
+    """Optional checkpoint face for a :attr:`BenchmarkFlow.stateful` flow.
+
+    ``snapshot`` returns a JSON-safe, private copy of the flow's policy state;
+    ``restore`` accepts a state previously returned by ``snapshot`` and must be
+    atomic enough that the engine can roll it back after an unexpected failure.
+    A flow may additionally implement ``validate_restore(state)``; the engine
+    calls it during checkpoint decoding so malformed payloads are refused before
+    any live state is touched.
+    """
+
+    def snapshot(self) -> JsonValue:
+        """Return the flow's rewindable state as JSON-safe, private data."""
+
+    def restore(self, state: JsonValue) -> None:
+        """Restore state previously returned by :meth:`snapshot`."""
+
+
 def validate_flow(value: object) -> BenchmarkFlow:
     """Validate a flow instance at the sink construction boundary.
 
@@ -461,8 +483,9 @@ def validate_flow(value: object) -> BenchmarkFlow:
         The validated flow.
 
     Raises:
-        TypeError: A required attribute or callback is missing or malformed.
-        ValueError: ``stateful`` is true; flow rewind is not part of this release.
+        TypeError: A required attribute or callback is missing or malformed,
+            or the ``stateful`` declaration disagrees with the snapshot/restore
+            capability.
     """
     name = getattr(value, "name", None)
     if not isinstance(name, str) or not name:
@@ -476,11 +499,12 @@ def validate_flow(value: object) -> BenchmarkFlow:
     has_snapshot = callable(getattr(value, "snapshot", None))
     has_restore = callable(getattr(value, "restore", None))
     if stateful:
-        raise ValueError(
-            f"benchmark flow {name!r}: stateful flows are not supported in this "
-            "release; flow rewind lands with the later rewind card"
-        )
-    if has_snapshot or has_restore:
+        if not (has_snapshot and has_restore):
+            raise TypeError(
+                f"benchmark flow {name!r}: stateful=True requires callable "
+                "snapshot() and restore()"
+            )
+    elif has_snapshot or has_restore:
         raise TypeError(
             f"benchmark flow {name!r}: declares stateful=False but implements "
             "snapshot/restore; declare stateful=True or remove the capability"

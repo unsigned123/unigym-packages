@@ -77,11 +77,13 @@ from .events import (
     termination_from_json,
 )
 from .flow import (
+    BenchmarkFlow,
     BenchmarkTick,
     EpisodeBatch,
     EpisodeEvidence,
     FlowDecision,
     _MonitorTickOutput,
+    validate_flow,
 )
 from .json import JsonValue, ensure_json_value
 from .monitors import Monitor
@@ -94,9 +96,12 @@ if TYPE_CHECKING:
 
 #: Checkpoint payload key and schema owned by the pack's rewind provider.
 #: Schema 5 pairs the value/context boundary with monitor snapshot schema 4 and
-#: carries finalized episode evidence plus stateful-extension snapshots.  Monitor
-#: snapshots contain only construction config and observed state, so schema 4 and
-#: older rewind payloads are rejected rather than silently upgraded.
+#: carries finalized episode evidence, stateful-extension snapshots, the
+#: run-scoped stop flag and (when the bound flow is stateful) its policy state.
+#: Monitor snapshots contain only construction config and observed state, so
+#: schema 4 and older rewind payloads are rejected rather than silently
+#: upgraded.  A pre-F5 ``/5`` payload lacks ``engine.stop_requested`` and is
+#: therefore rejected too rather than silently clearing the flag on restore.
 REWIND_PROVIDER_NAME = "unigym_bench"
 REWIND_SCHEMA = "unigym_bench.rewind/5"
 
@@ -108,7 +113,7 @@ __all__ = [
 ]
 
 _REWIND_KEYS = frozenset({"schema", "engine", "monitors"})
-_REWIND_OPTIONAL_KEYS = frozenset({"extensions"})
+_REWIND_OPTIONAL_KEYS = frozenset({"extensions", "flow"})
 _ENGINE_KEYS = frozenset(
     {
         "bound",
@@ -136,6 +141,7 @@ _ENGINE_KEYS = frozenset(
         "tick_total",
         "verdict_counts",
         "rewound_total",
+        "stop_requested",
         "termination_outcome_counts",
         "termination_code_counts",
         "termination_source_counts",
@@ -177,6 +183,7 @@ class _DecodedEngineState:
     tick_total: int
     verdict_counts: dict[str, int]
     rewound_total: int
+    stop_requested: bool
     termination_outcome_counts: dict[str, int]
     termination_code_counts: dict[str, int]
     termination_source_counts: dict[str, int]
@@ -190,6 +197,7 @@ class _DecodedRewindState:
     engine: _DecodedEngineState
     monitors: dict[str, JsonValue]
     extensions: dict[str, JsonValue]
+    flow: JsonValue | None
 
 
 @dataclass(frozen=True)
@@ -312,6 +320,24 @@ class StreamingEngine:
         self._active_tick: _ActiveTick | None = None
         self._active_episode: _ActiveEpisode | None = None
         self._stop_requested = False
+        self._flow: BenchmarkFlow | None = None
+
+    def bind_flow(self, flow: BenchmarkFlow | None) -> None:
+        """Bind the run's flow so stateful flow state joins this provider.
+
+        The sink owns flow construction; the engine keeps only the reference
+        needed to snapshot and restore stateful flow state.  Passing ``None``
+        unbinds.  The sink binds once at construction, before the first tick.
+        """
+        if flow is None:
+            self._flow = None
+            return
+        self._flow = validate_flow(flow)
+
+    @property
+    def flow(self) -> BenchmarkFlow | None:
+        """The flow bound for stateful rewind, or ``None`` when unbound."""
+        return self._flow
 
     # ------------------------------------------------------------------ #
     # Public read-only state
@@ -420,10 +446,13 @@ class StreamingEngine:
     def rewind_state(self) -> dict[str, JsonValue]:
         """Return a JSON-safe, private-copied checkpoint of the run state.
 
-        The payload owns only pack state: engine flags/counters, journal,
-        latches/pending drains, report accumulators that already exist, and
-        every rewindable monitor's ``snapshot()``.  The sampler cursor/RNG and
-        the core ``values`` store are separate core providers and are never
+        The payload owns only pack state: engine flags/counters (including the
+        run-scoped stop flag), journal, latches/pending drains, report
+        accumulators that already exist, every rewindable monitor's
+        ``snapshot()`` and, when the bound flow is stateful, that flow's
+        ``snapshot()``.  Episode records and evidence live only in the engine
+        block; flow state never duplicates them.  The sampler cursor/RNG and the
+        core ``values`` store are separate core providers and are never
         duplicated here.
         """
         engine: dict[str, JsonValue] = {
@@ -463,6 +492,7 @@ class StreamingEngine:
             "tick_total": self._tick_total,
             "verdict_counts": dict(self._verdict_counts),
             "rewound_total": self._rewound_total,
+            "stop_requested": self._stop_requested,
             "termination_outcome_counts": dict(self._termination_outcome_counts),
             "termination_code_counts": dict(self._termination_code_counts),
             "termination_source_counts": dict(self._termination_source_counts),
@@ -488,6 +518,18 @@ class StreamingEngine:
             # state must be restored, so a stateful extension can never silently
             # resume from a checkpoint that lacks its accumulator.
             document["extensions"] = extensions
+        flow = self._flow
+        if flow is not None and flow.stateful:
+            # A stateful flow is part of the checkpoint.  The ``flow`` key is
+            # optional so a stateless default flow keeps the three-key shape;
+            # it is present whenever flow state exists, and a stateful flow
+            # refuses a checkpoint that lacks it.
+            document["flow"] = {
+                "name": flow.name,
+                "state": ensure_json_value(
+                    flow.snapshot(), where=f"flow {flow.name!r} rewind snapshot"
+                ),
+            }
         normalized = ensure_json_value(document, where="unigym_bench rewind state")
         if not isinstance(normalized, dict):
             raise TypeError("unigym_bench rewind state: expected an object")
@@ -500,15 +542,16 @@ class StreamingEngine:
     def apply_rewind_state(self, state: object) -> None:
         """Restore a checkpoint in place after fully decoding and validating it.
 
-        Monitor and stateful-extension snapshots are pre-flighted with the
-        read-only ``validate_restore`` capability when present.  The live state
-        of every rewindable monitor and extension is captured before anything is
-        touched so an unexpected restore failure rolls all of them back; engine
-        fields are assigned only after every restore succeeded.  The stop flag
-        is transient and is cleared on a successful restore instead of being
-        checkpointed; a later card formalizes stop persistence.
+        Monitor, stateful-extension and stateful-flow snapshots are pre-flighted
+        with the read-only ``validate_restore`` capability when present.  The
+        live state of every rewindable monitor, extension and flow is captured
+        before anything is touched so an unexpected restore failure rolls all of
+        them back; engine fields are assigned only after every restore
+        succeeded.  The stop flag is run-scoped and restored with the engine
+        state rather than cleared.
         """
         decoded = self._decode_rewind_state(state)
+        flow = self._flow
         monitor_rollback: dict[str, JsonValue] = {}
         for monitor in self._monitors:
             snapshot = _monitor_snapshot(monitor)
@@ -518,6 +561,11 @@ class StreamingEngine:
         for extension in self._extensions:
             if extension.stateful:
                 extension_rollback[extension.name] = _extension_snapshot(extension)
+        flow_rollback: JsonValue | None = None
+        if flow is not None and flow.stateful:
+            flow_rollback = ensure_json_value(
+                flow.snapshot(), where=f"flow {flow.name!r} rollback snapshot"
+            )
         expected_extensions = _stateful_extensions(self._extensions)
         try:
             for monitor in self._monitors:
@@ -539,6 +587,11 @@ class StreamingEngine:
                         "callable restore"
                     )
                 restore(target)
+            if decoded.flow is not None:
+                # ``_decode_flow_state`` only returns a state when the bound
+                # flow is stateful and declares both capabilities.
+                assert flow is not None
+                flow.restore(decoded.flow)
         except Exception:
             for monitor in self._monitors:
                 previous = monitor_rollback.get(monitor.name)
@@ -546,9 +599,10 @@ class StreamingEngine:
                     monitor.restore(previous)
             for name, previous in extension_rollback.items():
                 expected_extensions[name].restore(previous)
+            if flow_rollback is not None:
+                flow.restore(flow_rollback)
             raise
         self._apply_engine_state(decoded.engine)
-        self._stop_requested = False
 
     # ------------------------------------------------------------------ #
     # Runner-facing lifecycle
@@ -1049,12 +1103,11 @@ class StreamingEngine:
         restored timeline's first step.  The mark rides the episode until it
         finalizes: a due record keeps its natural verdict plus ``rewound=True``;
         an episode still open at run end is reported with verdict ``rewound``.
-        The transient stop flag is cleared here too: a forked branch must not
-        inherit a stop request from the abandoned timeline.  A later card
-        formalizes stop persistence as part of the flow rewind contract.
+        The stop flag is run-scoped and was already restored with the engine
+        state, so a forked branch inherits exactly the checkpoint's request
+        rather than a flag from the abandoned timeline.
         """
         del info
-        self._stop_requested = False
         for env_id, is_open in enumerate(self._open):
             if is_open:
                 self._rewound[env_id] = True
@@ -1124,7 +1177,53 @@ class StreamingEngine:
             if callable(validate):
                 validate(normalized)
             extensions[name] = normalized
-        return _DecodedRewindState(engine=engine, monitors=monitors, extensions=extensions)
+        flow = self._decode_flow_state(payload, where)
+        return _DecodedRewindState(
+            engine=engine, monitors=monitors, extensions=extensions, flow=flow
+        )
+
+    def _decode_flow_state(self, payload: Mapping[str, JsonValue], where: str) -> JsonValue | None:
+        """Decode the optional stateful-flow block without touching live state.
+
+        A stateless or unbound flow must not receive a ``flow`` key, because
+        accepting one would silently drop the checkpoint's policy state.  A
+        stateful flow must receive one, because resuming without it would
+        silently diverge.  The flow's optional ``validate_restore`` runs here,
+        before any monitor, extension or flow is mutated.
+        """
+        flow = self._flow
+        flow_where = f"{where}.flow"
+        has_flow = "flow" in payload
+        if flow is None or not flow.stateful:
+            if has_flow:
+                live = "absent" if flow is None else f"stateless ({flow.name!r})"
+                raise ValueError(
+                    f"{flow_where}: checkpoint carries flow state but the live flow is "
+                    f"{live}; a stateful checkpoint cannot be restored silently"
+                )
+            return None
+        if not has_flow:
+            raise ValueError(
+                f"{flow_where}: stateful flow {flow.name!r} requires a flow snapshot; "
+                "a pre-F5 payload without flow state is rejected"
+            )
+        raw = payload["flow"]
+        if not isinstance(raw, dict):
+            raise TypeError(f"{flow_where}: expected an object, got {type(raw).__name__}")
+        _require_keys(raw, frozenset({"name", "state"}), flow_where)
+        name = raw["name"]
+        if not isinstance(name, str) or not name:
+            raise TypeError(f"{flow_where}.name: expected a non-empty string, got {name!r}")
+        if name != flow.name:
+            raise ValueError(
+                f"{flow_where}.name: checkpoint flow {name!r} does not match live "
+                f"flow {flow.name!r}"
+            )
+        state = ensure_json_value(raw["state"], where=f"{flow_where}.state")
+        validate = getattr(flow, "validate_restore", None)
+        if callable(validate):
+            validate(state)
+        return state
 
     def _decode_engine_state(self, raw: Mapping[str, JsonValue]) -> _DecodedEngineState:
         """Decode the engine-owned part of the payload into private locals."""
@@ -1222,6 +1321,7 @@ class StreamingEngine:
         dropped_events = _nonnegative_int(raw["dropped_events"], f"{where}.dropped_events")
         event_total = _nonnegative_int(raw["event_total"], f"{where}.event_total")
         rewound_total = _nonnegative_int(raw["rewound_total"], f"{where}.rewound_total")
+        stop_requested = _require_bool(raw["stop_requested"], f"{where}.stop_requested")
         if rewound_total > episode_total:
             raise ValueError(
                 f"{where}.rewound_total: expected a value <= episode_total "
@@ -1269,6 +1369,7 @@ class StreamingEngine:
             tick_total=tick_total,
             verdict_counts=verdict_counts,
             rewound_total=rewound_total,
+            stop_requested=stop_requested,
             termination_outcome_counts=termination_outcome_counts,
             termination_code_counts=termination_code_counts,
             termination_source_counts=termination_source_counts,
@@ -1301,6 +1402,7 @@ class StreamingEngine:
         self._tick_total = decoded.tick_total
         self._verdict_counts = decoded.verdict_counts
         self._rewound_total = decoded.rewound_total
+        self._stop_requested = decoded.stop_requested
         self._termination_outcome_counts = decoded.termination_outcome_counts
         self._termination_code_counts = decoded.termination_code_counts
         self._termination_source_counts = decoded.termination_source_counts

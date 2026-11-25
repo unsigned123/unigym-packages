@@ -38,6 +38,7 @@ from .flow import (
     EventRule,
     FlowDecision,
     FlowRun,
+    RewindableFlow,
     TerminationRule,
     validate_flow,
 )
@@ -55,6 +56,7 @@ __all__ = [
     "EventRule",
     "FlowDecision",
     "FlowRun",
+    "RewindableFlow",
     "TerminationRule",
     "JsonValue",
     "REQUIRED_CORE_VERSION",

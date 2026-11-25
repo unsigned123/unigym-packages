@@ -59,14 +59,16 @@ extensions and returns the pack report under :data:`SUMMARY_KEY`.  The sink
 validates the exact schema and top-level block set, caches the report once and
 never writes the core ``benchmark_report.json`` or any other core artifact.
 
-Rewind and early-stop hooks.  ``stop_when`` never stops.  The sink exposes the
-run's :class:`~unigym_bench.engine.StreamingEngine` as its core rewind provider
+Rewind and early-stop hooks.  ``stop_when`` returns the engine's run-scoped
+stop flag.  The sink exposes the run's
+:class:`~unigym_bench.engine.StreamingEngine` as its single core rewind provider
 (``name="unigym_bench"``, schema ``unigym_bench.rewind/5``); the engine owns all
-checkpointable pack state, including stateful report extensions.  A snapshot is
-taken between completed ticks, so there is no provisional reset glue to save.
-The sampler cursor/RNG and the core ``values`` store are separate core
-providers.  ``on_rewind`` delegates to the engine so open episodes are marked
-``rewound``.
+checkpointable pack state, including stateful report extensions and the policy
+state of a stateful flow bound by this sink.  A stateless default flow adds no
+checkpoint key.  A snapshot is taken between completed ticks, so there is no
+provisional reset glue to save.  The sampler cursor/RNG and the core ``values``
+store are separate core providers.  ``on_rewind`` delegates to the engine so
+open episodes are marked ``rewound``.
 """
 
 from __future__ import annotations
@@ -310,9 +312,8 @@ class BenchmarkSink:
         TypeError: Both or neither of ``monitors``/``engine`` are supplied, an
             injected engine is mixed with separately supplied resources, or the
             supplied flow is malformed.
-        ValueError: A monitor/extension name is duplicated, a declared
-            ``report_extension`` reference is missing, or the supplied flow
-            declares rewindable state (not supported until the rewind card).
+        ValueError: A monitor/extension name is duplicated or a declared
+            ``report_extension`` reference is missing.
     """
 
     def __init__(
@@ -379,6 +380,10 @@ class BenchmarkSink:
         )
         self._flow = DefaultBenchmarkFlow() if requested_flow is None else requested_flow
         self._fallback_flow = DefaultBenchmarkFlow()
+        # Bind the sink-owned flow to the engine so a stateful flow's policy
+        # state joins the single ``unigym_bench`` rewind provider.  The default
+        # flow is stateless and adds no checkpoint key.
+        self._engine.bind_flow(self._flow)
         self._monitor_extensions: Mapping[str, str] = (
             {} if monitor_extensions is None else dict(monitor_extensions)
         )
