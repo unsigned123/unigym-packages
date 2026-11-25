@@ -16,34 +16,34 @@ from unigym.values import StepValues, ValueStore
 
 from unigym_bench.engine import EngineStateError, StreamingEngine
 from unigym_bench.events import Event
-from unigym_bench.monitors import PredicateMonitor, ThresholdMonitor
+from unigym_bench.monitors import PredicateMonitor, threshold_config
 from unigym_bench.specs import RetentionSpec
 from _support import (
     ScriptedMonitor,
     TickScript,
     make_bundle,
     make_termination,
-    table_probe,
+    make_values,
 )
 
 
 def test_multi_env_interleaving_latches_each_env_independently() -> None:
-    monitor = ThresholdMonitor(
+    monitor = threshold_config(
         "contact",
-        table_probe([[1.0, 0.0], [0.0, 1.0]]),
+        "value:level",
         threshold=0.5,
         terminal_outcome="success",
     )
     engine = StreamingEngine([monitor], retention=RetentionSpec(retain_episodes=True))
 
-    engine.on_step(make_bundle(t=0, num_envs=2))
+    engine.on_step(make_bundle(t=0, num_envs=2, values=make_values([1.0, 0.0])))
     first = engine.drain_terminations()
     assert set(first) == {0}
     assert first[0].code == "custom.contact.threshold"
     engine.on_episode_end([0], make_bundle(t=0, num_envs=2))
     engine.on_reset([0])
 
-    engine.on_step(make_bundle(t=1, num_envs=2))
+    engine.on_step(make_bundle(t=1, num_envs=2, values=make_values([0.0, 1.0])))
     second = engine.drain_terminations()
     assert set(second) == {1}
     assert second[1].code == "custom.contact.threshold"

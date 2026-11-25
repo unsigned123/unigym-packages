@@ -184,7 +184,16 @@ class Comparison:
                 f"comparison source {self.ref} must be boolean, integer or "
                 f"floating point, got complex dtype {values.dtype}"
             )
-        return _compare(values.to(dtype=torch.float64), self.op, self.value)
+        comparable = values.to(dtype=torch.float64)
+        finite = torch.isfinite(comparable)
+        if not bool(finite.all()):
+            bad = int((~finite).nonzero(as_tuple=False)[0].item())
+            raise ConditionError(
+                f"comparison source {self.ref} has non-finite value "
+                f"{comparable[bad].item()!r} at env {bad}; condition sources must "
+                "be finite"
+            )
+        return _compare(comparable, self.op, self.value)
 
     def to_mapping(self) -> dict[str, JsonValue]:
         """Return the closed, JSON-safe leaf mapping accepted by the parser.

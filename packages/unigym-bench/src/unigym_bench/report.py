@@ -42,6 +42,8 @@ The report is a pack artifact.  Nothing in this module writes the core
 from __future__ import annotations
 
 import math
+import re
+import struct
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from types import MappingProxyType
@@ -62,6 +64,7 @@ __all__ = [
     "ReportExtension",
     "RunMetadata",
     "RunSummary",
+    "ScenarioCoverageExtension",
     "validate_report_extensions",
 ]
 
@@ -87,6 +90,12 @@ _BASE_BLOCKS: tuple[str, ...] = (
 
 #: Categories aggregated in the ``terminations`` base block.
 _TERMINATION_CATEGORIES: tuple[str, ...] = ("outcome", "code", "source")
+
+#: Schema id of :class:`ScenarioCoverageExtension`'s private rewind snapshot.
+_SCENARIO_COVERAGE_SNAPSHOT_SCHEMA = "unigym_bench.scenario_coverage/1"
+
+#: Extension names follow the monitor-name grammar.
+_NAME_PATTERN = re.compile(r"[a-z][a-z0-9_]*")
 
 
 @runtime_checkable
@@ -252,6 +261,173 @@ class RunSummary:
     def loop_mode(self) -> str:
         """The pack closed-loop mode selected at construction."""
         return self.metadata.loop_mode
+
+
+class ScenarioCoverageExtension:
+    """Stateful report extension that tracks scenario command coverage.
+
+    The extension observes each finalized episode's
+    :attr:`~unigym_bench.events.EpisodeRecord.command_at_start` through
+    :meth:`on_env_end`; it never receives a tick frame, view or tensor.  The
+    command is matched against a validated command pool with exact ``float32``
+    quantization, so the sampler remains the only owner of command
+    quantization.  The accumulator is JSON-safe and participates in the pack
+    rewind provider through :meth:`snapshot`/:meth:`restore`.
+
+    Args:
+        name: Extension name matching ``[a-z][a-z0-9_]*``.
+        commands: Non-empty sequence of equal-length finite command vectors.
+
+    Raises:
+        TypeError: ``name`` or ``commands`` has the wrong type.
+        ValueError: The name is malformed, the pool is empty, a row has a
+            different length, a value is non-finite after ``float32``
+            quantization, or two rows are duplicates.
+    """
+
+    stateful = True
+
+    def __init__(self, name: str, *, commands: Sequence[Sequence[float]]) -> None:
+        self.name = _require_extension_name(name)
+        self._commands = _require_command_pool(commands, f"report extension {name!r}.commands")
+        self._dim = len(self._commands[0])
+        self._index_by_row = {row: index for index, row in enumerate(self._commands)}
+        self._covered = [False] * len(self._commands)
+        self._episode_counts = [0] * len(self._commands)
+        self._unmatched = 0
+        self._episodes = 0
+
+    def on_env_end(self, env_ids: Sequence[int], records: Mapping[int, EpisodeRecord]) -> None:
+        """Match each due environment's start command against the pool.
+
+        Args:
+            env_ids: The due environment ids.
+            records: A read-only mapping containing exactly ``env_ids``.
+
+        Raises:
+            TypeError: ``records`` is not a mapping, a record is not an
+                ``EpisodeRecord``, or a record is missing for a due env.
+            ValueError: An env id is invalid, the mapping has extra ids, or a
+                start command is not representable as a finite float32 row.
+        """
+        ids = _validate_env_ids(env_ids)
+        if not isinstance(records, Mapping):
+            raise TypeError(
+                "scenario coverage.on_env_end.records: expected a mapping, "
+                f"got {type(records).__name__}"
+            )
+        missing = [env_id for env_id in ids if env_id not in records]
+        extra = sorted(set(records) - set(ids))
+        if missing or extra:
+            raise ValueError(
+                "scenario coverage.on_env_end.records: expected exactly "
+                f"{list(ids)}, missing {missing}, extra {extra}"
+            )
+        for env_id in ids:
+            record = records[env_id]
+            if not isinstance(record, EpisodeRecord):
+                raise TypeError(
+                    f"scenario coverage.on_env_end.records[{env_id}]: expected an "
+                    f"EpisodeRecord, got {type(record).__name__}"
+                )
+            self._episodes += 1
+            command = record.command_at_start
+            if command is None or len(command) != self._dim:
+                self._unmatched += 1
+                continue
+            row = _quantize_float32_row(command, f"scenario coverage episode {env_id}")
+            index = self._index_by_row.get(row)
+            if index is None:
+                self._unmatched += 1
+                continue
+            self._covered[index] = True
+            self._episode_counts[index] += 1
+
+    def on_run_end(self, summary: RunSummary) -> Mapping[str, JsonValue]:
+        """Return the same coverage facts the retired monitor reported."""
+        del summary
+        covered = sum(self._covered)
+        pool_size = len(self._commands)
+        return {
+            "name": self.name,
+            "kind": "scenario_coverage",
+            "pool_size": pool_size,
+            "covered": covered,
+            "coverage_ratio": covered / pool_size,
+            "episode_counts": list(self._episode_counts),
+            "unmatched_episodes": self._unmatched,
+            "episodes": self._episodes,
+        }
+
+    def snapshot(self) -> JsonValue:
+        """Return a JSON-safe private copy of the coverage accumulator."""
+        return {
+            "schema": _SCENARIO_COVERAGE_SNAPSHOT_SCHEMA,
+            "name": self.name,
+            "commands": [list(row) for row in self._commands],
+            "covered": list(self._covered),
+            "episode_counts": list(self._episode_counts),
+            "unmatched": self._unmatched,
+            "episodes": self._episodes,
+        }
+
+    def validate_restore(self, state: JsonValue) -> None:
+        """Pre-flight a snapshot without mutating the accumulator."""
+        self._decode_snapshot(state)
+
+    def restore(self, state: JsonValue) -> None:
+        """Replace the accumulator from a snapshot's private copy."""
+        decoded = self._decode_snapshot(state)
+        covered, episode_counts, unmatched, episodes = decoded
+        self._covered = covered
+        self._episode_counts = episode_counts
+        self._unmatched = unmatched
+        self._episodes = episodes
+
+    def _decode_snapshot(self, state: JsonValue) -> tuple[list[bool], list[int], int, int]:
+        payload = ensure_json_value(state, where=f"scenario coverage {self.name!r} restore")
+        if not isinstance(payload, dict):
+            raise TypeError(
+                f"scenario coverage {self.name!r} restore: expected an object, "
+                f"got {type(payload).__name__}"
+            )
+        expected = {
+            "schema",
+            "name",
+            "commands",
+            "covered",
+            "episode_counts",
+            "unmatched",
+            "episodes",
+        }
+        missing = sorted(expected - set(payload))
+        unknown = sorted(set(payload) - expected)
+        if missing or unknown:
+            raise ValueError(
+                f"scenario coverage {self.name!r} restore: expected keys "
+                f"{sorted(expected)}, missing {missing}, unknown {unknown}"
+            )
+        if payload["schema"] != _SCENARIO_COVERAGE_SNAPSHOT_SCHEMA:
+            raise ValueError(
+                f"scenario coverage {self.name!r} restore: expected schema "
+                f"{_SCENARIO_COVERAGE_SNAPSHOT_SCHEMA!r}, got {payload['schema']!r}"
+            )
+        if payload["name"] != self.name:
+            raise ValueError(
+                f"scenario coverage {self.name!r} restore: snapshot names "
+                f"extension {payload['name']!r}"
+            )
+        pool_size = len(self._commands)
+        if payload["commands"] != [list(row) for row in self._commands]:
+            raise ValueError(
+                f"scenario coverage {self.name!r} restore: snapshot command pool "
+                "does not match the extension configuration"
+            )
+        covered = _decode_bool_list(payload["covered"], pool_size, "covered")
+        episode_counts = _decode_int_list(payload["episode_counts"], pool_size, "episode_counts")
+        unmatched = _decode_nonnegative_int(payload["unmatched"], "unmatched")
+        episodes = _decode_nonnegative_int(payload["episodes"], "episodes")
+        return covered, episode_counts, unmatched, episodes
 
 
 class ReportBuilder:
@@ -716,6 +892,140 @@ def _validate_termination_counts(
         )
         validated[category] = MappingProxyType(dict(sorted(counts.items())))
     return MappingProxyType(validated)
+
+
+def _require_extension_name(value: object) -> str:
+    if not isinstance(value, str) or not _NAME_PATTERN.fullmatch(value):
+        raise ValueError(f"scenario coverage.name: expected [a-z][a-z0-9_]*, got {value!r}")
+    return value
+
+
+def _require_command_pool(value: object, where: str) -> tuple[tuple[float, ...], ...]:
+    if isinstance(value, (str, bytes, bytearray)) or not isinstance(value, Sequence):
+        raise TypeError(
+            f"{where}: expected a sequence of command vectors, got {type(value).__name__}"
+        )
+    rows = list(value)
+    if not rows:
+        raise ValueError(f"{where}: expected at least one command vector")
+    commands: list[tuple[float, ...]] = []
+    dimension: int | None = None
+    for row_index, row in enumerate(rows):
+        row_where = f"{where}[{row_index}]"
+        if isinstance(row, (str, bytes, bytearray)) or not isinstance(row, Sequence):
+            raise TypeError(f"{row_where}: expected a command vector, got {type(row).__name__}")
+        numbers: list[float] = []
+        for item_index, item in enumerate(row):
+            if isinstance(item, bool) or not isinstance(item, (int, float)):
+                raise TypeError(
+                    f"{row_where}[{item_index}]: expected a finite number, got {item!r}"
+                )
+            number = float(item)
+            if not math.isfinite(number):
+                raise ValueError(
+                    f"{row_where}[{item_index}]: expected a finite number, got {item!r}"
+                )
+            numbers.append(number)
+        if dimension is None:
+            dimension = len(numbers)
+            if dimension == 0:
+                raise ValueError(f"{row_where}: command vector must not be empty")
+        elif len(numbers) != dimension:
+            raise ValueError(
+                f"{row_where}: expected {dimension} values to match {where}[0], "
+                f"got {len(numbers)}"
+            )
+        commands.append(_quantize_float32_row(numbers, row_where))
+    if len(set(commands)) != len(commands):
+        raise ValueError(f"{where}: expected unique command vectors, got duplicates")
+    return tuple(commands)
+
+
+def _quantize_float32_row(values: Sequence[float], where: str) -> tuple[float, ...]:
+    """Quantize one command row to exact float32 Python values."""
+    row: list[float] = []
+    for index, value in enumerate(values):
+        number = _quantize_float32(float(value), f"{where}[{index}]")
+        row.append(number)
+    return tuple(row)
+
+
+def _quantize_float32(number: float, where: str) -> float:
+    """Return the float32-quantized value without importing a tensor library."""
+    try:
+        packed = struct.pack("<f", number)
+    except (OverflowError, struct.error) as exc:
+        raise ValueError(f"{where}: value {number!r} is not representable as float32") from exc
+    quantized = struct.unpack("<f", packed)[0]
+    if not math.isfinite(quantized):
+        raise ValueError(f"{where}: value {number!r} is not finite after float32 quantization")
+    return quantized
+
+
+def _validate_env_ids(env_ids: object) -> tuple[int, ...]:
+    if isinstance(env_ids, (str, bytes, bytearray)) or not isinstance(env_ids, Sequence):
+        raise TypeError(
+            f"scenario coverage.on_env_end.env_ids: expected a sequence of ints, "
+            f"got {type(env_ids).__name__}"
+        )
+    ids: list[int] = []
+    for index, env_id in enumerate(env_ids):
+        if isinstance(env_id, bool) or not isinstance(env_id, int):
+            raise TypeError(
+                f"scenario coverage.on_env_end.env_ids[{index}]: expected an int, "
+                f"got {env_id!r}"
+            )
+        if env_id < 0:
+            raise ValueError(
+                f"scenario coverage.on_env_end.env_ids[{index}]: expected an id >= 0, "
+                f"got {env_id}"
+            )
+        ids.append(env_id)
+    if len(set(ids)) != len(ids):
+        raise ValueError(
+            "scenario coverage.on_env_end.env_ids: expected unique ids, " f"got {tuple(ids)}"
+        )
+    return tuple(ids)
+
+
+def _decode_bool_list(value: JsonValue, expected: int, field: str) -> list[bool]:
+    items = _decode_state_list(value, field)
+    if len(items) != expected:
+        raise ValueError(f"{field}: expected {expected} values, got {len(items)}")
+    result: list[bool] = []
+    for index, item in enumerate(items):
+        if type(item) is not bool:
+            raise TypeError(f"{field}[{index}]: expected a bool, got {item!r}")
+        result.append(item)
+    return result
+
+
+def _decode_int_list(value: JsonValue, expected: int, field: str) -> list[int]:
+    items = _decode_state_list(value, field)
+    if len(items) != expected:
+        raise ValueError(f"{field}: expected {expected} values, got {len(items)}")
+    result: list[int] = []
+    for index, item in enumerate(items):
+        if isinstance(item, bool) or not isinstance(item, int):
+            raise TypeError(f"{field}[{index}]: expected an int, got {item!r}")
+        if item < 0:
+            raise ValueError(f"{field}[{index}]: expected an int >= 0, got {item}")
+        result.append(item)
+    return result
+
+
+def _decode_nonnegative_int(value: JsonValue, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{field}: expected an int, got {value!r}")
+    if value < 0:
+        raise ValueError(f"{field}: expected an int >= 0, got {value}")
+    return value
+
+
+def _decode_state_list(value: JsonValue, field: str) -> list[JsonValue]:
+    if not isinstance(value, list):
+        raise TypeError(f"{field}: expected a list, got {type(value).__name__}")
+    return value
 
 
 def _require_str(value: object, where: str) -> None:

@@ -8,23 +8,22 @@ import pytest
 
 from unigym_bench.engine import REWIND_PROVIDER_NAME, REWIND_SCHEMA, StreamingEngine
 from unigym_bench.json import ensure_json_value
-from unigym_bench.monitors import ThresholdMonitor
+from unigym_bench.monitors import PredicateMonitor, threshold_config
 from unigym_bench.sink import BenchmarkSink
 from unigym_bench.specs import RetentionSpec
-from _support import make_bundle, table_probe
+from _support import make_bundle, make_values
 
 
 def _sink(
-    rows: list[list[float]],
     *,
     name: str = "contact",
     threshold: float = 0.5,
     terminal_outcome: str | None = "success",
     retention: RetentionSpec | None = None,
-) -> tuple[BenchmarkSink, StreamingEngine, ThresholdMonitor]:
-    monitor = ThresholdMonitor(
+) -> tuple[BenchmarkSink, StreamingEngine, PredicateMonitor]:
+    monitor = threshold_config(
         name,
-        table_probe(rows),
+        "value:level",
         threshold=threshold,
         terminal_outcome=terminal_outcome,
     )
@@ -35,30 +34,34 @@ def _sink(
     return BenchmarkSink(engine=engine), engine, monitor
 
 
-def _step(sink: BenchmarkSink, t: int) -> dict[str, object]:
-    bundle = make_bundle(num_envs=1, t=t)
+def _bundle(t: int, row: list[float]) -> dict[str, object]:
+    return make_bundle(num_envs=1, t=t, values=make_values(row))
+
+
+def _step(sink: BenchmarkSink, t: int, row: list[float]) -> dict[str, object]:
+    bundle = _bundle(t, row)
     sink.on_step(t, bundle)
     return bundle
 
 
-def _due(sink: BenchmarkSink, t: int) -> None:
-    bundle = _step(sink, t)
+def _due(sink: BenchmarkSink, t: int, row: list[float]) -> None:
+    bundle = _step(sink, t, row)
     sink.drain_terminations()
     sink.on_episode_end([0], bundle)
     sink.on_step_end(t, bundle)
 
 
 def test_provider_identity_and_payload_is_json_safe_and_private() -> None:
-    sink, engine, _ = _sink([[0.0]])
-    _step(sink, 0)
+    sink, engine, _ = _sink()
+    _step(sink, 0, [0.0])
 
     provider = sink.rewind_provider
     assert provider is engine
     assert provider.name == REWIND_PROVIDER_NAME == "unigym_bench"
     state = provider.rewind_state()
 
-    assert state["schema"] == REWIND_SCHEMA == "unigym_bench.rewind/3"
-    assert state["monitors"]["contact"]["schema"] == "unigym_bench.monitor/2"
+    assert state["schema"] == REWIND_SCHEMA == "unigym_bench.rewind/4"
+    assert state["monitors"]["contact"]["schema"] == "unigym_bench.monitor/3"
     assert set(state) == {"schema", "engine", "monitors"}
     assert ensure_json_value(state) == state
     assert json.loads(json.dumps(state)) == state
@@ -71,14 +74,15 @@ def test_provider_identity_and_payload_is_json_safe_and_private() -> None:
 
 
 def test_roundtrip_after_a_due_episode_restores_seq_ticks_journal_and_monitor() -> None:
-    sink, engine, monitor = _sink([[0.0], [1.0], [0.0], [1.0]])
-    _step(sink, 0)
-    _due(sink, 1)
+    sink, engine, monitor = _sink()
+    rows = [[0.0], [1.0], [0.0], [1.0]]
+    _step(sink, 0, rows[0])
+    _due(sink, 1, rows[1])
     assert engine.open_envs == (0,)
     snapshot = sink.rewind_provider.rewind_state()
 
-    _step(sink, 2)
-    _due(sink, 3)
+    _step(sink, 2, rows[2])
+    _due(sink, 3, rows[3])
     assert engine.summary.episodes == 2
     assert [record.episode_seq for record in engine.records] == [0, 1]
 
@@ -89,20 +93,20 @@ def test_roundtrip_after_a_due_episode_restores_seq_ticks_journal_and_monitor() 
     assert engine.summary.episodes == 1
     assert engine.summary.total_ticks == 2
     assert [record.episode_seq for record in engine.records] == [0]
-    assert monitor.report_view()["trigger_events"] == 1
+    assert monitor.report_view()["fired"] == 1
 
-    _step(sink, 2)
-    _due(sink, 3)
+    _step(sink, 2, rows[2])
+    _due(sink, 3, rows[3])
 
     assert [record.episode_seq for record in engine.records] == [0, 1]
     assert engine.records[1].ticks == 2
     assert len(engine.journal) == 2
-    assert monitor.report_view()["trigger_events"] == 2
+    assert monitor.report_view()["fired"] == 2
 
 
 def test_pending_terminal_is_snapshotted_restored_and_drained_once() -> None:
-    sink, engine, _ = _sink([[1.0]])
-    _step(sink, 0)
+    sink, engine, _ = _sink()
+    _step(sink, 0, [1.0])
     snapshot = sink.rewind_provider.rewind_state()
     assert set(snapshot["engine"]["pending"]) == {"0"}
 
@@ -119,8 +123,8 @@ def test_pending_terminal_is_snapshotted_restored_and_drained_once() -> None:
 
 
 def test_first_terminal_latch_event_counter_and_journal_length_are_restored() -> None:
-    sink, engine, _ = _sink([[1.0]])
-    _step(sink, 0)
+    sink, engine, _ = _sink()
+    _step(sink, 0, [1.0])
     snapshot = sink.rewind_provider.rewind_state()
     assert snapshot["engine"]["latched"]["0"]["code"] == "custom.contact.threshold"
 
@@ -133,7 +137,7 @@ def test_first_terminal_latch_event_counter_and_journal_length_are_restored() ->
     assert engine.conflicts == {}
     assert set(sink.drain_terminations()) == {0}
 
-    bundle = make_bundle(num_envs=1, t=0)
+    bundle = _bundle(0, [1.0])
     sink.on_episode_end([0], bundle)
     record = engine.records[0]
     assert record.first_terminal is not None
@@ -143,19 +147,18 @@ def test_first_terminal_latch_event_counter_and_journal_length_are_restored() ->
 
 def test_dropped_event_counter_and_capped_journal_are_restored() -> None:
     sink, engine, _ = _sink(
-        [[1.0], [1.0], [1.0]],
         retention=RetentionSpec(retain_episodes=True, max_events=1),
     )
-    _due(sink, 0)
-    _step(sink, 1)
+    _due(sink, 0, [1.0])
+    _step(sink, 1, [1.0])
     snapshot = sink.rewind_provider.rewind_state()
     assert len(snapshot["engine"]["journal"]) == 1
     assert snapshot["engine"]["dropped_events"] == 1
 
     sink.drain_terminations()
-    sink.on_episode_end([0], make_bundle(num_envs=1, t=1))
-    sink.on_step_end(1, make_bundle(num_envs=1, t=1))
-    _step(sink, 2)
+    sink.on_episode_end([0], _bundle(1, [1.0]))
+    sink.on_step_end(1, _bundle(1, [1.0]))
+    _step(sink, 2, [1.0])
     assert engine.dropped_events == 2
 
     sink.rewind_provider.apply_rewind_state(snapshot)
@@ -168,26 +171,26 @@ def test_dropped_event_counter_and_capped_journal_are_restored() -> None:
 def test_monitor_snapshot_config_mismatch_is_rejected_atomically() -> None:
     source = StreamingEngine(
         [
-            ThresholdMonitor("contact", table_probe([[0.0]]), threshold=0.5),
-            ThresholdMonitor("stable", table_probe([[0.0]]), threshold=0.5),
+            threshold_config("contact", "value:level", threshold=0.5),
+            threshold_config("stable", "value:level", threshold=0.5),
         ],
         retention=RetentionSpec(retain_episodes=True),
     )
     source_sink = BenchmarkSink(engine=source)
-    source_sink.on_step(0, make_bundle(num_envs=1, t=0))
+    source_sink.on_step(0, _bundle(0, [0.0]))
     snapshot = source_sink.rewind_provider.rewind_state()
 
-    stable = ThresholdMonitor("stable", table_probe([[1.0]]), threshold=0.5)
+    stable = threshold_config("stable", "value:level", threshold=0.5)
     target = StreamingEngine(
         [
-            ThresholdMonitor("contact", table_probe([[1.0]]), threshold=0.9),
+            threshold_config("contact", "value:level", threshold=0.9),
             stable,
         ],
         retention=RetentionSpec(retain_episodes=True),
     )
     target_sink = BenchmarkSink(engine=target)
-    target_sink.on_step(0, make_bundle(num_envs=1, t=0))
-    assert stable.report_view()["trigger_events"] == 1
+    target_sink.on_step(0, _bundle(0, [1.0]))
+    assert stable.report_view()["fired"] == 1
     assert len(target.journal) == 2
 
     with pytest.raises(ValueError, match="config does not match"):
@@ -195,7 +198,7 @@ def test_monitor_snapshot_config_mismatch_is_rejected_atomically() -> None:
     with pytest.raises(ValueError, match="config does not match"):
         target_sink.rewind_provider.apply_rewind_state(snapshot)
 
-    assert stable.report_view()["trigger_events"] == 1
+    assert stable.report_view()["fired"] == 1
     assert len(target.journal) == 2
     assert target.records == ()
     assert target.open_envs == (0,)
@@ -203,14 +206,14 @@ def test_monitor_snapshot_config_mismatch_is_rejected_atomically() -> None:
 
 
 def test_rewind_after_due_episode_marks_replayed_open_episode_rewound() -> None:
-    sink, engine, _ = _sink([[1.0], [0.0]])
-    _due(sink, 0)
+    sink, engine, _ = _sink()
+    _due(sink, 0, [1.0])
     snapshot = sink.rewind_provider.rewind_state()
 
-    _step(sink, 1)
+    _step(sink, 1, [0.0])
     sink.rewind_provider.apply_rewind_state(snapshot)
     sink.on_rewind({"tick": 2, "restored_tick": 1, "snap_id": 7})
-    _step(sink, 1)
+    _step(sink, 1, [0.0])
     summary = sink.on_run_end()
 
     assert [record.verdict for record in engine.records] == ["terminal", "rewound"]
@@ -221,8 +224,8 @@ def test_rewind_after_due_episode_marks_replayed_open_episode_rewound() -> None:
 
 
 def test_payload_never_carries_sampler_or_core_value_state() -> None:
-    sink, _, _ = _sink([[1.0]])
-    _step(sink, 0)
+    sink, _, _ = _sink()
+    _step(sink, 0, [1.0])
 
     state = sink.rewind_provider.rewind_state()
 
@@ -243,20 +246,20 @@ def test_payload_never_carries_sampler_or_core_value_state() -> None:
 
 
 def test_old_rewind_and_monitor_schemas_are_rejected() -> None:
-    sink, engine, _ = _sink([[0.0]])
-    _step(sink, 0)
+    sink, engine, _ = _sink()
+    _step(sink, 0, [0.0])
     state = sink.rewind_provider.rewind_state()
 
     old_rewind = json.loads(json.dumps(state))
-    old_rewind["schema"] = "unigym_bench.rewind/2"
-    with pytest.raises(ValueError, match=r"expected 'unigym_bench.rewind/3'"):
+    old_rewind["schema"] = "unigym_bench.rewind/3"
+    with pytest.raises(ValueError, match=r"expected 'unigym_bench.rewind/4'"):
         engine.validate_rewind_state(old_rewind)
-    with pytest.raises(ValueError, match=r"expected 'unigym_bench.rewind/3'"):
+    with pytest.raises(ValueError, match=r"expected 'unigym_bench.rewind/4'"):
         engine.apply_rewind_state(old_rewind)
 
     old_monitor = json.loads(json.dumps(state))
-    old_monitor["monitors"]["contact"]["schema"] = "unigym_bench.monitor/1"
-    with pytest.raises(ValueError, match=r"expected schema 'unigym_bench.monitor/2'"):
+    old_monitor["monitors"]["contact"]["schema"] = "unigym_bench.monitor/2"
+    with pytest.raises(ValueError, match=r"expected schema 'unigym_bench.monitor/3'"):
         engine.validate_rewind_state(old_monitor)
-    with pytest.raises(ValueError, match=r"expected schema 'unigym_bench.monitor/2'"):
+    with pytest.raises(ValueError, match=r"expected schema 'unigym_bench.monitor/3'"):
         engine.apply_rewind_state(old_monitor)

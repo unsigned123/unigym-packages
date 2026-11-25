@@ -5,15 +5,17 @@ streaming, monitor-driven benchmarking layer on the public sink, evaluation,
 value and step-context contracts, without importing `unigym.benchmarks`,
 `unigym.runner.evaluation` or `unigym.runner.episodes`.
 
-Status: P15 (core `0.107.0` value/context baseline; no throughput claim).
+Status: P14, applied on the P15 value/context runtime baseline (core `0.107.0`;
+no throughput claim).
 P10 moves the import fence and version pin to core C13: the pack requires
 `unigym>=0.107,<0.108`, `CORE_SURFACE_VERSION` is `3`, and the fence checks
 `unigym.values` (`ValueStore`, `ValueView`, `ValuePublisher`, `StepValues`)
 and `unigym.evaluation.EnvStepContext` instead of the removed
-`unigym.signals`. Runtime migration is complete through P15: P11 replaces the
-pack `TickFrame` with `BenchmarkStepContext` (a core `EnvStepContext`
-subclass), P12 adds the source resolver and condition DSL, and P13 adds
-`PredicateMonitor`. P15 moves the runtime onto the core value transport:
+`unigym.signals`. This baseline includes the P15 runtime migration: P11
+replaces the pack `TickFrame` with `BenchmarkStepContext` (a core
+`EnvStepContext` subclass), P12 adds the source resolver and condition DSL, and
+P13 adds `PredicateMonitor`. P15 moves the runtime onto the core value
+transport:
 
 - `make_sink` reads `ctx.values` as a `ValuePublisher`, and `sink-steered`
   fails fast when it is absent;
@@ -25,15 +27,22 @@ subclass), P12 adds the source resolver and condition DSL, and P13 adds
   report/scoring terminals are counted in the aggregate/report without a
   runner drain or latch conflict;
 - `ScenarioSampler.bind_values(ValueView)` replaces `bind_signals`;
-- the pack rewind schema is `unigym_bench.rewind/3` and monitor snapshots are
-  `unigym_bench.monitor/2`; older payloads are rejected explicitly.
+- the pack rewind schema is `unigym_bench.rewind/4` and monitor snapshots are
+  `unigym_bench.monitor/3`; older payloads are rejected explicitly.
 
-P14 (collapse the built-in monitors) and P16 (TaskDocument composition) remain
-later cards. The package
-already contains the P0-P15 tree: version metadata, the core-contract import
-fence, strict JSON helpers, the closed YAML task-spec loader
-(`unigym_bench.specs`), the monitor protocol with the v1 built-in monitors
-(`unigym_bench.monitors`), the streaming engine
+P14 collapses the typed built-in monitors. `ThresholdMonitor`, `HoldMonitor`,
+`SafetyMonitor` and `EventCounterMonitor` are now `PredicateMonitor`
+configurations built by `threshold_config`, `hold_config`, `safety_config` and
+`event_counter_config`; the `Probe` protocol and the old typed monitor
+constructors/state classes are deleted. `PhaseMonitor` takes an explicit
+`SourceRef` and resolves it through `SourceResolver`. Scenario coverage is a
+stateful `ScenarioCoverageExtension` in `report.py`, fed by finalized
+`EpisodeRecord.command_at_start` values instead of a tick monitor. P16
+(TaskDocument composition) remains a later card. The package already contains
+the P0-P15 tree with the P14 collapse: version metadata, the core-contract
+import fence, strict JSON helpers, the closed YAML task-spec loader
+(`unigym_bench.specs`), the monitor protocol with the configured predicate and
+phase monitors (`unigym_bench.monitors`), the streaming engine
 (`unigym_bench.engine`), the core sink shell (`unigym_bench.sink`), the rewind
 provider, the report builder with report extensions (`unigym_bench.report`),
 and the validated command scenario with its rewind-capable sampler
@@ -149,18 +158,80 @@ context through `on_episode_end(env_ids, final_context)`. Episode-end
 report/scoring terminals are drained through the separate optional
 `drain_episode_terminals()` face, never through the runner drain. A monitor
 clears per-env measurement state through `reset` and contributes a JSON-safe
-`report_view`. Stateful built-ins implement the
-optional `RewindableMonitor.snapshot()/restore()` capability with JSON-safe
-private copies; a snapshot carries a construction/config fingerprint and
-`restore` rejects a monitor with a different configuration.
+`report_view`. Stateful monitors implement the optional
+`RewindableMonitor.snapshot()/restore()` capability with JSON-safe private
+copies; a snapshot carries a construction/config fingerprint and `restore`
+rejects a monitor with a different configuration.
 
 `BaseMonitor` is a convenience class with empty values and no-op lifecycle.
-The v1 built-ins are `ThresholdMonitor`, `HoldMonitor`,
-`EventCounterMonitor`, `PhaseMonitor`, `SafetyMonitor` and
-`ScenarioCoverageMonitor`. Value-driven built-ins take an explicit `Probe`
-callable that returns one `(num_envs,)` tensor on the frame device; the
-composition layer, not the monitor, decides where that value comes from.
-Monitors never retain a frame, view or tensor.
+`PredicateMonitor` is the compositional monitor: one condition tree, one
+`TriggerSpec` (`tick`, `edge`, `hold`, `once`, `episode_end`) and one
+`EmitSpec` (local value name, optional event/severity and optional terminal).
+Each condition reads explicit `SourceRef` values (`record:`, `obs:`, `value:`;
+`query:` is rejected in v1) through `SourceResolver`; there is no `Probe`
+callable and no fallback lookup.
+
+The retired typed monitors are configuration helpers that return a validated
+`PredicateMonitor`:
+
+```python
+from unigym_bench.monitors import (
+    event_counter_config, hold_config, safety_config, threshold_config,
+)
+
+contact = threshold_config("contact", "value:force", threshold=5.0,
+                           terminal_outcome="failure")
+settled = hold_config("settled", "value:error", threshold=0.05, hold_steps=10)
+danger = safety_config("danger", "value:tilt", threshold=0.6, severity="fatal")
+bounces = event_counter_config("bounces", "value:contact")
+```
+
+`PhaseMonitor(name, source, boundaries=..., phase_names=...)` remains a
+specialized monitor: it resolves one per-env floating vector from `source` on
+each tick and reports phases, transitions and episode phases.
+
+Scenario coverage is not a monitor. `ScenarioCoverageExtension` in
+`unigym_bench.report` is a stateful report extension: `on_env_end` reads the
+finalized `EpisodeRecord.command_at_start` of each due env and matches it
+against a validated command pool with exact `float32` quantization (using no
+tick frame, view or tensor). Its accumulator is snapshotted by the rewind
+provider, and its `on_run_end` block is emitted under
+`extensions/<name>`. Like the retired monitor it observes due episode
+boundaries only; an episode finalized only at run end is not a coverage
+observation.
+
+### Report field mapping
+
+The new predicate report is intentionally generic. Where a retired field has
+no predicate equivalent, the table names the replacement and the reason.
+
+| Old monitor field | New report field | Notes |
+| --- | --- | --- |
+| `kind: threshold/hold/safety/event_counter` | `kind: predicate` | The configuration is visible under `condition`, `trigger` and `emit`. |
+| `threshold`, `operator`, `hold_steps` | `condition`, `trigger` | The closed condition mapping and trigger spec are the source of truth. |
+| `trigger_events`, `holds`, `violation_events`, `occurrences` | `fired` | One count per fired environment row. |
+| per-env trigger counters | `fired_counts` | Same per-env edge/hold counts. |
+| `episodes` | `episodes` | Unchanged. |
+| `terminal_outcome` | `terminal_outcome` | Unchanged; the terminal code keeps `custom.<monitor>.<reason>`. |
+| `severity` | `severity` | Event severity for threshold/hold/safety; report metadata for the event counter. |
+| `active_ticks`, `violation_ticks`, `max_streak` | (none) | A `PredicateMonitor` publishes the trigger mask, not a continuous level, so these watchers have no equivalent. |
+| signal `level` | (none) | Only the configured emit value is published (`<monitor>/<value>`). |
+| signal `active` / `violating` / `holding` / `count` | emit value | The published bit is the trigger firing mask, not the continuous condition or cumulative counter. |
+| event data `value`, `threshold`, `operator`, `hold_steps` | generic trigger data | Events carry only `{"trigger": <kind>}` plus `steps` for a hold trigger. The old monitor-specific data fields are not preserved. |
+| terminal metrics `value`, `threshold`, `hold_steps` | empty `metrics` | Predicate terminals have `metrics: {}`; outcome, code, source and first-terminal behavior are preserved. |
+| scenario coverage fields | `extensions/<name>` | `ScenarioCoverageExtension` returns the original `pool_size`, `covered`, `coverage_ratio`, `episode_counts`, `unmatched_episodes` and `episodes` facts. |
+
+Event grouping also differs: `PredicateMonitor` emits one event per firing tick
+with the fired env ids grouped, while the retired typed monitors emitted one
+event per env. Per-episode `event_counts` and the firing counts above remain
+per env; `execution.event_total` counts grouped occurrences.
+
+Event and terminal payload parity is therefore limited. Event names, codes,
+severity and env ids are preserved, but event `data` is the generic trigger
+description rather than the old measured value/threshold/operator payload.
+Terminal outcome, code, source and per-env first-terminal behavior are
+preserved, but terminal `metrics` are empty because a predicate does not retain
+the measured value.
 
 ## Closed loop
 

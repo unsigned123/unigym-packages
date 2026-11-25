@@ -1,15 +1,15 @@
-"""Construction helpers for monitor tests: real contexts and simple probes.
+"""Construction helpers for monitor tests: real contexts and value sources.
 
 These are test inputs, not stand-ins for pack components: every context is
 built from a real :class:`unigym.evaluation.EnvView` and a
-:class:`unigym.values.StepValues` snapshot, and every probe is a small callable
-that returns a real tensor for the context's device.
+:class:`unigym.values.StepValues` snapshot, and the value helpers publish real
+per-env tensors that a monitor resolves through an explicit ``value:`` source.
 """
 
 from __future__ import annotations
 
 from argparse import Namespace
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 
 import torch
@@ -27,7 +27,8 @@ from unigym_bench.context import BenchmarkStepContext
 from unigym_bench.engine import StreamingEngine
 from unigym_bench.events import Event
 from unigym_bench.json import JsonValue
-from unigym_bench.monitors import BaseMonitor, Monitor, ThresholdMonitor
+from unigym_bench.monitors import BaseMonitor, Monitor, threshold_config
+from unigym_bench.report import ScenarioCoverageExtension
 from unigym_bench.sink import BenchmarkSink, make_sink
 
 
@@ -186,57 +187,35 @@ class ScriptedMonitor(BaseMonitor):
         self.resets.append(tuple(env_ids))
 
 
-def constant_probe(
-    values: Sequence[float], *, dtype: torch.dtype = torch.float32
-) -> Callable[[EnvStepContext], torch.Tensor]:
-    """Return a probe that always reports the same per-env row."""
-    row = [float(value) for value in values]
-
-    def probe(context: EnvStepContext) -> torch.Tensor:
-        return torch.tensor(row, dtype=dtype, device=context.device)
-
-    return probe
+def make_values(
+    row: Sequence[float],
+    *,
+    name: str = "level",
+    dtype: torch.dtype = torch.float32,
+) -> StepValues:
+    """Return a real step-value snapshot with one per-env row."""
+    return StepValues({name: torch.tensor(list(row), dtype=dtype)})
 
 
-def bool_probe(values: Sequence[bool]) -> Callable[[EnvStepContext], torch.Tensor]:
-    """Return a boolean probe that always reports the same per-env row."""
-    row = [bool(value) for value in values]
-
-    def probe(context: EnvStepContext) -> torch.Tensor:
-        return torch.tensor(row, dtype=torch.bool, device=context.device)
-
-    return probe
-
-
-def series_probe(
-    rows: Sequence[Sequence[float]], *, dtype: torch.dtype = torch.float32
-) -> Callable[[EnvStepContext], torch.Tensor]:
-    """Return a probe that advances one row per call."""
-    remaining = [[float(value) for value in row] for row in rows]
-    state = {"index": 0}
-
-    def probe(context: EnvStepContext) -> torch.Tensor:
-        index = state["index"]
-        if index >= len(remaining):
-            raise AssertionError(f"series probe exhausted after {len(remaining)} calls")
-        state["index"] = index + 1
-        return torch.tensor(remaining[index], dtype=dtype, device=context.device)
-
-    return probe
-
-
-def table_probe(
-    rows: Sequence[Sequence[float]], *, dtype: torch.dtype = torch.float32
-) -> Callable[[EnvStepContext], torch.Tensor]:
-    """Return a probe that selects a row by the context's policy tick."""
-    table = [[float(value) for value in row] for row in rows]
-
-    def probe(context: EnvStepContext) -> torch.Tensor:
-        if context.t >= len(table):
-            raise AssertionError(f"table probe has no row for tick {context.t}")
-        return torch.tensor(table[context.t], dtype=dtype, device=context.device)
-
-    return probe
+def make_value_context(
+    row: Sequence[float],
+    *,
+    name: str = "level",
+    t: int = 0,
+    num_envs: int | None = None,
+    device: str | torch.device = "cpu",
+    dtype: torch.dtype = torch.float32,
+) -> BenchmarkStepContext:
+    """Build a real context whose value source carries one per-env row."""
+    target = torch.device(device)
+    tensor = torch.tensor(list(row), dtype=dtype, device=target)
+    resolved_num_envs = int(tensor.shape[0]) if num_envs is None else num_envs
+    return make_context(
+        num_envs=resolved_num_envs,
+        t=t,
+        values=StepValues({name: tensor}),
+        device=target,
+    )
 
 
 _SINK_CONTEXT_CFG: dict[str, JsonValue] = {
@@ -287,16 +266,16 @@ def make_sink_context(
 def make_threshold_monitors() -> tuple[Monitor, ...]:
     """Importable zero-argument monitor factory used by make_sink tests."""
     return (
-        ThresholdMonitor(
+        threshold_config(
             "contact",
-            constant_probe([0.0]),
+            "value:level",
             threshold=0.5,
             terminal_outcome="success",
         ),
     )
 
 
-class IntegrationProbeMonitor(BaseMonitor):
+class IntegrationMonitor(BaseMonitor):
     """Minimal monitor used by the real-run integration test.
 
     It counts ticks and contributes one JSON-safe report view; it owns no
@@ -319,10 +298,10 @@ class IntegrationProbeMonitor(BaseMonitor):
 
 def make_integration_monitors() -> tuple[Monitor, ...]:
     """Importable zero-argument monitor factory for the real-run test."""
-    return (IntegrationProbeMonitor(),)
+    return (IntegrationMonitor(),)
 
 
-class BundleProbeSink:
+class BundleRecordingSink:
     """Test harness forwarding to the real pack sink while recording bundles.
 
     The pack sink still owns every callback and all report state; this wrapper
@@ -377,9 +356,9 @@ class BundleProbeSink:
         self.inner.on_rewind(info)
 
 
-def make_observed_sink(ctx: SinkContext) -> BundleProbeSink:
+def make_observed_sink(ctx: SinkContext) -> BundleRecordingSink:
     """Importable real-run sink factory wrapping ``make_sink``."""
-    return BundleProbeSink(make_sink(ctx))
+    return BundleRecordingSink(make_sink(ctx))
 
 
 class StaticReportExtension:
@@ -401,7 +380,7 @@ class StaticReportExtension:
         return dict(self._block)
 
 
-class ViewProbeReportExtension:
+class ViewReportExtension:
     """Stateless extension proving fallback views reach ``on_run_end``."""
 
     stateful = False
@@ -640,6 +619,11 @@ class RecordingReportExtension:
 def make_report_extensions() -> tuple[RecordingReportExtension, ...]:
     """Importable zero-argument report-extension factory used by make_sink tests."""
     return (RecordingReportExtension(),)
+
+
+def make_coverage_extensions() -> tuple[ScenarioCoverageExtension, ...]:
+    """Importable coverage extension factory used by the real-run test."""
+    return (ScenarioCoverageExtension("coverage", commands=[[0.0]]),)
 
 
 @dataclass(frozen=True)

@@ -51,7 +51,7 @@ never writes the core ``benchmark_report.json`` or any other core artifact.
 
 Rewind and early-stop hooks.  ``stop_when`` never stops.  The sink exposes the
 run's :class:`~unigym_bench.engine.StreamingEngine` as its core rewind provider
-(``name="unigym_bench"``, schema ``unigym_bench.rewind/3``); the engine owns all
+(``name="unigym_bench"``, schema ``unigym_bench.rewind/4``); the engine owns all
 checkpointable pack state, including stateful report extensions, and the sink's
 own ``_pending_reset`` glue is empty at every core snapshot freeze point (a
 snapshot is taken between completed ticks).  The sampler cursor/RNG and the

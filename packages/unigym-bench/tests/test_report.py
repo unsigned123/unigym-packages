@@ -25,6 +25,7 @@ from unigym_bench.report import (
     ReportBuilder,
     RunMetadata,
     RunSummary,
+    ScenarioCoverageExtension,
     validate_report_extensions,
 )
 from unigym_bench.sink import BenchmarkSink, make_sink
@@ -44,7 +45,7 @@ from _support import (
     SummaryFactsReportExtension,
     TickScript,
     UndeclaredExtension,
-    ViewProbeReportExtension,
+    ViewReportExtension,
     make_bundle,
     make_sink_context,
     make_termination,
@@ -156,7 +157,7 @@ def test_base_fallback_and_extension_blocks_assemble_the_fixed_layout() -> None:
 
 def test_monitor_with_declared_extension_is_not_duplicated_under_monitors() -> None:
     monitor = BaseMonitor("contact")
-    extension = ViewProbeReportExtension("contact_report")
+    extension = ViewReportExtension("contact_report")
     builder = ReportBuilder(
         monitors=[monitor],
         extensions=[extension],
@@ -548,6 +549,63 @@ def test_stateful_extension_state_round_trips_through_the_rewind_provider() -> N
     assert extension.episodes == 2
     assert extension.envs == [0, 0]
     assert engine.summary.episodes == 2
+
+
+def test_scenario_coverage_extension_uses_record_start_commands_and_rewinds() -> None:
+    extension = ScenarioCoverageExtension("coverage", commands=[[0.0], [1.0]])
+    monitor = ScriptedMonitor(
+        "hit",
+        {0: TickScript(terminals={0: make_termination("custom.hit.one")})},
+    )
+    sink, engine = _sink(
+        [monitor],
+        extensions=[extension],
+        retention=RetentionSpec(retain_episodes=True),
+    )
+
+    first = make_bundle(num_envs=2, t=0, cmd=torch.tensor([[0.0], [2.0]]))
+    sink.on_step(0, first)
+    sink.drain_terminations()
+    sink.on_episode_end([0], first)
+    sink.on_step_end(0, first)
+
+    state = sink.rewind_provider.rewind_state()
+    assert state["extensions"]["coverage"] == {
+        "schema": "unigym_bench.scenario_coverage/1",
+        "name": "coverage",
+        "commands": [[0.0], [1.0]],
+        "covered": [True, False],
+        "episode_counts": [1, 0],
+        "unmatched": 0,
+        "episodes": 1,
+    }
+    sink.rewind_provider.validate_rewind_state(state)
+
+    second = make_bundle(num_envs=2, t=1, cmd=torch.tensor([[0.0], [2.0]]))
+    sink.on_step(1, second)
+    sink.on_episode_end([1], second)
+    live = sink.rewind_provider.rewind_state()["extensions"]["coverage"]
+    assert live["episodes"] == 2
+    assert live["unmatched"] == 1
+
+    sink.rewind_provider.apply_rewind_state(state)
+    restored = sink.rewind_provider.rewind_state()["extensions"]["coverage"]
+    assert restored["episodes"] == 1
+    assert restored["unmatched"] == 0
+
+    report = sink.on_run_end()["BenchmarkSink"]
+    assert isinstance(report, dict)
+    assert report["extensions"]["coverage"] == {
+        "name": "coverage",
+        "kind": "scenario_coverage",
+        "pool_size": 2,
+        "covered": 1,
+        "coverage_ratio": 0.5,
+        "episode_counts": [1, 0],
+        "unmatched_episodes": 0,
+        "episodes": 1,
+    }
+    assert report["tasks"]["extensions"] == ["coverage"]
 
 
 def test_rewind_rejects_missing_extension_state_on_a_plain_engine() -> None:

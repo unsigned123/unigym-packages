@@ -1,15 +1,17 @@
-"""Monitor protocol, convenience base and the v1 built-in monitors.
+"""Monitor protocol, convenience base and the configured monitor helpers.
 
 A monitor is the stateful per-env unit of a benchmark task.  It observes ticks,
 publishes per-env level signals, emits one-shot events and requests per-env
-episode terminals.  This module owns the monitor contract, the six legacy
-built-ins and the compositional :class:`PredicateMonitor`; it owns no engine,
-sink, report or scenario code.
+episode terminals.  This module owns the monitor contract, the compositional
+:class:`PredicateMonitor`, the specialized :class:`PhaseMonitor` and the
+configuration helpers that replace the retired typed monitor classes; it owns no
+engine, sink, report or scenario code.
 
 Ownership boundaries:
 
 - A monitor decides when an event occurs.  Events are drained one-shot and the
-  engine does not deduplicate them in v1.  Built-ins emit on their own edges.
+  engine does not deduplicate them in v1.  A predicate monitor emits on its
+  configured trigger.
 - A monitor requests terminals as core :class:`Termination` facts with
   ``source=CUSTOM`` and a ``custom.<monitor>.<reason>`` code.  The engine owns
   the first-terminal latch for an environment; a monitor keeps no competing
@@ -17,16 +19,16 @@ Ownership boundaries:
 - ``signals()`` returns fresh per-env level tensors with a leading dimension of
   ``num_envs``.  A monitor stores plain Python measurements, never tensors or
   views, so it cannot retain boundary data.
-- ``reset(env_ids)`` clears per-env measurement state (edges, streaks, phases,
-  captured commands).  Run-scoped report accumulators persist, and the last
-  observed level is refreshed by the next tick rather than erased.
-- A stateful built-in implements :class:`RewindableMonitor`; ``snapshot()`` is
+- ``reset(env_ids)`` clears per-env measurement state (edges, streaks, phases).
+  Run-scoped report accumulators persist.
+- A stateful monitor implements :class:`RewindableMonitor`; ``snapshot()`` is
   JSON-safe and both directions return private copies.
 
-Built-ins that read a value take an explicit :class:`Probe` callable.  The
-probe is composed at the pack's composition boundary and returns one level
-tensor with shape ``(num_envs,)`` on the context device.  A probe is never
-inferred from a name, so a monitor cannot silently read the wrong quantity.
+A value-driven monitor names its input with an explicit
+:class:`~unigym_bench.sources.SourceRef`; the monitor resolves it through a
+:class:`~unigym_bench.sources.SourceResolver` at the boundary.  There is no
+callable input and no fallback lookup, so a monitor cannot silently read the
+wrong quantity.
 """
 
 from __future__ import annotations
@@ -51,27 +53,32 @@ from .conditions import Condition, ConditionError, parse_condition
 from .events import SEVERITIES, Event, Severity, termination_from_json
 from .json import JsonValue, ensure_json_value
 from .predicates import EmitSpec, TriggerKind, TriggerSpec
-from .sources import SourceResolver
+from .sources import SourceError, SourceRef, SourceResolver
 
 __all__ = [
     "BaseMonitor",
     "Comparison",
-    "EventCounterMonitor",
-    "HoldMonitor",
     "Monitor",
     "PhaseMonitor",
     "PredicateMonitor",
-    "Probe",
     "RewindableMonitor",
-    "SafetyMonitor",
-    "ScenarioCoverageMonitor",
-    "ThresholdMonitor",
+    "event_counter_config",
+    "hold_config",
+    "safety_config",
+    "threshold_config",
 ]
 
-#: Comparison operator accepted by the value-threshold built-ins.
+#: Comparison operator accepted by the configuration helpers.
 Comparison: TypeAlias = Literal[">", ">=", "<", "<="]
 
-_SNAPSHOT_SCHEMA = "unigym_bench.monitor/2"
+_CONDITION_OPS: Mapping[str, str] = {
+    ">": "gt",
+    ">=": "gte",
+    "<": "lt",
+    "<=": "lte",
+}
+
+_SNAPSHOT_SCHEMA = "unigym_bench.monitor/3"
 _SNAPSHOT_KEYS = frozenset(
     {
         "schema",
@@ -103,20 +110,6 @@ class _DecodedMonitorSnapshot:
     device: torch.device | None
     pending_events: tuple[Event, ...]
     pending_terminals: dict[int, Termination]
-
-
-class Probe(Protocol):
-    """Read one per-env level from a tick context.
-
-    The returned tensor must have shape ``(context.num_envs,)`` and live on
-    ``context.device``.  A numeric probe returns a floating tensor; a boolean
-    probe returns ``torch.bool``.  The monitor copies the values immediately
-    and never retains the tensor.
-    """
-
-    def __call__(self, context: EnvStepContext) -> Tensor:
-        """Return the per-env level for ``context``."""
-        ...
 
 
 @runtime_checkable
@@ -450,452 +443,198 @@ class _StatefulMonitor(BaseMonitor):
         return torch.tensor(list(values), dtype=dtype, device=self._device)
 
 
-@dataclass(frozen=True)
-class _ThresholdState:
-    active: list[bool]
-    last_values: list[float]
-    trigger_events: int
-    active_ticks: int
-    episodes: int
+def threshold_config(
+    name: str,
+    source: SourceRef | str,
+    *,
+    threshold: float,
+    operator: Comparison = ">=",
+    terminal_outcome: EpisodeOutcome | str | None = None,
+) -> PredicateMonitor:
+    """Configure a threshold predicate: an edge-triggered comparison.
 
+    The old ``ThresholdMonitor`` is now one :class:`PredicateMonitor`: a
+    single-source ``Comparison`` condition, an ``edge`` trigger and an emit
+    spec whose event name and terminal reason are unchanged.
 
-class ThresholdMonitor(_StatefulMonitor):
-    """Emit an event and optional terminal when a level crosses a threshold.
+    Args:
+        name: Monitor name matching ``[a-z][a-z0-9_]*``.
+        source: Per-env numeric source reference (``SourceRef`` or ``kind:key``).
+        threshold: Finite comparison threshold.
+        operator: One of ``>``, ``>=``, ``<`` or ``<=``.
+        terminal_outcome: Optional episode outcome for a per-env terminal on
+            each rising edge.
 
-    The signal ``active`` reports the current condition and ``level`` the last
-    observed value.  One event is emitted per environment on each rising edge,
-    where ``value <operator> threshold`` becomes true.  With
-    ``terminal_outcome`` set, the same edge also queues a terminal.
+    Returns:
+        A validated predicate monitor.
     """
-
-    kind = "threshold"
-
-    def __init__(
-        self,
-        name: str,
-        probe: Probe,
-        *,
-        threshold: float,
-        operator: Comparison = ">=",
-        terminal_outcome: EpisodeOutcome | str | None = None,
-    ) -> None:
-        super().__init__(name)
-        where = f"monitor {self.name!r}"
-        self._probe = _require_probe(probe, f"{where}.probe")
-        self._threshold = _require_finite_float(threshold, f"{where}.threshold")
-        self._operator = _require_comparison(operator, f"{where}.operator")
-        self._terminal_outcome = _require_outcome(terminal_outcome, f"{where}.terminal_outcome")
-        self._active: list[bool] = []
-        self._last_values: list[float] = []
-        self._trigger_events = 0
-        self._active_ticks = 0
-        self._episodes = 0
-
-    def on_tick(self, context: EnvStepContext) -> None:
-        """Update the condition and emit the rising edges."""
-        self._bind_context(context)
-        values = _read_float_probe(self._probe, context, f"monitor {self.name!r}.probe")
-        self._active = self._ensure_length(self._active, False)
-        self._last_values = self._ensure_length(self._last_values, 0.0)
-        for env_id, value in enumerate(values):
-            active = _compare(value, self._operator, self._threshold)
-            if active and not self._active[env_id]:
-                self._trigger_events += 1
-                self._emit_event(
-                    name="threshold_reached",
-                    env_id=env_id,
-                    severity="info",
-                    data={
-                        "value": value,
-                        "threshold": self._threshold,
-                        "operator": self._operator,
-                    },
-                )
-                if self._terminal_outcome is not None:
-                    self._emit_terminal(
-                        env_id,
-                        outcome=self._terminal_outcome,
-                        reason="threshold",
-                        metrics={"value": value, "threshold": self._threshold},
-                    )
-            if active:
-                self._active_ticks += 1
-            self._active[env_id] = active
-        self._last_values = [float(value) for value in values]
-
-    def signals(self) -> Mapping[str, Tensor]:
-        """Return the current level and condition."""
-        if self._device is None or not self._last_values:
-            return {}
-        return {
-            "level": self._signal_tensor(self._last_values, torch.float32),
-            "active": torch.tensor(self._active, dtype=torch.bool, device=self._device),
-        }
-
-    def on_episode_end(self, env_ids: Sequence[int], context: EnvStepContext | None = None) -> None:
-        """Count observed episodes."""
-        self._episodes += len(_validate_env_ids(env_ids, self._num_envs, "on_episode_end.env_ids"))
-
-    def reset(self, env_ids: Sequence[int]) -> None:
-        """Clear the condition edge state for ``env_ids``."""
-        for env_id in _validate_env_ids(env_ids, self._num_envs, "reset.env_ids"):
-            if env_id < len(self._active):
-                self._active[env_id] = False
-
-    def report_view(self) -> Mapping[str, JsonValue]:
-        """Return the run-scoped threshold statistics."""
-        return self._json_report(
-            {
-                "name": self.name,
-                "kind": self.kind,
-                "threshold": self._threshold,
-                "operator": self._operator,
-                "terminal_outcome": (
-                    None if self._terminal_outcome is None else self._terminal_outcome.value
-                ),
-                "trigger_events": self._trigger_events,
-                "active_ticks": self._active_ticks,
-                "episodes": self._episodes,
-            }
-        )
-
-    def _state_fields(self) -> Mapping[str, JsonValue]:
-        return {
-            "active": list(self._active),
-            "last_values": list(self._last_values),
-            "trigger_events": self._trigger_events,
-            "active_ticks": self._active_ticks,
-            "episodes": self._episodes,
-        }
-
-    def _config_fields(self) -> Mapping[str, JsonValue]:
-        return {
-            "threshold": self._threshold,
-            "operator": self._operator,
-            "terminal_outcome": (
-                None if self._terminal_outcome is None else self._terminal_outcome.value
-            ),
-        }
-
-    def _decode_state(
-        self, state: Mapping[str, JsonValue], num_envs: int | None
-    ) -> _ThresholdState:
-        where = f"monitor {self.name!r} restore.state"
-        _require_state_keys(
-            state,
-            frozenset({"active", "last_values", "trigger_events", "active_ticks", "episodes"}),
-            where,
-        )
-        return _ThresholdState(
-            active=_decode_bool_list(state["active"], f"{where}.active", num_envs),
-            last_values=_decode_float_list(state["last_values"], f"{where}.last_values", num_envs),
-            trigger_events=_decode_nonnegative_int(
-                state["trigger_events"], f"{where}.trigger_events"
-            ),
-            active_ticks=_decode_nonnegative_int(state["active_ticks"], f"{where}.active_ticks"),
-            episodes=_decode_nonnegative_int(state["episodes"], f"{where}.episodes"),
-        )
-
-    def _apply_state(self, decoded: object) -> None:
-        if not isinstance(decoded, _ThresholdState):
-            raise TypeError(
-                f"monitor {self.name!r}: invalid threshold state bundle "
-                f"{type(decoded).__name__}"
-            )
-        self._active = decoded.active
-        self._last_values = decoded.last_values
-        self._trigger_events = decoded.trigger_events
-        self._active_ticks = decoded.active_ticks
-        self._episodes = decoded.episodes
+    where = f"threshold_config({name!r})"
+    ref = _coerce_source_ref(source, f"{where}.source")
+    level = _require_finite_float(threshold, f"{where}.threshold")
+    comparison = _require_comparison(operator, f"{where}.operator")
+    outcome = _require_outcome(terminal_outcome, f"{where}.terminal_outcome")
+    return PredicateMonitor(
+        name,
+        _comparison_mapping(ref, comparison, level),
+        TriggerSpec(kind="edge"),
+        EmitSpec(
+            value="threshold_reached",
+            event="threshold_reached",
+            severity="info",
+            terminal_reason=None if outcome is None else "threshold",
+            terminal_outcome=outcome,
+        ),
+    )
 
 
-@dataclass(frozen=True)
-class _HoldState:
-    streak: list[int]
-    reached: list[bool]
-    last_values: list[float]
-    holds: int
-    max_streak: int
-    episodes: int
+def hold_config(
+    name: str,
+    source: SourceRef | str,
+    *,
+    threshold: float,
+    hold_steps: int,
+    operator: Comparison = ">=",
+    terminal_outcome: EpisodeOutcome | str | None = None,
+) -> PredicateMonitor:
+    """Configure a hold predicate: fire once after consecutive true ticks.
 
+    The old ``HoldMonitor`` becomes a ``Comparison`` condition plus a ``hold``
+    trigger.  The terminal reason and event name are unchanged.
 
-class HoldMonitor(_StatefulMonitor):
-    """Emit once when a level holds a condition for consecutive ticks.
+    Args:
+        name: Monitor name matching ``[a-z][a-z0-9_]*``.
+        source: Per-env numeric source reference.
+        threshold: Finite comparison threshold.
+        hold_steps: Positive number of consecutive true evaluations.
+        operator: One of ``>``, ``>=``, ``<`` or ``<=``.
+        terminal_outcome: Optional episode outcome for a per-env terminal on
+            the hold firing.
 
-    ``streak`` reports the current consecutive count and ``holding`` whether
-    the current streak satisfies the hold.  One event and optional terminal
-    are emitted per environment when a streak reaches ``hold_steps``; a false
-    tick resets the streak and re-arms the hold.
+    Returns:
+        A validated predicate monitor.
     """
-
-    kind = "hold"
-
-    def __init__(
-        self,
-        name: str,
-        probe: Probe,
-        *,
-        threshold: float,
-        hold_steps: int,
-        operator: Comparison = ">=",
-        terminal_outcome: EpisodeOutcome | str | None = None,
-    ) -> None:
-        super().__init__(name)
-        where = f"monitor {self.name!r}"
-        self._probe = _require_probe(probe, f"{where}.probe")
-        self._threshold = _require_finite_float(threshold, f"{where}.threshold")
-        self._operator = _require_comparison(operator, f"{where}.operator")
-        self._hold_steps = _require_positive_int(hold_steps, f"{where}.hold_steps")
-        self._terminal_outcome = _require_outcome(terminal_outcome, f"{where}.terminal_outcome")
-        self._streak: list[int] = []
-        self._reached: list[bool] = []
-        self._last_values: list[float] = []
-        self._holds = 0
-        self._max_streak = 0
-        self._episodes = 0
-
-    def on_tick(self, context: EnvStepContext) -> None:
-        """Update streaks and emit the hold edges."""
-        self._bind_context(context)
-        values = _read_float_probe(self._probe, context, f"monitor {self.name!r}.probe")
-        self._streak = self._ensure_length(self._streak, 0)
-        self._reached = self._ensure_length(self._reached, False)
-        self._last_values = self._ensure_length(self._last_values, 0.0)
-        for env_id, value in enumerate(values):
-            if not _compare(value, self._operator, self._threshold):
-                self._streak[env_id] = 0
-                self._reached[env_id] = False
-                continue
-            self._streak[env_id] += 1
-            self._max_streak = max(self._max_streak, self._streak[env_id])
-            if self._reached[env_id] or self._streak[env_id] < self._hold_steps:
-                continue
-            self._reached[env_id] = True
-            self._holds += 1
-            self._emit_event(
-                name="hold_reached",
-                env_id=env_id,
-                severity="info",
-                data={
-                    "value": value,
-                    "threshold": self._threshold,
-                    "operator": self._operator,
-                    "hold_steps": self._hold_steps,
-                },
-            )
-            if self._terminal_outcome is not None:
-                self._emit_terminal(
-                    env_id,
-                    outcome=self._terminal_outcome,
-                    reason="hold",
-                    metrics={
-                        "value": value,
-                        "threshold": self._threshold,
-                        "hold_steps": float(self._hold_steps),
-                    },
-                )
-        self._last_values = [float(value) for value in values]
-
-    def signals(self) -> Mapping[str, Tensor]:
-        """Return the level, streak and reached flag."""
-        if self._device is None or not self._last_values:
-            return {}
-        return {
-            "level": self._signal_tensor(self._last_values, torch.float32),
-            "streak": torch.tensor(self._streak, dtype=torch.int64, device=self._device),
-            "holding": torch.tensor(self._reached, dtype=torch.bool, device=self._device),
-        }
-
-    def on_episode_end(self, env_ids: Sequence[int], context: EnvStepContext | None = None) -> None:
-        """Count observed episodes."""
-        self._episodes += len(_validate_env_ids(env_ids, self._num_envs, "on_episode_end.env_ids"))
-
-    def reset(self, env_ids: Sequence[int]) -> None:
-        """Clear streaks and reached flags for ``env_ids``."""
-        for env_id in _validate_env_ids(env_ids, self._num_envs, "reset.env_ids"):
-            if env_id < len(self._streak):
-                self._streak[env_id] = 0
-                self._reached[env_id] = False
-
-    def report_view(self) -> Mapping[str, JsonValue]:
-        """Return the run-scoped hold statistics."""
-        return self._json_report(
-            {
-                "name": self.name,
-                "kind": self.kind,
-                "threshold": self._threshold,
-                "operator": self._operator,
-                "hold_steps": self._hold_steps,
-                "terminal_outcome": (
-                    None if self._terminal_outcome is None else self._terminal_outcome.value
-                ),
-                "holds": self._holds,
-                "max_streak": self._max_streak,
-                "episodes": self._episodes,
-            }
-        )
-
-    def _state_fields(self) -> Mapping[str, JsonValue]:
-        return {
-            "streak": list(self._streak),
-            "reached": list(self._reached),
-            "last_values": list(self._last_values),
-            "holds": self._holds,
-            "max_streak": self._max_streak,
-            "episodes": self._episodes,
-        }
-
-    def _config_fields(self) -> Mapping[str, JsonValue]:
-        return {
-            "threshold": self._threshold,
-            "operator": self._operator,
-            "hold_steps": self._hold_steps,
-            "terminal_outcome": (
-                None if self._terminal_outcome is None else self._terminal_outcome.value
-            ),
-        }
-
-    def _decode_state(self, state: Mapping[str, JsonValue], num_envs: int | None) -> _HoldState:
-        where = f"monitor {self.name!r} restore.state"
-        _require_state_keys(
-            state,
-            frozenset({"streak", "reached", "last_values", "holds", "max_streak", "episodes"}),
-            where,
-        )
-        return _HoldState(
-            streak=_decode_int_list(state["streak"], f"{where}.streak", num_envs),
-            reached=_decode_bool_list(state["reached"], f"{where}.reached", num_envs),
-            last_values=_decode_float_list(state["last_values"], f"{where}.last_values", num_envs),
-            holds=_decode_nonnegative_int(state["holds"], f"{where}.holds"),
-            max_streak=_decode_nonnegative_int(state["max_streak"], f"{where}.max_streak"),
-            episodes=_decode_nonnegative_int(state["episodes"], f"{where}.episodes"),
-        )
-
-    def _apply_state(self, decoded: object) -> None:
-        if not isinstance(decoded, _HoldState):
-            raise TypeError(
-                f"monitor {self.name!r}: invalid hold state bundle " f"{type(decoded).__name__}"
-            )
-        self._streak = decoded.streak
-        self._reached = decoded.reached
-        self._last_values = decoded.last_values
-        self._holds = decoded.holds
-        self._max_streak = decoded.max_streak
-        self._episodes = decoded.episodes
+    where = f"hold_config({name!r})"
+    ref = _coerce_source_ref(source, f"{where}.source")
+    level = _require_finite_float(threshold, f"{where}.threshold")
+    comparison = _require_comparison(operator, f"{where}.operator")
+    steps = _require_positive_int(hold_steps, f"{where}.hold_steps")
+    outcome = _require_outcome(terminal_outcome, f"{where}.terminal_outcome")
+    return PredicateMonitor(
+        name,
+        _comparison_mapping(ref, comparison, level),
+        TriggerSpec(kind="hold", steps=steps),
+        EmitSpec(
+            value="hold_reached",
+            event="hold_reached",
+            severity="info",
+            terminal_reason=None if outcome is None else "hold",
+            terminal_outcome=outcome,
+        ),
+    )
 
 
-@dataclass(frozen=True)
-class _EventCounterState:
-    previous: list[bool]
-    counts: list[int]
-    occurrences: int
-    episodes: int
+def safety_config(
+    name: str,
+    source: SourceRef | str,
+    *,
+    threshold: float,
+    operator: Comparison = ">=",
+    severity: Severity = "violation",
+    terminal_outcome: EpisodeOutcome | str | None = None,
+) -> PredicateMonitor:
+    """Configure a safety violation predicate: an edge-triggered comparison.
 
+    The old ``SafetyMonitor`` becomes a ``Comparison`` condition, an ``edge``
+    trigger and an emit spec with the configured severity.  The event name and
+    terminal reason are unchanged.
 
-class EventCounterMonitor(_StatefulMonitor):
-    """Count boolean occurrences per environment for the report.
+    Args:
+        name: Monitor name matching ``[a-z][a-z0-9_]*``.
+        source: Per-env numeric source reference.
+        threshold: Finite comparison threshold.
+        operator: One of ``>``, ``>=``, ``<`` or ``<=``.
+        severity: Severity for the emitted violation event.
+        terminal_outcome: Optional episode outcome for a per-env terminal on
+            each rising edge.
 
-    The probe returns a boolean level.  Each false-to-true edge increments the
-    per-env ``count`` signal and the run total.  This monitor is report-only:
-    it emits no events and no terminals.  ``reset`` clears edge detection but
-    keeps the run-scoped counts.  ``severity`` is report metadata only;
-    occurrences are counted once per rising edge and are not severity-weighted.
+    Returns:
+        A validated predicate monitor.
     """
+    where = f"safety_config({name!r})"
+    ref = _coerce_source_ref(source, f"{where}.source")
+    level = _require_finite_float(threshold, f"{where}.threshold")
+    comparison = _require_comparison(operator, f"{where}.operator")
+    level_severity = _require_severity(severity, f"{where}.severity")
+    outcome = _require_outcome(terminal_outcome, f"{where}.terminal_outcome")
+    return PredicateMonitor(
+        name,
+        _comparison_mapping(ref, comparison, level),
+        TriggerSpec(kind="edge"),
+        EmitSpec(
+            value="violation",
+            event="violation",
+            severity=level_severity,
+            terminal_reason=None if outcome is None else "violation",
+            terminal_outcome=outcome,
+        ),
+    )
 
-    kind = "event_counter"
 
-    def __init__(
-        self,
-        name: str,
-        probe: Probe,
-        *,
-        severity: Severity = "info",
-    ) -> None:
-        super().__init__(name)
-        where = f"monitor {self.name!r}"
-        self._probe = _require_probe(probe, f"{where}.probe")
-        self._severity = _require_severity(severity, f"{where}.severity")
-        self._previous: list[bool] = []
-        self._counts: list[int] = []
-        self._occurrences = 0
-        self._episodes = 0
+def event_counter_config(
+    name: str,
+    source: SourceRef | str,
+    *,
+    severity: Severity = "info",
+) -> PredicateMonitor:
+    """Configure a report-only occurrence counter: edge-triggered true values.
 
-    def on_tick(self, context: EnvStepContext) -> None:
-        """Count rising edges."""
-        self._bind_context(context)
-        current = _read_bool_probe(self._probe, context, f"monitor {self.name!r}.probe")
-        self._previous = self._ensure_length(self._previous, False)
-        self._counts = self._ensure_length(self._counts, 0)
-        for env_id, value in enumerate(current):
-            if value and not self._previous[env_id]:
-                self._counts[env_id] += 1
-                self._occurrences += 1
-            self._previous[env_id] = value
+    The old ``EventCounterMonitor`` becomes an ``edge`` predicate over a
+    boolean-like source: a value greater than zero is true.  It emits no event
+    and no terminal.  The run report keeps the severity and the per-env firing
+    counts; the monitor publishes the per-tick rising-edge mask.
 
-    def signals(self) -> Mapping[str, Tensor]:
-        """Return the run-scoped per-env count."""
-        if self._device is None or not self._counts:
-            return {}
-        return {"count": torch.tensor(self._counts, dtype=torch.int64, device=self._device)}
+    Args:
+        name: Monitor name matching ``[a-z][a-z0-9_]*``.
+        source: Per-env boolean or numeric source reference.
+        severity: Report metadata severity (never event-weighted).
 
-    def on_episode_end(self, env_ids: Sequence[int], context: EnvStepContext | None = None) -> None:
-        """Count observed episodes."""
-        self._episodes += len(_validate_env_ids(env_ids, self._num_envs, "on_episode_end.env_ids"))
+    Returns:
+        A validated predicate monitor.
+    """
+    where = f"event_counter_config({name!r})"
+    ref = _coerce_source_ref(source, f"{where}.source")
+    level_severity = _require_severity(severity, f"{where}.severity")
+    return PredicateMonitor(
+        name,
+        _comparison_mapping(ref, ">", 0.0),
+        TriggerSpec(kind="edge"),
+        EmitSpec(value="counted", severity=level_severity),
+    )
 
-    def reset(self, env_ids: Sequence[int]) -> None:
-        """Clear edge detection for ``env_ids``; counts persist."""
-        for env_id in _validate_env_ids(env_ids, self._num_envs, "reset.env_ids"):
-            if env_id < len(self._previous):
-                self._previous[env_id] = False
 
-    def report_view(self) -> Mapping[str, JsonValue]:
-        """Return the run-scoped occurrence counts."""
-        return self._json_report(
-            {
-                "name": self.name,
-                "kind": self.kind,
-                "severity": self._severity,
-                "occurrences": self._occurrences,
-                "counts": list(self._counts),
-                "episodes": self._episodes,
-            }
-        )
+def _comparison_mapping(
+    ref: SourceRef,
+    operator: Comparison,
+    threshold: float,
+) -> dict[str, JsonValue]:
+    """Return the closed condition mapping for one source comparison."""
+    return {
+        "source": str(ref),
+        "op": _CONDITION_OPS[operator],
+        "value": float(threshold),
+    }
 
-    def _state_fields(self) -> Mapping[str, JsonValue]:
-        return {
-            "previous": list(self._previous),
-            "counts": list(self._counts),
-            "occurrences": self._occurrences,
-            "episodes": self._episodes,
-        }
 
-    def _config_fields(self) -> Mapping[str, JsonValue]:
-        return {"severity": self._severity}
-
-    def _decode_state(
-        self, state: Mapping[str, JsonValue], num_envs: int | None
-    ) -> _EventCounterState:
-        where = f"monitor {self.name!r} restore.state"
-        _require_state_keys(
-            state, frozenset({"previous", "counts", "occurrences", "episodes"}), where
-        )
-        return _EventCounterState(
-            previous=_decode_bool_list(state["previous"], f"{where}.previous", num_envs),
-            counts=_decode_int_list(state["counts"], f"{where}.counts", num_envs),
-            occurrences=_decode_nonnegative_int(state["occurrences"], f"{where}.occurrences"),
-            episodes=_decode_nonnegative_int(state["episodes"], f"{where}.episodes"),
-        )
-
-    def _apply_state(self, decoded: object) -> None:
-        if not isinstance(decoded, _EventCounterState):
-            raise TypeError(
-                f"monitor {self.name!r}: invalid event-counter state bundle "
-                f"{type(decoded).__name__}"
-            )
-        self._previous = decoded.previous
-        self._counts = decoded.counts
-        self._occurrences = decoded.occurrences
-        self._episodes = decoded.episodes
+def _coerce_source_ref(value: SourceRef | str, where: str) -> SourceRef:
+    """Normalize one explicit source reference without a fallback lookup."""
+    if isinstance(value, SourceRef):
+        return value
+    if isinstance(value, str):
+        try:
+            return SourceRef.parse(value)
+        except SourceError as exc:
+            raise ValueError(f"{where}: {exc}") from exc
+    raise TypeError(f"{where}: expected a SourceRef or 'kind:key' string, got {value!r}")
 
 
 _PREDICATE_STATE_KEYS: frozenset[str] = frozenset(
@@ -1334,7 +1073,7 @@ class _PhaseState:
 
 
 class PhaseMonitor(_StatefulMonitor):
-    """Map a level to a finite phase and report transitions.
+    """Map one sourced level vector to a finite phase and report transitions.
 
     ``boundaries`` is a strictly increasing list of finite values.  A level is
     in phase ``i`` when exactly ``i`` boundaries are less than or equal to it,
@@ -1342,6 +1081,10 @@ class PhaseMonitor(_StatefulMonitor):
     ``phase`` is an ``int64`` tensor and ``level`` the last value.  One
     ``phase_changed`` event is emitted per environment on each transition;
     the first observation after construction or reset initializes silently.
+
+    The level is resolved from the explicit ``source`` reference through a
+    :class:`~unigym_bench.sources.SourceResolver` on each tick.  There is no
+    callable input and the monitor retains only plain Python measurements.
     """
 
     kind = "phase"
@@ -1349,14 +1092,15 @@ class PhaseMonitor(_StatefulMonitor):
     def __init__(
         self,
         name: str,
-        probe: Probe,
+        source: SourceRef | str,
         *,
         boundaries: Sequence[float],
         phase_names: Sequence[str] | None = None,
     ) -> None:
         super().__init__(name)
         where = f"monitor {self.name!r}"
-        self._probe = _require_probe(probe, f"{where}.probe")
+        self._source = _coerce_source_ref(source, f"{where}.source")
+        self._resolver = SourceResolver()
         self._boundaries = _require_boundaries(boundaries, f"{where}.boundaries")
         self._phase_names = _require_phase_names(
             phase_names, len(self._boundaries) + 1, f"{where}.phase_names"
@@ -1371,7 +1115,7 @@ class PhaseMonitor(_StatefulMonitor):
     def on_tick(self, context: EnvStepContext) -> None:
         """Update phases and emit transitions."""
         self._bind_context(context)
-        values = _read_float_probe(self._probe, context, f"monitor {self.name!r}.probe")
+        values = _read_phase_source(self._resolver, self._source, context, f"monitor {self.name!r}")
         self._phase = self._ensure_length(self._phase, None)
         self._last_values = self._ensure_length(self._last_values, None)
         for env_id, value in enumerate(values):
@@ -1425,6 +1169,7 @@ class PhaseMonitor(_StatefulMonitor):
             {
                 "name": self.name,
                 "kind": self.kind,
+                "source": str(self._source),
                 "boundaries": list(self._boundaries),
                 "phase_names": (None if self._phase_names is None else list(self._phase_names)),
                 "transitions": self._transitions,
@@ -1456,6 +1201,7 @@ class PhaseMonitor(_StatefulMonitor):
 
     def _config_fields(self) -> Mapping[str, JsonValue]:
         return {
+            "source": str(self._source),
             "boundaries": list(self._boundaries),
             "phase_names": None if self._phase_names is None else list(self._phase_names),
         }
@@ -1498,341 +1244,10 @@ class PhaseMonitor(_StatefulMonitor):
         self._episodes = decoded.episodes
 
 
-@dataclass(frozen=True)
-class _SafetyState:
-    violating: list[bool]
-    last_values: list[float]
-    violation_events: int
-    violation_ticks: int
-    episodes: int
-
-
-class SafetyMonitor(_StatefulMonitor):
-    """Count a violation condition and emit severity-tagged occurrences.
-
-    The signal ``violating`` reports the current condition and ``level`` the
-    last value.  One ``violation`` event with the configured severity is
-    emitted per environment on each rising edge.  With ``terminal_outcome``
-    set, the same edge also queues a terminal.
-    """
-
-    kind = "safety"
-
-    def __init__(
-        self,
-        name: str,
-        probe: Probe,
-        *,
-        threshold: float,
-        operator: Comparison = ">=",
-        severity: Severity = "violation",
-        terminal_outcome: EpisodeOutcome | str | None = None,
-    ) -> None:
-        super().__init__(name)
-        where = f"monitor {self.name!r}"
-        self._probe = _require_probe(probe, f"{where}.probe")
-        self._threshold = _require_finite_float(threshold, f"{where}.threshold")
-        self._operator = _require_comparison(operator, f"{where}.operator")
-        self._severity = _require_severity(severity, f"{where}.severity")
-        self._terminal_outcome = _require_outcome(terminal_outcome, f"{where}.terminal_outcome")
-        self._violating: list[bool] = []
-        self._last_values: list[float] = []
-        self._violation_events = 0
-        self._violation_ticks = 0
-        self._episodes = 0
-
-    def on_tick(self, context: EnvStepContext) -> None:
-        """Update the violation condition and emit rising edges."""
-        self._bind_context(context)
-        values = _read_float_probe(self._probe, context, f"monitor {self.name!r}.probe")
-        self._violating = self._ensure_length(self._violating, False)
-        self._last_values = self._ensure_length(self._last_values, 0.0)
-        for env_id, value in enumerate(values):
-            violating = _compare(value, self._operator, self._threshold)
-            if violating and not self._violating[env_id]:
-                self._violation_events += 1
-                self._emit_event(
-                    name="violation",
-                    env_id=env_id,
-                    severity=self._severity,
-                    data={
-                        "value": value,
-                        "threshold": self._threshold,
-                        "operator": self._operator,
-                    },
-                )
-                if self._terminal_outcome is not None:
-                    self._emit_terminal(
-                        env_id,
-                        outcome=self._terminal_outcome,
-                        reason="violation",
-                        metrics={"value": value, "threshold": self._threshold},
-                    )
-            if violating:
-                self._violation_ticks += 1
-            self._violating[env_id] = violating
-        self._last_values = [float(value) for value in values]
-
-    def signals(self) -> Mapping[str, Tensor]:
-        """Return the current level and violation condition."""
-        if self._device is None or not self._last_values:
-            return {}
-        return {
-            "level": self._signal_tensor(self._last_values, torch.float32),
-            "violating": torch.tensor(self._violating, dtype=torch.bool, device=self._device),
-        }
-
-    def on_episode_end(self, env_ids: Sequence[int], context: EnvStepContext | None = None) -> None:
-        """Count observed episodes."""
-        self._episodes += len(_validate_env_ids(env_ids, self._num_envs, "on_episode_end.env_ids"))
-
-    def reset(self, env_ids: Sequence[int]) -> None:
-        """Clear the violation edge state for ``env_ids``."""
-        for env_id in _validate_env_ids(env_ids, self._num_envs, "reset.env_ids"):
-            if env_id < len(self._violating):
-                self._violating[env_id] = False
-
-    def report_view(self) -> Mapping[str, JsonValue]:
-        """Return the run-scoped safety statistics."""
-        return self._json_report(
-            {
-                "name": self.name,
-                "kind": self.kind,
-                "threshold": self._threshold,
-                "operator": self._operator,
-                "severity": self._severity,
-                "terminal_outcome": (
-                    None if self._terminal_outcome is None else self._terminal_outcome.value
-                ),
-                "violation_events": self._violation_events,
-                "violation_ticks": self._violation_ticks,
-                "episodes": self._episodes,
-            }
-        )
-
-    def _state_fields(self) -> Mapping[str, JsonValue]:
-        return {
-            "violating": list(self._violating),
-            "last_values": list(self._last_values),
-            "violation_events": self._violation_events,
-            "violation_ticks": self._violation_ticks,
-            "episodes": self._episodes,
-        }
-
-    def _config_fields(self) -> Mapping[str, JsonValue]:
-        return {
-            "threshold": self._threshold,
-            "operator": self._operator,
-            "severity": self._severity,
-            "terminal_outcome": (
-                None if self._terminal_outcome is None else self._terminal_outcome.value
-            ),
-        }
-
-    def _decode_state(self, state: Mapping[str, JsonValue], num_envs: int | None) -> _SafetyState:
-        where = f"monitor {self.name!r} restore.state"
-        _require_state_keys(
-            state,
-            frozenset(
-                {"violating", "last_values", "violation_events", "violation_ticks", "episodes"}
-            ),
-            where,
-        )
-        return _SafetyState(
-            violating=_decode_bool_list(state["violating"], f"{where}.violating", num_envs),
-            last_values=_decode_float_list(state["last_values"], f"{where}.last_values", num_envs),
-            violation_events=_decode_nonnegative_int(
-                state["violation_events"], f"{where}.violation_events"
-            ),
-            violation_ticks=_decode_nonnegative_int(
-                state["violation_ticks"], f"{where}.violation_ticks"
-            ),
-            episodes=_decode_nonnegative_int(state["episodes"], f"{where}.episodes"),
-        )
-
-    def _apply_state(self, decoded: object) -> None:
-        if not isinstance(decoded, _SafetyState):
-            raise TypeError(
-                f"monitor {self.name!r}: invalid safety state bundle " f"{type(decoded).__name__}"
-            )
-        self._violating = decoded.violating
-        self._last_values = decoded.last_values
-        self._violation_events = decoded.violation_events
-        self._violation_ticks = decoded.violation_ticks
-        self._episodes = decoded.episodes
-
-
-@dataclass(frozen=True)
-class _ScenarioCoverageState:
-    captured: list[tuple[float, ...] | None]
-    covered: list[bool]
-    episode_counts: list[int]
-    unmatched: int
-    episodes: int
-
-
-class ScenarioCoverageMonitor(_StatefulMonitor):
-    """Track which scenario commands an episode started with.
-
-    The monitor reads the observed ``cmd`` at the first tick after a reset for
-    each environment, then matches that row against the declared command pool
-    at the episode boundary.  Matching is exact in ``float32``: the sampler
-    owns quantization.  The report is JSON-safe and contains no per-env hidden
-    axis.  This monitor emits no signals, events or terminals.
-    """
-
-    kind = "scenario_coverage"
-
-    def __init__(self, name: str, *, commands: Sequence[Sequence[float]]) -> None:
-        super().__init__(name)
-        where = f"monitor {self.name!r}"
-        self._commands = _require_commands(commands, f"{where}.commands")
-        self._dim = len(self._commands[0])
-        self._index_by_row = {row: index for index, row in enumerate(self._commands)}
-        self._captured: list[tuple[float, ...] | None] = []
-        self._covered = [False] * len(self._commands)
-        self._episode_counts = [0] * len(self._commands)
-        self._unmatched = 0
-        self._episodes = 0
-
-    def on_tick(self, context: EnvStepContext) -> None:
-        """Capture each environment's command at the start of its episode."""
-        self._bind_context(context)
-        cmd = context.cmd
-        if cmd is None:
-            raise ValueError(
-                f"monitor {self.name!r}: scenario coverage requires context.cmd, got None"
-            )
-        if cmd.ndim != 2:
-            raise ValueError(
-                f"monitor {self.name!r}: context.cmd must be 2-D "
-                f"(num_envs, {self._dim}), got shape {tuple(cmd.shape)}"
-            )
-        if cmd.shape != (context.num_envs, self._dim):
-            raise ValueError(
-                f"monitor {self.name!r}: context.cmd must have shape "
-                f"({context.num_envs}, {self._dim}), got {tuple(cmd.shape)}"
-            )
-        if cmd.device != context.device:
-            raise ValueError(
-                f"monitor {self.name!r}: context.cmd device {cmd.device} does not match "
-                f"context device {context.device}"
-            )
-        if not cmd.is_floating_point():
-            raise TypeError(
-                f"monitor {self.name!r}: context.cmd must be floating point, " f"got {cmd.dtype}"
-            )
-        self._captured = self._ensure_length(self._captured, None)
-        rows = cmd.detach().to(device="cpu", dtype=torch.float32).tolist()
-        for env_id in range(context.num_envs):
-            if self._captured[env_id] is not None:
-                continue
-            captured = tuple(float(value) for value in rows[env_id])
-            for item_index, number in enumerate(captured):
-                if not math.isfinite(number):
-                    raise ValueError(
-                        f"monitor {self.name!r}: context.cmd[{env_id}][{item_index}] "
-                        f"must be finite, got {number!r}"
-                    )
-            self._captured[env_id] = captured
-
-    def on_episode_end(self, env_ids: Sequence[int], context: EnvStepContext | None = None) -> None:
-        """Match each ending environment's start command and clear it."""
-        ids = _validate_env_ids(env_ids, self._num_envs, "on_episode_end.env_ids")
-        self._episodes += len(ids)
-        for env_id in ids:
-            captured = self._captured[env_id] if env_id < len(self._captured) else None
-            if captured is None:
-                self._unmatched += 1
-            else:
-                index = self._index_by_row.get(captured)
-                if index is None:
-                    self._unmatched += 1
-                else:
-                    self._covered[index] = True
-                    self._episode_counts[index] += 1
-            if env_id < len(self._captured):
-                self._captured[env_id] = None
-
-    def reset(self, env_ids: Sequence[int]) -> None:
-        """Clear captured start commands for ``env_ids``."""
-        for env_id in _validate_env_ids(env_ids, self._num_envs, "reset.env_ids"):
-            if env_id < len(self._captured):
-                self._captured[env_id] = None
-
-    def report_view(self) -> Mapping[str, JsonValue]:
-        """Return the run-scoped command coverage."""
-        covered = sum(self._covered)
-        pool_size = len(self._commands)
-        return self._json_report(
-            {
-                "name": self.name,
-                "kind": self.kind,
-                "pool_size": pool_size,
-                "covered": covered,
-                "coverage_ratio": covered / pool_size,
-                "episode_counts": list(self._episode_counts),
-                "unmatched_episodes": self._unmatched,
-                "episodes": self._episodes,
-            }
-        )
-
-    def _state_fields(self) -> Mapping[str, JsonValue]:
-        return {
-            "captured": [None if row is None else list(row) for row in self._captured],
-            "covered": list(self._covered),
-            "episode_counts": list(self._episode_counts),
-            "unmatched": self._unmatched,
-            "episodes": self._episodes,
-        }
-
-    def _config_fields(self) -> Mapping[str, JsonValue]:
-        return {"commands": [list(row) for row in self._commands]}
-
-    def _decode_state(
-        self, state: Mapping[str, JsonValue], num_envs: int | None
-    ) -> _ScenarioCoverageState:
-        where = f"monitor {self.name!r} restore.state"
-        _require_state_keys(
-            state,
-            frozenset({"captured", "covered", "episode_counts", "unmatched", "episodes"}),
-            where,
-        )
-        return _ScenarioCoverageState(
-            captured=_decode_captured_commands(
-                state["captured"], f"{where}.captured", num_envs, self._dim
-            ),
-            covered=_decode_bool_list(state["covered"], f"{where}.covered", len(self._commands)),
-            episode_counts=_decode_int_list(
-                state["episode_counts"], f"{where}.episode_counts", len(self._commands)
-            ),
-            unmatched=_decode_nonnegative_int(state["unmatched"], f"{where}.unmatched"),
-            episodes=_decode_nonnegative_int(state["episodes"], f"{where}.episodes"),
-        )
-
-    def _apply_state(self, decoded: object) -> None:
-        if not isinstance(decoded, _ScenarioCoverageState):
-            raise TypeError(
-                f"monitor {self.name!r}: invalid scenario coverage state bundle "
-                f"{type(decoded).__name__}"
-            )
-        self._captured = decoded.captured
-        self._covered = decoded.covered
-        self._episode_counts = decoded.episode_counts
-        self._unmatched = decoded.unmatched
-        self._episodes = decoded.episodes
-
-
 def _require_monitor_name(value: object) -> str:
     if not isinstance(value, str) or not _NAME_PATTERN.fullmatch(value):
         raise ValueError(f"monitor name must match [a-z][a-z0-9_]*, got {value!r}")
     return value
-
-
-def _require_probe(probe: object, where: str) -> Probe:
-    if not callable(probe):
-        raise TypeError(f"{where}: expected a callable probe, got {type(probe).__name__}")
-    return probe
 
 
 def _coerce_predicate_condition(condition: Condition | Mapping[str, object]) -> Condition:
@@ -2005,57 +1420,27 @@ def _require_phase_names(value: object, expected: int, where: str) -> tuple[str,
     return names
 
 
-def _require_commands(value: object, where: str) -> tuple[tuple[float, ...], ...]:
-    if isinstance(value, (str, bytes, bytearray)) or not isinstance(value, Sequence):
-        raise TypeError(
-            f"{where}: expected a sequence of command vectors, got {type(value).__name__}"
-        )
-    rows = list(value)
-    if not rows:
-        raise ValueError(f"{where}: expected at least one command vector")
-    commands: list[tuple[float, ...]] = []
-    dimension: int | None = None
-    for row_index, row in enumerate(rows):
-        row_where = f"{where}[{row_index}]"
-        if isinstance(row, (str, bytes, bytearray)) or not isinstance(row, Sequence):
-            raise TypeError(f"{row_where}: expected a command vector, got {type(row).__name__}")
-        numbers = tuple(
-            _require_finite_float(item, f"{row_where}[{item_index}]")
-            for item_index, item in enumerate(row)
-        )
-        if dimension is None:
-            dimension = len(numbers)
-            if dimension == 0:
-                raise ValueError(f"{row_where}: command vector must not be empty")
-        elif len(numbers) != dimension:
-            raise ValueError(
-                f"{row_where}: expected {dimension} values to match {where}[0], "
-                f"got {len(numbers)}"
-            )
-        quantized = torch.tensor(numbers, dtype=torch.float32).tolist()
-        for item_index, value in enumerate(quantized):
-            if not math.isfinite(value):
-                raise ValueError(
-                    f"{row_where}[{item_index}]: value {numbers[item_index]!r} is not "
-                    "finite after float32 quantization"
-                )
-        commands.append(tuple(float(value) for value in quantized))
-    if len(set(commands)) != len(commands):
-        raise ValueError(f"{where}: expected unique command vectors, got duplicates")
-    return tuple(commands)
-
-
-def _read_float_probe(probe: Probe, context: EnvStepContext, where: str) -> list[float]:
-    value = probe(context)
+def _read_phase_source(
+    resolver: SourceResolver,
+    source: SourceRef,
+    context: EnvStepContext,
+    where: str,
+) -> list[float]:
+    """Resolve and validate one per-env floating vector for the phase monitor."""
+    value = resolver.resolve(context, source)
     if not isinstance(value, Tensor):
-        raise TypeError(f"{where}: expected a torch.Tensor, got {type(value).__name__}")
+        raise TypeError(
+            f"{where}: source {source} resolved to {type(value).__name__}, "
+            "expected a per-env torch.Tensor"
+        )
     if value.ndim != 1 or value.shape[0] != context.num_envs:
         raise ValueError(
             f"{where}: expected shape (num_envs={context.num_envs},), got {tuple(value.shape)}"
         )
     if value.device != context.device:
         raise ValueError(
-            f"{where}: probe device {value.device} does not match context device {context.device}"
+            f"{where}: source device {value.device} does not match "
+            f"context device {context.device}"
         )
     if not value.is_floating_point():
         raise TypeError(f"{where}: expected a floating tensor, got {value.dtype}")
@@ -2064,33 +1449,6 @@ def _read_float_probe(probe: Probe, context: EnvStepContext, where: str) -> list
         if not math.isfinite(number):
             raise ValueError(f"{where}[{index}]: expected a finite level, got {number!r}")
     return values
-
-
-def _read_bool_probe(probe: Probe, context: EnvStepContext, where: str) -> list[bool]:
-    value = probe(context)
-    if not isinstance(value, Tensor):
-        raise TypeError(f"{where}: expected a torch.Tensor, got {type(value).__name__}")
-    if value.ndim != 1 or value.shape[0] != context.num_envs:
-        raise ValueError(
-            f"{where}: expected shape (num_envs={context.num_envs},), got {tuple(value.shape)}"
-        )
-    if value.device != context.device:
-        raise ValueError(
-            f"{where}: probe device {value.device} does not match context device {context.device}"
-        )
-    if value.dtype != torch.bool:
-        raise TypeError(f"{where}: expected a bool tensor, got {value.dtype}")
-    return [bool(item) for item in value.detach().to(device="cpu").tolist()]
-
-
-def _compare(value: float, operator: Comparison, threshold: float) -> bool:
-    if operator == ">":
-        return value > threshold
-    if operator == ">=":
-        return value >= threshold
-    if operator == "<":
-        return value < threshold
-    return value <= threshold
 
 
 def _phase_index(value: float, boundaries: tuple[float, ...]) -> int:
@@ -2216,20 +1574,6 @@ def _decode_int_list(value: JsonValue, where: str, expected: int | None) -> list
     return result
 
 
-def _decode_float_list(value: JsonValue, where: str, expected: int | None) -> list[float]:
-    items = _decode_state_list(value, where)
-    _expect_length(items, expected, where)
-    result: list[float] = []
-    for index, item in enumerate(items):
-        if isinstance(item, bool) or not isinstance(item, (int, float)):
-            raise TypeError(f"{where}[{index}]: expected a number, got {item!r}")
-        number = float(item)
-        if not math.isfinite(number):
-            raise ValueError(f"{where}[{index}]: expected a finite number, got {item!r}")
-        result.append(number)
-    return result
-
-
 def _decode_optional_int_list(
     value: JsonValue, where: str, expected: int | None
 ) -> list[int | None]:
@@ -2275,33 +1619,6 @@ def _decode_optional_phase_list(
         if phase is not None and phase >= phase_count:
             raise ValueError(f"{where}[{index}]: phase {phase} is outside [0, {phase_count})")
     return phases
-
-
-def _decode_captured_commands(
-    value: JsonValue, where: str, expected: int | None, dimension: int
-) -> list[tuple[float, ...] | None]:
-    items = _decode_state_list(value, where)
-    _expect_length(items, expected, where)
-    result: list[tuple[float, ...] | None] = []
-    for index, item in enumerate(items):
-        if item is None:
-            result.append(None)
-            continue
-        row = _decode_state_list(item, f"{where}[{index}]")
-        if len(row) != dimension:
-            raise ValueError(f"{where}[{index}]: expected {dimension} values, got {len(row)}")
-        values: list[float] = []
-        for item_index, entry in enumerate(row):
-            if isinstance(entry, bool) or not isinstance(entry, (int, float)):
-                raise TypeError(f"{where}[{index}][{item_index}]: expected a number, got {entry!r}")
-            number = float(entry)
-            if not math.isfinite(number):
-                raise ValueError(
-                    f"{where}[{index}][{item_index}]: expected a finite number, got {entry!r}"
-                )
-            values.append(number)
-        result.append(tuple(values))
-    return result
 
 
 def _decode_env_key(key: str, where: str) -> int:

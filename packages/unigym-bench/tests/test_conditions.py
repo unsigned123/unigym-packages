@@ -151,6 +151,21 @@ def test_comparison_rejects_complex_sources() -> None:
         )
 
 
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_comparison_rejects_non_finite_record_sources(bad: float) -> None:
+    with pytest.raises(ConditionError, match=r"record:level.*non-finite"):
+        _record_comparison({"level": torch.tensor([0.0, bad])}, key="level")
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_comparison_rejects_non_finite_value_sources(bad: float) -> None:
+    context = _context(values=StepValues({"level": torch.tensor([0.0, bad])}))
+    condition = Comparison(SourceRef.parse("value:level"), "gt", 0.0)
+
+    with pytest.raises(ConditionError, match=r"value:level.*non-finite"):
+        condition.evaluate(context, _RESOLVER)
+
+
 def test_comparison_rejects_a_foreign_device() -> None:
     with pytest.raises(ConditionError, match="device"):
         _record_comparison({"level": torch.zeros(2, device="meta")}, key="level")

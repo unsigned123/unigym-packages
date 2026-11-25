@@ -33,7 +33,7 @@ from unigym_bench.report import REPORT_FILENAME, REPORT_SCHEMA
 from unigym_bench.sink import BenchmarkSink
 from unigym_bench.specs import RetentionSpec
 from _support import (
-    BundleProbeSink,
+    BundleRecordingSink,
     ScriptedMonitor,
     TickScript,
     make_bundle,
@@ -55,6 +55,7 @@ def _make_run(tmp_path: Path, *, steps: int, episode_length_s: float) -> Run:
             factory="_support:make_observed_sink",
             options={
                 "monitor_factory": "_support:make_integration_monitors",
+                "extension_factory": "_support:make_coverage_extensions",
                 "write_report": True,
             },
         ),
@@ -68,9 +69,9 @@ def _walk_sinks(node: object) -> Iterator[object]:
         yield from _walk_sinks(child)
 
 
-def _observed_sink(instance: RunInstance) -> BundleProbeSink:
+def _observed_sink(instance: RunInstance) -> BundleRecordingSink:
     for node in _walk_sinks(getattr(instance, "sink", None)):
-        if isinstance(node, BundleProbeSink):
+        if isinstance(node, BundleRecordingSink):
             return node
     raise AssertionError("the observed pack sink is not mounted in the run tree")
 
@@ -98,7 +99,7 @@ def _find_pack_report(document: object) -> dict[str, object]:
     return found
 
 
-def _core_termination_counter(probe: BundleProbeSink) -> Counter[str]:
+def _core_termination_counter(probe: BundleRecordingSink) -> Counter[str]:
     counter: Counter[str] = Counter()
     for facts in probe.episode_terminations:
         for entry in facts.values():
@@ -143,6 +144,10 @@ def test_real_tiny_arm_run_writes_the_pack_report_not_core_benchmark_files(
     assert set(written["terminations"]["outcome"]) <= {outcome.value for outcome in EpisodeOutcome}
     assert written["terminations"]["code"] == {"runtime.episode_horizon": episodes["count"]}
     assert written["terminations"]["source"] == {"runtime": episodes["count"]}
+    coverage = written["extensions"]["coverage"]
+    assert coverage["episodes"] == episodes["count"]
+    assert sum(coverage["episode_counts"]) + coverage["unmatched_episodes"] == coverage["episodes"]
+    assert written["tasks"]["extensions"] == ["coverage"]
 
     # The runner bundle no longer exposes a live env object.
     assert probe.step_bundle_keys

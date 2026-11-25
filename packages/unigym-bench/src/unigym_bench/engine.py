@@ -81,10 +81,10 @@ if TYPE_CHECKING:
     from unigym.values import ValuePublisher
 
 #: Checkpoint payload key and schema owned by the pack's rewind provider.
-#: Schema 3 consumes the core final-context boundary and the separate
-#: episode-end terminal face; it rejects schema 2 and older payloads.
+#: Schema 4 pairs the value/context boundary with monitor snapshot schema 3;
+#: it rejects schema 3 and older payloads.
 REWIND_PROVIDER_NAME = "unigym_bench"
-REWIND_SCHEMA = "unigym_bench.rewind/3"
+REWIND_SCHEMA = "unigym_bench.rewind/4"
 
 __all__ = [
     "EngineStateError",
