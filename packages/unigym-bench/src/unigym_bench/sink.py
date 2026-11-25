@@ -42,15 +42,16 @@ JSON-safe.
 Lifecycle glue
 --------------
 
-The runner calls ``on_episode_end`` after the terminal drain and computes the
-reset mask itself, but ``on_step_end`` carries no reset ids.  The sink therefore
-stores the due ids returned by ``engine.on_episode_end`` and calls
-``engine.on_reset`` from ``on_step_end``, i.e. exactly after the runner's reset
-chain.  Because the sink cannot observe whether that chain ran, construction
-rejects ``runner.auto_reset: false``: the core runner already rejects sink
-terminals in that mode, and reopening a row the backend never reset would be
-incorrect.  The direct constructor exposes the same assertion as
-``reset_after_episode``.
+The runner owns the episode clock and calls ``on_episode_end`` at an explicit
+boundary.  The sink finalizes the due episodes there.  When the runner then
+runs a real reset chain, it calls the sink's :class:`~unigym.sink.ResetAwareSink`
+``on_reset`` capability (tick auto-reset, ``runner.reset`` and
+``terminate(..., reset=True)``).  A reset of a finalized env reopens it; a core
+reset of an already-open env restarts it in place and fabricates no episode
+record; a pre-start reset-all is a no-op because the engine binds on the first
+tick.  The sink never infers a reset from ``on_step_end`` and never owns an
+episode horizon, so a pack run must end episodes with ``runner.terminate(...)``
+or a pack sink terminal rather than a core clock.
 
 Report.  ``on_run_end`` finalizes the engine, drives every report extension's
 ``on_run_end`` once and returns the pack report under :data:`SUMMARY_KEY`.  It
@@ -59,11 +60,11 @@ never writes the core ``benchmark_report.json`` or any other core artifact.
 Rewind and early-stop hooks.  ``stop_when`` never stops.  The sink exposes the
 run's :class:`~unigym_bench.engine.StreamingEngine` as its core rewind provider
 (``name="unigym_bench"``, schema ``unigym_bench.rewind/4``); the engine owns all
-checkpointable pack state, including stateful report extensions, and the sink's
-own ``_pending_reset`` glue is empty at every core snapshot freeze point (a
-snapshot is taken between completed ticks).  The sampler cursor/RNG and the
-core ``values`` store are separate core providers.  ``on_rewind`` delegates to
-the engine so open episodes are marked ``rewound``.
+checkpointable pack state, including stateful report extensions.  A snapshot is
+taken between completed ticks, so there is no provisional reset glue to save.
+The sampler cursor/RNG and the core ``values`` store are separate core
+providers.  ``on_rewind`` delegates to the engine so open episodes are marked
+``rewound``.
 """
 
 from __future__ import annotations
@@ -173,13 +174,6 @@ def make_sink(ctx: SinkContext) -> BenchmarkSink:
             "unigym-bench sink: loop_mode 'sink-steered' requires ctx.values, "
             "but the build supplied no value publisher"
         )
-    auto_reset = _runner_auto_reset(ctx.spec)
-    if not auto_reset:
-        raise ConfigError(
-            "unigym-bench sink: requires runner.auto_reset: true so the backend "
-            "reset chain runs after on_episode_end; got runner.auto_reset: false. "
-            "The pack sink cannot detect whether a backend reset actually ran."
-        )
     raw_task_document = options.get("task_document")
     raw_monitor_factory = options.get("monitor_factory")
     raw_extension_factory = options.get("extension_factory")
@@ -241,7 +235,6 @@ def make_sink(ctx: SinkContext) -> BenchmarkSink:
         run_identity=ctx.run_identity,
         run_name=ctx.spec.run_name,
         task_name=ctx.spec.run_name,
-        mode=ctx.mode,
         out_dir=ctx.out_dir,
         seed=ctx.seed,
         num_envs=ctx.num_envs,
@@ -254,7 +247,6 @@ def make_sink(ctx: SinkContext) -> BenchmarkSink:
         retention=retention,
         publisher=ctx.values,
         loop_mode=loop_mode,
-        reset_after_episode=auto_reset,
         extensions=extensions,
         metadata=metadata,
         monitor_extensions=monitor_extensions,
@@ -281,9 +273,6 @@ class BenchmarkSink:
         loop_mode: ``"pool"`` or ``"sink-steered"``.  A sink-steered sink needs
             a value publisher on its engine; absent publisher is a construction
             error.
-        reset_after_episode: Explicit assertion that the runner actually resets
-            due envs.  The sink cannot observe the backend reset chain, so a
-            false value is rejected instead of silently reopening envs.
         extensions: Report extensions in task declaration order for a
             sink-built engine.
         metadata: Optional construction metadata for the report's ``run`` block.
@@ -299,8 +288,8 @@ class BenchmarkSink:
 
     Raises:
         ConfigError: ``loop_mode`` is unknown, a sink-steered sink has no
-            publisher, ``reset_after_episode`` is false, or ``write_report`` is
-            true without a construction ``out_dir``.
+            publisher, or ``write_report`` is true without a construction
+            ``out_dir``.
         TypeError: Both or neither of ``monitors``/``engine`` are supplied, or
             an injected engine is mixed with separately supplied resources.
         ValueError: A monitor/extension name is duplicated or a declared
@@ -315,7 +304,6 @@ class BenchmarkSink:
         retention: RetentionSpec | None = None,
         publisher: ValuePublisher | None = None,
         loop_mode: str = DEFAULT_LOOP_MODE,
-        reset_after_episode: bool = True,
         extensions: Sequence[ReportExtension] | None = None,
         metadata: RunMetadata | None = None,
         monitor_extensions: Mapping[str, str] | None = None,
@@ -331,16 +319,6 @@ class BenchmarkSink:
                 "BenchmarkSink: write_report requires construction metadata with a "
                 "non-empty out_dir; build the sink through make_sink(ctx) or pass "
                 "RunMetadata(out_dir=...)"
-            )
-        if not isinstance(reset_after_episode, bool):
-            raise TypeError(
-                "BenchmarkSink: reset_after_episode must be a bool, "
-                f"got {type(reset_after_episode).__name__}"
-            )
-        if not reset_after_episode:
-            raise ConfigError(
-                "BenchmarkSink: requires reset_after_episode (runner.auto_reset: true) "
-                "so the sink only reopens envs the backend actually reset; got false"
             )
         if metadata is not None and not isinstance(metadata, RunMetadata):
             raise TypeError(
@@ -371,7 +349,6 @@ class BenchmarkSink:
         self._loop_mode = loop_mode
         self._metadata = metadata
         self._write_report = write_report
-        self._pending_reset: tuple[int, ...] = ()
         self._builder = ReportBuilder(
             monitors=self._engine.monitors,
             extensions=self._engine.extensions,
@@ -408,15 +385,26 @@ class BenchmarkSink:
         return self._engine.drain_terminations()
 
     def on_episode_end(self, env_ids: object, bundle: dict[str, object]) -> None:
-        """Finalize due episodes and remember the ids for the reset reopen."""
-        self._pending_reset = self._engine.on_episode_end(env_ids, bundle)
+        """Finalize the due episodes at the runner's explicit boundary."""
+        self._engine.on_episode_end(env_ids, bundle)
 
     def on_step_end(self, t: int, bundle: dict[str, object]) -> None:
-        """Reopen exactly the envs the runner has just reset."""
-        pending = self._pending_reset
-        self._pending_reset = ()
-        if pending:
-            self._engine.on_reset(pending)
+        """Post-reset metrics hook; the reset notification owns reopening."""
+        del t, bundle
+
+    def on_reset(self, env_ids: object) -> None:
+        """Apply the core reset notification without owning an episode clock.
+
+        The core calls this after every real reset chain (pre-start reset-all,
+        tick auto-reset, explicit ``reset`` and ``terminate(..., reset=True)``).
+        A pre-start reset happens before the first tick binds the engine, so it
+        is a safe no-op: the first ``on_step`` binds the later run shape.  After
+        binding, the engine reopens finalized envs and restarts open envs in
+        place without fabricating an episode record.
+        """
+        if self._engine.num_envs is None:
+            return
+        self._engine.on_reset(env_ids)
 
     def on_run_end(self) -> dict[str, object]:
         """Finalize the run, assemble the pack report and return it.
@@ -495,19 +483,6 @@ def _validate_loop_mode(value: object) -> None:
         raise ConfigError(
             f"unigym-bench sink loop_mode: expected one of {sorted(LOOP_MODES)}, " f"got {value!r}"
         )
-
-
-def _runner_auto_reset(spec: object) -> bool:
-    """Read the runner's reset policy from construction metadata.
-
-    An absent or non-mapping ``runner`` block is the core default (auto reset).
-    The value is coerced with ``bool`` exactly as ``SyncRunner`` does, so an
-    explicit false-like value is rejected while an absent key stays true.
-    """
-    runner = getattr(spec, "runner", None)
-    if not isinstance(runner, Mapping):
-        return True
-    return bool(runner.get("auto_reset", True))
 
 
 def _resolve_monitor_factory(path: object) -> _MonitorFactory:

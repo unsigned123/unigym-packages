@@ -251,7 +251,6 @@ def make_sink_context(
         spec = replace(spec, runner={**spec.runner, "auto_reset": auto_reset})
     return SinkContext(
         spec=spec,
-        mode=spec.mode,
         out_dir="data_out/sink-context",
         num_envs=1,
         policy_dt=0.02,
@@ -338,6 +337,10 @@ class BundleRecordingSink:
     def on_step_end(self, t: int, bundle: dict[str, object]) -> None:
         """Forward the post-reset callback."""
         self.inner.on_step_end(t, bundle)
+
+    def on_reset(self, env_ids: object) -> None:
+        """Forward the reset notification to the pack sink."""
+        self.inner.on_reset(env_ids)
 
     def on_run_end(self) -> dict[str, object]:
         """Return the pack sink's summary unchanged."""

@@ -6,10 +6,14 @@ scaffolding it replaces (``unigym.benchmarks``, ``unigym.runner.evaluation``,
 ``unigym.runner.episodes``), so this module checks only the allowed surfaces
 and reports every missing one in a single teaching error.
 
-``unigym.run`` is imported only to verify the public ``SinkContext``,
-``SinkSpec`` and ``SinkFactory`` construction face; the P0 plan requires that
-surface even though importing ``unigym.run`` also loads torch.  No benchmark
-scaffolding is imported.
+The required surface is the post-deletion core: explicit sink selection
+(``sinks:`` / ``CollectSinkSpec`` / ``SinkDeclaration``), the reset-aware sink
+capability, and value/evaluation contexts.  There is no core ``mode``, no
+episode clock, no ``Wait`` and no ``EvaluationSession`` to depend on.
+
+``unigym.run`` is imported only to verify the public construction face; the P0
+plan requires that surface even though importing ``unigym.run`` also loads
+torch.  No benchmark scaffolding is imported.
 """
 
 from __future__ import annotations
@@ -22,8 +26,20 @@ __all__ = ["assert_core_contract"]
 
 _REQUIRED_SURFACES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("unigym", ("__version__",)),
-    ("unigym.sink", ("Sink", "TerminalSink", "StoppingSink", "RewindAwareSink")),
-    ("unigym.run", ("SinkContext", "SinkSpec", "SinkFactory")),
+    (
+        "unigym.sink",
+        ("Sink", "TerminalSink", "StoppingSink", "RewindAwareSink", "ResetAwareSink"),
+    ),
+    (
+        "unigym.run",
+        (
+            "SinkContext",
+            "SinkSpec",
+            "SinkFactory",
+            "CollectSinkSpec",
+            "SinkDeclaration",
+        ),
+    ),
     ("unigym.evaluation", ("EnvView", "EnvStepContext")),
     ("unigym.values", ("ValueStore", "ValueView", "ValuePublisher", "StepValues")),
     ("unigym.core.identity", ("RunIdentity",)),

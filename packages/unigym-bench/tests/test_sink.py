@@ -145,9 +145,11 @@ def test_write_failure_is_raised_and_retried_without_reassembling(
     assert written == report
 
 
-def test_make_sink_rejects_auto_reset_false() -> None:
-    with pytest.raises(ConfigError, match="runner.auto_reset: true"):
-        make_sink(make_sink_context(auto_reset=False))
+def test_make_sink_accepts_auto_reset_false_with_explicit_reset_notification() -> None:
+    """The sink observes resets directly, so it no longer rejects auto_reset=false."""
+    sink = make_sink(make_sink_context(auto_reset=False))
+
+    assert isinstance(sink, BenchmarkSink)
 
 
 @pytest.mark.parametrize(
@@ -244,14 +246,6 @@ def test_injected_engine_sink_steered_requires_an_engine_publisher() -> None:
     assert sink.loop_mode == "sink-steered"
 
 
-def test_direct_construction_rejects_a_non_resetting_runner_assertion() -> None:
-    with pytest.raises(ConfigError, match="reset_after_episode"):
-        BenchmarkSink([], reset_after_episode=False)
-
-    with pytest.raises(TypeError, match="reset_after_episode"):
-        BenchmarkSink([], reset_after_episode="yes")
-
-
 def test_direct_construction_rejects_engine_and_monitor_conflicts() -> None:
     engine = StreamingEngine([])
 
@@ -261,7 +255,7 @@ def test_direct_construction_rejects_engine_and_monitor_conflicts() -> None:
         BenchmarkSink(engine=engine, retention=RetentionSpec())
 
 
-def test_sink_delegates_the_terminal_drain_and_reopens_after_step_end() -> None:
+def test_sink_delegates_the_terminal_drain_and_reopens_on_reset() -> None:
     monitor = ScriptedMonitor(
         "contact",
         {0: TickScript(terminals={0: make_termination("custom.contact.hit")})},
@@ -277,8 +271,20 @@ def test_sink_delegates_the_terminal_drain_and_reopens_after_step_end() -> None:
     sink.on_episode_end([0], bundle)
     assert engine.open_envs == ()
     sink.on_step_end(0, bundle)
+    assert engine.open_envs == ()
+    sink.on_reset([0])
     assert engine.open_envs == (0,)
     assert engine.records[0].episode_seq == 0
+
+
+def test_on_reset_before_the_first_tick_is_a_safe_noop() -> None:
+    sink = BenchmarkSink([])
+
+    sink.on_reset([0])
+
+    report = sink.on_run_end()["BenchmarkSink"]
+    assert report["episodes"]["count"] == 0
+    assert report["terminations"]["total"] == 0
 
 
 def test_on_run_end_immediately_after_reset_skips_the_zero_tick_reopened_env() -> None:
@@ -292,7 +298,7 @@ def test_on_run_end_immediately_after_reset_skips_the_zero_tick_reopened_env() -
     sink.on_step(0, bundle)
     sink.drain_terminations()
     sink.on_episode_end([0], bundle)
-    sink.on_step_end(0, bundle)
+    sink.on_reset([0])
     assert engine.open_envs == (0,)
 
     summary = sink.on_run_end()
@@ -335,7 +341,7 @@ def test_reopened_episode_captures_new_command_and_reset_facts() -> None:
     sink.on_step(0, first)
     sink.drain_terminations()
     sink.on_episode_end([0], first)
-    sink.on_step_end(0, first)
+    sink.on_reset([0])
 
     second = make_bundle(
         num_envs=1,

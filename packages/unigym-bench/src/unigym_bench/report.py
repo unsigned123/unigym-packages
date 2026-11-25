@@ -9,7 +9,7 @@ metadata supplied at construction, the streaming engine's finalized
 Layout (fixed top-level blocks, in this order)::
 
     {
-      "schema": "external_benchmark_report/1",
+      "schema": "external_benchmark_report/2",
       "run": {...},          # identity + construction metadata
       "tasks": {...},        # task name, monitor names, extension names
       "episodes": {...},     # retention-independent counts + retained detail
@@ -69,7 +69,11 @@ __all__ = [
 ]
 
 #: Schema id of the pack-owned external benchmark report.
-REPORT_SCHEMA = "external_benchmark_report/1"
+#:
+#: Schema 2 removes the obsolete ``run.mode`` field: the post-deletion core has
+#: no run mode, and the pack must not fabricate one.  ``run.loop_mode`` remains
+#: the pack's own closed-loop selection.
+REPORT_SCHEMA = "external_benchmark_report/2"
 
 #: Pack-owned report filename written under a run's ``out_dir``.
 #: It can never collide with the core ``benchmark_report.json`` / ``results.json``
@@ -154,7 +158,6 @@ class RunMetadata:
     run_identity: RunIdentity | None = None
     run_name: str = ""
     task_name: str = ""
-    mode: str = ""
     out_dir: str = ""
     seed: int = 0
     num_envs: int = 0
@@ -169,7 +172,7 @@ class RunMetadata:
                 "run metadata.run_identity: expected a RunIdentity or None, "
                 f"got {type(self.run_identity).__name__}"
             )
-        for name in ("run_name", "task_name", "mode", "out_dir", "loop_mode", "pack_version"):
+        for name in ("run_name", "task_name", "out_dir", "loop_mode", "pack_version"):
             _require_str(getattr(self, name), f"run metadata.{name}")
         _require_int(self.seed, "run metadata.seed")
         _require_int(self.num_envs, "run metadata.num_envs", minimum=0)
@@ -668,7 +671,6 @@ def _run_block(metadata: RunMetadata) -> dict[str, JsonValue]:
         "identity": identity,
         "run_name": metadata.run_name,
         "task_name": metadata.task_name,
-        "mode": metadata.mode,
         "out_dir": metadata.out_dir,
         "seed": metadata.seed,
         "num_envs": metadata.num_envs,

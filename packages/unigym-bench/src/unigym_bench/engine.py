@@ -15,17 +15,17 @@ The engine never keeps an ``EnvView``, a step context, a tensor or a backend
 handle.  Monitor values are validated and published one boundary at a time
 through the run's core ``ValuePublisher``; they are not stored by the engine.
 
-Lifecycle (delegated by the sink in the next card)::
+Lifecycle (delegated by the sink)::
 
     sink.on_step -> engine.on_step(bundle)
     runner drain -> engine.drain_terminations()
-    runner due   -> engine.on_episode_end(due, bundle) -> due ids (sink stores)
-    runner reset -> engine.on_reset(stored due)          # reopen new episodes
+    runner due   -> engine.on_episode_end(due, bundle)   # finalize
+    runner reset -> engine.on_reset(due)                 # reopen new episodes
     runner end   -> engine.on_run_end()
 
-The core runner does not pass reset ids to ``on_step_end``, so the sink keeps
-the ids returned by ``on_episode_end`` until the post-reset callback and calls
-``on_reset`` there.
+The core runner owns the episode boundary and calls the sink's reset-aware
+``on_reset`` capability after every real reset chain.  The engine never infers
+a reset from ``on_step_end`` and never owns an episode clock.
 
 A terminal request for an environment that is not open is a pack contract
 error.  A terminal request for an environment that is open but already latched
@@ -580,9 +580,9 @@ class StreamingEngine:
                 on the episode's first tick.
 
         Returns:
-            The sorted, unique due env ids.  The sink stores this tuple until
-            ``on_step_end`` and then reopens exactly these envs after the
-            runner's reset chain.
+            The sorted, unique due env ids.  The sink may use this tuple for
+            diagnostics; reopening is driven by the core reset notification
+            (``on_reset``) that follows a real reset chain.
 
         Raises:
             EngineStateError: The engine is unbound/ended, ``final_step`` is
@@ -699,38 +699,61 @@ class StreamingEngine:
         return due_ids
 
     def on_reset(self, env_ids: object) -> None:
-        """Reopen the environments the runner has just reset.
+        """Apply the core reset notification to the pack episode state.
 
-        The pack sink calls this after the runner's reset chain.  It starts a
-        new episode sequence for each id and clears the per-episode tick and
-        event counters.  It does not call ``monitor.reset`` again; episode-end
-        finalization already did that.
+        The core calls this after every real reset chain, including a reset of
+        an env that is still open (``runner.reset`` is not an episode-end
+        callback).  The engine handles both cases without fabricating an
+        episode record:
+
+        - a closed env (an episode finalized by :meth:`on_episode_end`) is
+          reopened with a new episode sequence;
+        - an open env restarts in place: its per-episode ticks, events, start
+          command and reset facts are cleared, any stale terminal latch/drain
+          is dropped and ``monitor.reset`` is notified.  The env stays open and
+          keeps its current sequence; the discarded partial episode was never
+          finalized by the core, so it is not reported.
+
+        Args:
+            env_ids: The ids the runner actually reset (a sequence or an
+                integer tensor).  A pre-start reset-all never reaches the
+                engine bound; the sink treats that as a no-op.
 
         Raises:
-            EngineStateError: The engine is unbound/ended or an id is open.
+            EngineStateError: The engine is ended or an env was bound but the
+                ids are invalid.  A closed env with a stale terminal latch or
+                pending drain is a lifecycle error.
         """
         self._require_running()
         num_envs = self._require_bound()
         reset_ids = _as_env_ids(env_ids, num_envs, "engine reset.env_ids")
+        reopen_ids: list[int] = []
+        restart_ids: list[int] = []
         for env_id in reset_ids:
-            if self._open[env_id]:
-                raise EngineStateError(
-                    f"engine reset.env_ids: env {env_id} is still open; "
-                    "a reset may only reopen an env finalized by on_episode_end"
-                )
-            if env_id in self._latched or env_id in self._pending:
-                raise EngineStateError(
-                    f"engine reset.env_ids: env {env_id} still has a terminal latch "
-                    "or pending drain; on_episode_end must clear it first"
-                )
-        for env_id in reset_ids:
+            if not self._open[env_id]:
+                if env_id in self._latched or env_id in self._pending:
+                    raise EngineStateError(
+                        f"engine reset.env_ids: env {env_id} still has a terminal "
+                        "latch or pending drain; on_episode_end must clear it first"
+                    )
+                reopen_ids.append(env_id)
+                continue
+            restart_ids.append(env_id)
+        for env_id in reopen_ids:
             self._open[env_id] = True
             self._episode_seq[env_id] += 1
+        for env_id in reopen_ids + restart_ids:
             self._episode_ticks[env_id] = 0
             self._episode_events[env_id].clear()
             self._episode_command[env_id] = None
             self._episode_reset[env_id].clear()
             self._rewound[env_id] = False
+        for env_id in restart_ids:
+            self._latched.pop(env_id, None)
+            self._pending.pop(env_id, None)
+        if restart_ids:
+            for monitor in self._monitors:
+                monitor.reset(restart_ids)
 
     def on_run_end(self) -> EpisodeSummary:
         """Finalize still-open episodes as ``incomplete`` and return the summary.
@@ -1122,11 +1145,22 @@ class StreamingEngine:
         return None
 
     def _first_terminal(self, bundle: Mapping[str, object], env_id: int) -> Termination | None:
-        """Return the latched terminal, preferring its canonical stamped copy."""
+        """Return the episode's first terminal fact, stamped when available.
+
+        A monitor/sink terminal is latched during the tick.  An explicit
+        ``runner.terminate`` boundary never passes through the sink drain, so
+        its custom fact is read directly from the boundary bundle; otherwise
+        the report would silently drop an explicit termination.
+        """
         latched = self._latched.get(env_id)
-        if latched is None:
-            return None
         entry = self._termination_entry(bundle, env_id)
+        if latched is None:
+            if entry is None:
+                return None
+            for term in entry.all:
+                if term.source is TerminationSource.CUSTOM:
+                    return term
+            return None
         if entry is not None:
             for term in entry.all:
                 if (

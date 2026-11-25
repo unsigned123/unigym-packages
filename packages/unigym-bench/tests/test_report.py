@@ -73,7 +73,6 @@ def _metadata(**overrides: object) -> RunMetadata:
     values: dict[str, object] = {
         "run_name": "report-run",
         "task_name": "report-task",
-        "mode": "benchmark",
         "out_dir": "data_out/report-run",
         "seed": 3,
         "num_envs": 1,
@@ -123,6 +122,7 @@ def test_base_fallback_and_extension_blocks_assemble_the_fixed_layout() -> None:
     assert report["schema"] == REPORT_SCHEMA
     assert report["run"]["run_name"] == "report-run"
     assert report["run"]["task_name"] == "report-task"
+    assert "mode" not in report["run"]
     assert report["run"]["seed"] == 3
     assert report["tasks"] == {
         "name": "report-task",
@@ -348,7 +348,7 @@ def test_default_retention_rewound_episode_is_counted_without_records() -> None:
     sink.on_step(0, first)
     sink.drain_terminations()
     sink.on_episode_end([0], first)
-    sink.on_step_end(0, first)
+    sink.on_reset([0])
     snapshot = sink.rewind_provider.rewind_state()
 
     sink.on_step(1, make_bundle(num_envs=1, t=1))
@@ -518,7 +518,7 @@ def test_stateful_extension_state_round_trips_through_the_rewind_provider() -> N
     sink.on_step(1, first)
     sink.drain_terminations()
     sink.on_episode_end([0], first)
-    sink.on_step_end(1, first)
+    sink.on_reset([0])
     assert extension.episodes == 1
 
     snapshot = sink.rewind_provider.rewind_state()
@@ -567,7 +567,7 @@ def test_scenario_coverage_extension_uses_record_start_commands_and_rewinds() ->
     sink.on_step(0, first)
     sink.drain_terminations()
     sink.on_episode_end([0], first)
-    sink.on_step_end(0, first)
+    sink.on_reset([0])
 
     state = sink.rewind_provider.rewind_state()
     assert state["extensions"]["coverage"] == {

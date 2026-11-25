@@ -9,8 +9,8 @@ from __future__ import annotations
 
 __all__ = ["CORE_SURFACE_VERSION", "REQUIRED_CORE_VERSION", "__version__"]
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
-CORE_SURFACE_VERSION: int = 3
+CORE_SURFACE_VERSION: int = 4
 
-REQUIRED_CORE_VERSION = "0.107.0"
+REQUIRED_CORE_VERSION = "0.108.0"

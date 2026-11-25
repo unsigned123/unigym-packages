@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import unigym
 from unigym import values as core_values
 from unigym.core import episode_termination
 
@@ -73,12 +74,17 @@ def test_pack_import_and_compat_import_no_benchmark_scaffolding() -> None:
 
 def test_core_contract_passes_on_current_core() -> None:
     assert assert_core_contract() is None
+    installed = tuple(int(part) for part in unigym.__version__.split(".")[:2])
+    required = tuple(int(part) for part in compat.REQUIRED_CORE_VERSION.split(".")[:2])
+    assert installed >= required
 
 
-def test_core_contract_declares_the_c13_value_and_context_surfaces() -> None:
+def test_core_contract_declares_the_post_deletion_value_and_context_surfaces() -> None:
     required = dict(compat._REQUIRED_SURFACES)
     assert set(_VALUE_SURFACES) <= set(required["unigym.values"])
     assert "EnvStepContext" in required["unigym.evaluation"]
+    assert "ResetAwareSink" in required["unigym.sink"]
+    assert {"CollectSinkSpec", "SinkDeclaration", "SinkSpec"} <= set(required["unigym.run"])
     assert "unigym.signals" not in required
 
 

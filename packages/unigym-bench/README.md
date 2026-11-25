@@ -5,14 +5,17 @@ streaming, monitor-driven benchmarking layer on the public sink, evaluation,
 value and step-context contracts, without importing `unigym.benchmarks`,
 `unigym.runner.evaluation` or `unigym.runner.episodes`.
 
-Status: P17, the finalized `0.2.0` release documentation on the P15
-value/context runtime baseline (core `0.107.x`; no throughput claim). P17 adds
-no runtime behavior; it records the release surface and validates it. P10 moved
-the import fence and version pin to core C13: the pack requires
-`unigym>=0.107,<0.108` and `CORE_SURFACE_VERSION` is `3`. The fence checks
-`unigym.values` (`ValueStore`, `ValueView`, `ValuePublisher`, `StepValues`)
-and `unigym.evaluation.EnvStepContext` instead of the removed
-`unigym.signals`. This baseline includes the P15 runtime migration: P11
+Status: `0.3.0`, the post-deletion-core release (core `0.108.x`; no throughput
+claim). The pack now requires `unigym>=0.108,<0.109` and
+`CORE_SURFACE_VERSION` is `4`. The post-deletion core owns no run `mode`, no
+episode clock and no built-in benchmark or `EvaluationSession`; the pack
+therefore ends every episode through an explicit `runner.terminate(...)`
+boundary (or a pack sink terminal) and reopens envs through the core
+`ResetAwareSink.on_reset` capability. The fence checks the explicit sink
+selection (`CollectSinkSpec`/`SinkDeclaration`/`SinkSpec`), `ResetAwareSink`,
+`unigym.values` (`ValueStore`, `ValueView`, `ValuePublisher`, `StepValues`) and
+`unigym.evaluation.EnvStepContext`. This baseline includes the P15 runtime
+migration: P11
 replaced the pack `TickFrame` with `BenchmarkStepContext` (a core
 `EnvStepContext` subclass), P12 added the source resolver and condition DSL,
 and P13 added `PredicateMonitor`. P15 moved the runtime onto the core value
@@ -56,7 +59,8 @@ collision is a teaching error. `compose_task(document)` returns a frozen
 `TaskPlan(monitors, extensions, retention, scenario, monitor_extensions)`, and
 `make_sink` accepts a JSON-safe `task_document` path option that runs this
 composition instead of the factory path. The package contains the P0-P16
-implementation tree, finalized as the P17 `0.2.0` release: version metadata, the
+implementation tree, first finalized as the `0.2.0` release and carried forward
+as `0.3.0` on the post-deletion core: version metadata, the
 core-contract import fence, strict JSON helpers, the closed YAML task-spec
 loader (`unigym_bench.specs`), the composition layer (`unigym_bench.compose`),
 the monitor protocol with the configured predicate and phase monitors
@@ -69,7 +73,46 @@ test through `Run.runner` (the core SyncRunner tick engine), zero-episode and
 multi-env conformance coverage, a bounded-journal retention test, and the
 parity limitations documented below.
 
-## Release 0.2.0: breaking API
+## Release 0.3.0: post-deletion core lockstep
+
+`unigym-bench 0.3.0` is a breaking release with no compatibility shims. It
+requires core `unigym>=0.108,<0.109` and pack-local core surface revision `4`.
+
+Changed contracts:
+
+- The core has no run `mode`, no `episode_length_s`, no built-in benchmark and
+  no `EvaluationSession`. The pack removes `ctx.mode` and `RunMetadata.mode`;
+  no run mode is fabricated.
+- The report schema is `external_benchmark_report/2`. The obsolete `run.mode`
+  field is removed; `run.loop_mode` remains the pack's own closed-loop
+  selection. Schema `/1` reports are not re-emitted as `/2`.
+- Episodes end only through an explicit boundary: `runner.terminate(env_ids,
+  terminations, reset=True/False)` or a pack sink terminal drained by the
+  runner. There is no hidden episode clock; a run that never ends an episode
+  reports it honestly as `incomplete` at run end.
+- `BenchmarkSink` implements the core `ResetAwareSink.on_reset` capability.
+  A reset of a finalized env reopens it; a core reset of an already-open env
+  restarts it in place (per-episode ticks/events/command/reset facts cleared,
+  `monitor.reset` notified) without fabricating an episode record; a pre-start
+  reset-all is a no-op because the engine binds on the first tick. `on_step_end`
+  no longer infers a reset. The `reset_after_episode` constructor argument and
+  the `runner.auto_reset: false` rejection are removed because the sink now
+  observes resets directly. With `runner.auto_reset: false`, episodes must
+  still end through an explicit boundary (`terminate(..., reset=True)`, or
+  `reset=False` followed by `runner.reset`); a core-owned due left open is
+  outside the pack contract.
+- Explicit `runner.terminate` facts are custom-owned facts (`custom.*` code,
+  `TerminationSource.CUSTOM`) and now appear in the pack's `terminations`
+  counters. A core-owned namespace such as `runtime.episode_horizon` cannot be
+  produced by the pack.
+- The compat fence requires `ResetAwareSink`, `CollectSinkSpec`,
+  `SinkDeclaration`, `SinkSpec`, `SinkContext`, `EnvView`/`EnvStepContext` and
+  the four value surfaces; it never requires the removed benchmark scaffolding.
+
+## Release 0.2.0: breaking API (historical)
+
+The `0.2.0` notes are retained for history; `0.3.0` above supersedes the core
+range, report schema and lifecycle contracts.
 
 `unigym-bench 0.2.0` is a breaking release with no compatibility shims. It
 requires core `unigym>=0.107,<0.108` (C13) and pack-local core surface revision
@@ -135,13 +178,12 @@ the run config in charge of the body/backend and gives the pack only its
 construction context:
 
 ```python
+from unigym.core.episode_termination import EpisodeOutcome, Termination, TerminationSource
 from unigym.run.api import Run
 from unigym.run.sink import SinkSpec
 
 run = Run(
-    # ... world, robot, action_spec, policies, steps, episode_length_s ...
-    mode="benchmark",
-    benchmark={"tasks": [], "min_episodes": 1, "max_steps": 2000},
+    # ... world, robot, action_spec, policies, steps ...
     # A custom sink owns benchmark control flow, so no task pack runtime is
     # needed and the built-in task catalog is not loaded.
     pack_runtime=None,
@@ -158,8 +200,22 @@ run = Run(
     ),
 )
 instance = run.build()
-runner = run.runner("external", action_fn=policy_actions)
-summary = runner.run(stop_when=instance.stop_when)
+runner = run.runner("external")
+for t in range(2000):
+    runner.step(policy_actions(t))
+    if episode_done(t):  # caller-owned episode semantics; no core clock
+        runner.terminate(
+            [0],
+            {
+                0: Termination(
+                    outcome=EpisodeOutcome.DEADLINE,
+                    code="custom.episode_horizon",
+                    source=TerminationSource.CUSTOM,
+                )
+            },
+            reset=True,  # reset=False leaves the env closed until runner.reset()
+        )
+summary = runner.sink.on_run_end()
 ```
 
 `monitor_factory` and `extension_factory` are zero-argument callables, given as
@@ -167,10 +223,9 @@ summary = runner.run(stop_when=instance.stop_when)
 they must be importable from the run process. A factory is the injection seam
 for programmatic callers because monitor/extension instances are not JSON-safe.
 `make_sink(ctx)` fails fast on unknown options, an unknown loop mode, a
-`sink-steered` run without `ctx.values`, `runner.auto_reset: false`, or a
-declared `monitor_extensions` reference that does not exist. `ctx.values` is
-the core `ValuePublisher` from `SinkContext`; the pack never reads a signal
-surface.
+`sink-steered` run without `ctx.values`, or a declared `monitor_extensions`
+reference that does not exist. `ctx.values` is the core `ValuePublisher` from
+`SinkContext`; the pack never reads a signal surface.
 
 A YAML task document is the other, JSON-safe composition path:
 
@@ -195,7 +250,7 @@ this boundary.
 
 With `write_report: true` the sink writes the assembled document to
 `<out_dir>/external_benchmark_report.json` at run end. The filename and the
-`external_benchmark_report/1` schema are pack-owned; the core
+`external_benchmark_report/2` schema are pack-owned; the core
 `benchmark_report.json`, `results.json` and `metrics.npz` are never touched.
 Writing is opt-in because it is a filesystem side effect. The sink creates
 `out_dir` if needed and replaces the file atomically; a failed write raises and
@@ -433,75 +488,79 @@ Known limitations in this revision:
 - **Events are in-memory only.** The capped journal is not persisted; there is
   no `external_benchmark_events.jsonl` writer in this revision.
 - **No early-stop policy.** `BenchmarkSink.stop_when()` always returns false;
-  the caller controls `runner.run(stop_when=...)`. `min_episodes`/`max_steps`
-  remain core benchmark keys the pack does not consume.
+  the caller controls `runner.run(stop_when=...)` or drives `runner.step`.
+  There are no core benchmark limit keys to consume.
+- **No episode clock.** The pack never infers `episode_length_s`; an episode
+  ends only through `runner.terminate(...)` or a pack sink terminal.
 - **MuJoCo integration lane.** The real tiny-arm test needs the D0 MuJoCo lane.
   A missing backend is a test failure, not a skip.
 
-Parity against the core built-in benchmark is **documented, not claimed**:
+Parity against the deleted core built-in benchmark is **frozen, not live**:
 
-| Aspect | Core built-in benchmark | `unigym-bench` pack | Status |
+| Aspect | Frozen core built-in facts | `unigym-bench` pack | Status |
 | --- | --- | --- | --- |
-| Entry | `mode=benchmark` + `EvaluationSession` over pack-runtime tasks | `mode=benchmark` + custom sink (`make_sink`) with monitors | Different composition; both use the same core runner tick engine |
-| Report artifact | `benchmark_report.json` / `results.json` / `metrics.npz` | `external_benchmark_report.json` (opt-in) | Disjoint, pack-owned filename |
-| Schema | `benchmark_report` | `external_benchmark_report/1` | Not byte-compatible; mapping documented here |
-| Episode end | core term group, episode horizon, benchmark limits | core facts plus pack first-terminal; verdicts `terminal`, `deadline`, `core`, `incomplete`, `rewound` | Same core boundary facts; pack adds custom terminals |
-| Scoring | per-task `success` and metrics | monitor `report_view` and extension blocks; no aggregate success score | Different purpose; not interchangeable |
-| Early stop | `min_episodes` / `max_steps` | caller-provided `stop_when` | Pack has no built-in stop policy |
-| Retention | episode buffer retains for scoring | counters by default; capped event journal | Pack is lossier by default and reports its drops |
-| Distribution | needs a benchmark task provider/pack runtime | installed sink; no pack runtime in `benchmark` mode | Pack avoids task-provider activation |
-| Rewind | built-in session/buffer | pack engine provider `unigym_bench` | Same core rewind seam |
+| Entry | `tests/_frozen_builtin_facts.json` (historical) | custom sink (`make_sink`) with monitors | Different composition; both used the same core runner tick engine |
+| Report artifact | `benchmark_report.json` / `results.json` / `metrics.npz` (historical) | `external_benchmark_report.json` (opt-in) | Disjoint, pack-owned filename |
+| Schema | `benchmark_report` (historical) | `external_benchmark_report/2` | Not byte-compatible; mapping documented here |
+| Episode end | core term group + episode horizon (historical) | explicit `runner.terminate`/sink terminal; verdicts `terminal`, `deadline`, `core`, `incomplete`, `rewound` | Same core boundary facts; pack owns the lifecycle |
+| Scoring | per-task `success` and metrics (historical) | monitor `report_view` and extension blocks; no aggregate success score | Different purpose; not interchangeable |
+| Early stop | `min_episodes` / `max_steps` (historical) | caller-provided `stop_when` | Pack has no built-in stop policy |
+| Retention | episode buffer retains for scoring (historical) | counters by default; capped event journal | Pack is lossier by default and reports its drops |
+| Distribution | needed a benchmark task provider/pack runtime | installed sink; no task-provider activation | Pack avoids task-provider activation |
+| Rewind | built-in session/buffer (historical) | pack engine provider `unigym_bench` | Same core rewind seam |
 
-The release includes a real same-config parity test. Constructing the core
-built-in benchmark from a bare `Run` is not a normal external-pack path: the
-benchmark task catalog must be imported inside the core `ACTIVATE` registration window,
-while core imports it lazily during `BACKEND_BUILD`. The test therefore runs
-the built-in lane in a fresh subprocess with that window opened explicitly,
-then runs the pack sink over the same tiny-arm config. Both runs use two policy
-ticks and one 0.04 s episode horizon, and the test asserts equal:
+The post-deletion core no longer contains `unigym.benchmarks`,
+`unigym.runner.evaluation`, `unigym.runner.episodes`, a run `mode`, an episode
+clock or `EvaluationSession`; no pack test imports them. The historical
+same-config facts are frozen in `tests/_frozen_builtin_facts.json`. The parity
+test runs only the pack lane over the tiny-arm fixture, ends one episode after
+two policy ticks with an explicit `runner.terminate`, and asserts the frozen:
 
 - episode count (1);
 - total episode ticks (2);
-- termination `outcome` / `code` / `source` counters (`deadline` /
-  `runtime.episode_horizon` / `runtime`).
+- termination `outcome` counter (`deadline`).
 
-That is **fact parity**, not report or scoring parity. The built-in task
-`success`/metric block has no pack equivalent, the two report schemas are not
-byte-compatible, and the pack runtime never imports `unigym.benchmarks`; the
-parity probe is test-only. The in-process integration test additionally checks
-the same-run core `EpisodeTermination` facts against the pack report and the
-report vocabulary against the core `EpisodeOutcome` / `TerminationSource`
-enums. No throughput claim is made; the retention test proves the journal is
-bounded by `max_events`.
+The `code` and `source` namespaces intentionally change: the old core-owned
+horizon fact was `runtime.episode_horizon` / `runtime`, while an explicit
+boundary is custom-owned (`custom.episode_horizon` / `custom`). That is
+**frozen fact parity plus a documented namespace change**, not report or
+scoring parity. The built-in task `success`/metric block has no pack
+equivalent, and the two report schemas are not byte-compatible. The in-process
+integration test additionally checks the same-run core `EpisodeTermination`
+facts against the pack report and the report vocabulary against the core
+`EpisodeOutcome` / `TerminationSource` enums. No throughput claim is made; the
+retention test proves the journal is bounded by `max_events`.
 
 ### Release validation
 
-The P17 `0.2.0` release was validated against the C13 core environment. From
+The `0.3.0` release is validated against the post-deletion core worktree. From
 `packages/unigym-bench`, using the Python from the core virtual environment:
 
 ```bash
-python -m pytest -q tests
-python -m pytest -q \
-  tests/test_parity.py tests/test_retention.py tests/test_rewind.py
-python -m ruff check src tests
-python -m ruff format --check src tests
+PYTHONPATH=<core-worktree>:src python -m pytest -q tests
+PYTHONPATH=<core-worktree>:src python -m pytest -q \
+  tests/test_parity.py tests/test_retention.py tests/test_rewind.py \
+  tests/test_integration.py
+PYTHONPATH=<core-worktree>:src python -m ruff check src tests
+PYTHONPATH=<core-worktree>:src python -m ruff format --check src tests
 ```
 
-The full suite includes the real tiny-arm MuJoCo integration, zero-episode and
-multi-env conformance, and the bounded-retention test; the focused lane covers
-parity, retention and rewind. This evidence is a CPU/MuJoCo lane only. No GPU or
-Isaac Lab lane is claimed.
+The full suite includes the real tiny-arm MuJoCo integration, explicit
+`terminate(reset=True/False)` lifecycle coverage, zero-episode and multi-env
+conformance, and the bounded-retention test; the focused lane covers parity,
+retention, rewind and tiny-arm. This evidence is a CPU/MuJoCo lane only. No GPU
+or Isaac Lab lane is claimed.
 
 ## Dependencies
 
 Development requires Python >=3.11 with a compatible `unigym`
-(`>=0.107,<0.108`) installed, plus the `dev` extra. The YAML loader requires
+(`>=0.108,<0.109`) installed, plus the `dev` extra. The YAML loader requires
 `PyYAML>=6.0,<7.0`, which is a direct runtime dependency of the pack. Pytest
 adds `src` to its own path, so tests do not need a caller-provided
 `PYTHONPATH`; the import-fence subprocess also sets its own path from the
 imported package.
 
-`unigym_bench.__version__` is `0.2.0` for the core `0.107.x` baseline release.
-`CORE_SURFACE_VERSION` is a pack-local revision
-of the required `unigym` public surface (currently `3`, after adopting the
-core value/context seams), not the distribution version.
+`unigym_bench.__version__` is `0.3.0` for the post-deletion core `0.108.x`
+baseline release. `CORE_SURFACE_VERSION` is a pack-local revision of the
+required `unigym` public surface (currently `4`, after adopting the explicit
+sink selection and reset-aware lifecycle seams), not the distribution version.

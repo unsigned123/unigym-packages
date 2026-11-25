@@ -118,12 +118,35 @@ def test_terminal_for_closed_env_is_a_contract_error() -> None:
         engine.on_episode_end([0], make_bundle(num_envs=1, t=1))
 
 
-def test_reset_of_open_env_is_a_contract_error() -> None:
-    engine = StreamingEngine([ScriptedMonitor("idle", {})])
+def test_reset_of_open_env_restarts_in_place_without_a_record() -> None:
+    monitor = ScriptedMonitor("idle", {})
+    engine = StreamingEngine([monitor], retention=RetentionSpec(retain_episodes=True))
     engine.on_step(make_bundle(num_envs=1, t=0))
 
-    with pytest.raises(EngineStateError, match="still open"):
-        engine.on_reset([0])
+    engine.on_reset([0])
+
+    assert engine.open_envs == (0,)
+    assert engine.records == ()
+    assert monitor.resets == [(0,)]
+
+    engine.on_step(make_bundle(num_envs=1, t=1))
+    engine.on_episode_end([0], make_bundle(num_envs=1, t=1))
+
+    assert [(record.episode_seq, record.ticks) for record in engine.records] == [(0, 1)]
+
+
+def test_reset_of_open_env_with_no_new_tick_reports_no_episode() -> None:
+    engine = StreamingEngine(
+        [ScriptedMonitor("idle", {})],
+        retention=RetentionSpec(retain_episodes=True),
+    )
+    engine.on_step(make_bundle(num_envs=1, t=0))
+
+    engine.on_reset([0])
+    summary = engine.on_run_end()
+
+    assert summary.episodes == 0
+    assert engine.records == ()
 
 
 def test_event_journal_cap_and_dropped_count() -> None:

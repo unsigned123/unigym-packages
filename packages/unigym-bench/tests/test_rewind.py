@@ -48,7 +48,7 @@ def _due(sink: BenchmarkSink, t: int, row: list[float]) -> None:
     bundle = _step(sink, t, row)
     sink.drain_terminations()
     sink.on_episode_end([0], bundle)
-    sink.on_step_end(t, bundle)
+    sink.on_reset([0])
 
 
 def test_provider_identity_and_payload_is_json_safe_and_private() -> None:
@@ -157,7 +157,7 @@ def test_dropped_event_counter_and_capped_journal_are_restored() -> None:
 
     sink.drain_terminations()
     sink.on_episode_end([0], _bundle(1, [1.0]))
-    sink.on_step_end(1, _bundle(1, [1.0]))
+    sink.on_reset([0])
     _step(sink, 2, [1.0])
     assert engine.dropped_events == 2
 

@@ -19,8 +19,10 @@ to the pack-owned ``external_benchmark_report.json``.  P16 adds the validated
 task-document composition layer in :mod:`unigym_bench.compose`: the closed
 builtin registry, source/trigger/emit predicate composition, the
 scenario-derived coverage extension and the ``task_document`` sink option.
-P17 finalizes the 0.2.0 release documentation and release evidence; it adds no
-runtime behavior.
+P17 finalized the 0.2.0 release documentation and release evidence. The 0.3.0
+release locks the pack to the post-deletion core: no run mode, no episode
+clock, no built-in benchmark/``EvaluationSession``, explicit
+``runner.terminate``/sink terminals and core ``on_reset`` reopening.
 """
 
 from __future__ import annotations

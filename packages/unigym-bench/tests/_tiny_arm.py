@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, TypeAlias
 
 from unigym.actuators.ir import ActuationGroup
 from unigym.assets.asset_ref import AssetRef
+from unigym.core.episode_termination import EpisodeOutcome, Termination, TerminationSource
 from unigym.robots.base import BodyBinding, RobotProfile
 from unigym.run.api import Run
 from unigym.run.sink import SinkSpec
@@ -20,11 +21,13 @@ from unigym.world import World
 
 if TYPE_CHECKING:
     from unigym.packs.runtime import PackRuntime
+    from unigym.runner.external import ExternalRunner
 
 __all__ = [
     "JOINTS",
     "TINY_ARM",
     "action_spec",
+    "end_episode",
     "floor_world",
     "make_run",
     "policy_binding",
@@ -102,12 +105,15 @@ def make_run(
     tmp_path: Path,
     *,
     steps: int,
-    episode_length_s: float,
     sink: SinkSpec | None,
-    benchmark: dict[str, object],
     pack_runtime: PackRuntime | None = None,
 ) -> Run:
-    """Build one real tiny-arm benchmark ``Run`` with the supplied sink."""
+    """Build one real tiny-arm ``Run`` with the supplied sink.
+
+    The post-deletion core owns no run mode, episode clock or built-in
+    benchmark, so the run declares only its body, backend and steps.  Episodes
+    end through :func:`end_episode` (``runner.terminate``) in the test bodies.
+    """
     return Run(
         world=World.base(mjcf=floor_world(tmp_path)),
         robot=robot_profile(),
@@ -115,13 +121,32 @@ def make_run(
         observations={"robot": ["tiny"]},
         action_spec=action_spec(),
         policies=(policy_binding(),),
-        mode="benchmark",
         steps=steps,
-        episode_length_s=episode_length_s,
         output_dir=str(tmp_path / "run"),
         no_artifacts=True,
         sink=sink,
-        benchmark=benchmark,
         pack_runtime=pack_runtime,
         discover_runtime=False,
+    )
+
+
+def end_episode(
+    runner: ExternalRunner,
+    *,
+    env_id: int = 0,
+    reset: bool,
+    code: str = "custom.episode_horizon",
+    outcome: EpisodeOutcome = EpisodeOutcome.DEADLINE,
+) -> None:
+    """End one episode through the core's explicit terminate boundary."""
+    runner.terminate(
+        [env_id],
+        {
+            env_id: Termination(
+                outcome=outcome,
+                code=code,
+                source=TerminationSource.CUSTOM,
+            )
+        },
+        reset=reset,
     )
