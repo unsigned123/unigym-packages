@@ -171,6 +171,50 @@ that declares an extension is emitted only through that extension's
 `unigym_bench` rewind provider restores its accumulator. The pack never writes
 the core `benchmark_report.json` or `results.json`.
 
+## Benchmark flow (F2 bridge)
+
+`BenchmarkSink(flow=...)` now composes a `unigym_bench.flow.BenchmarkFlow`
+beside the engine. The stable seam is:
+
+- `BenchmarkFlow`: `name`, `stateful`, optional `on_tick(tick)`, required
+  `on_episode_end(batch)` and `on_run_end(run)`;
+- `BenchmarkTick`: the tick's step context, monitor values and (for this card)
+  the current monitor event/terminal outputs;
+- `FlowDecision`: events, terminal requests and a run-stop flag;
+- `EpisodeBatch`: the due ids, final step context and final monitor values;
+- `FlowRun`: metadata, run summary, retained records, monitor views and the
+  report-extension set;
+- `DefaultBenchmarkFlow`: the stateless default that reproduces today's report.
+
+The engine remains the validation, latch, journal, record and rewind owner.
+The sink drives `begin_tick -> flow.on_tick -> apply_decision` and
+`begin_episode_end -> flow.on_episode_end -> commit_episode_end`; the engine
+validates every decision before it mutates run state. A flow without `on_tick`
+is valid and applies no tick policy. A `stateful=True` flow is rejected until
+the rewind card adds flow snapshots.
+
+F2 is a temporary bridge, not the final ownership model. Monitors still drain
+events and terminals, and `DefaultBenchmarkFlow` forwards them unchanged so
+existing behavior (including terminal-conflict counts) is identical. The
+monitor output fields and this bridge are removed by F3; the report schema
+stays `external_benchmark_report/2` and no evidence or `FlowSequence` exists
+yet. `FlowRun` carries monitor report views plus the declaration-order names,
+never live monitor objects, so the default flow builds the report without
+touching monitor internals.
+
+The F2 stop flag is transient. A successful rewind restore, and the core
+`on_rewind` notification, clear it so a forked branch never inherits a stop
+from the abandoned timeline. Stop persistence is deferred to the flow-rewind
+card; the report schema is unchanged.
+
+Flow callback exceptions are fail-fast with no rollback. `begin_tick` advances
+the episode tick counters and drains monitor outputs before `flow.on_tick`, and
+`begin_episode_end` drains final queues before `flow.on_episode_end`. If a flow
+callback raises, the sink discards the pending tick/boundary and closes its
+query snapshot, but it does not restore monitor queues, tick counters or
+already-observed outputs. The exception propagates and the run must abort; it
+must not silently continue on partially observed state.
+
 ## Authoring a run
 
 The pack is mounted as a core custom sink. A real benchmark run therefore keeps

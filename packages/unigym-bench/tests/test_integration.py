@@ -30,6 +30,7 @@ from unigym.run.sink import SinkSpec
 from unigym.runner.external import ExternalRunner
 
 from unigym_bench.events import Event
+from unigym_bench.flow import DefaultBenchmarkFlow
 from unigym_bench.report import REPORT_FILENAME, REPORT_SCHEMA
 from unigym_bench.sink import BenchmarkSink
 from unigym_bench.specs import RetentionSpec
@@ -124,6 +125,7 @@ def test_real_tiny_arm_run_writes_the_pack_report_not_core_benchmark_files(
     try:
         instance = run.build()
         probe = _observed_sink(instance)
+        assert isinstance(probe.inner.flow, DefaultBenchmarkFlow)
         runner = run.runner("external", action_fn=zero_actions)
         _step(runner, 2)
         end_episode(runner, reset=True)

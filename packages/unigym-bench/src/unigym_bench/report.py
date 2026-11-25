@@ -65,6 +65,7 @@ __all__ = [
     "RunMetadata",
     "RunSummary",
     "ScenarioCoverageExtension",
+    "validate_report_configuration",
     "validate_report_extensions",
 ]
 
@@ -515,6 +516,31 @@ class ReportBuilder:
         if not isinstance(normalized, dict):
             raise TypeError("external benchmark report: expected an object")
         return normalized
+
+
+def validate_report_configuration(
+    *,
+    monitors: Sequence[Monitor],
+    extensions: Sequence[ReportExtension] = (),
+    monitor_extensions: Mapping[str, str] | None = None,
+) -> None:
+    """Validate report composition without retaining live monitor objects.
+
+    Args:
+        monitors: Monitor instances in task declaration order.
+        extensions: Report extensions in task declaration order.
+        monitor_extensions: Optional monitor-name to extension-name map.
+
+    Raises:
+        TypeError: A monitor/extension is malformed or the stateful contract is
+            inconsistent.
+        ValueError: A name is duplicated or a declared reference is missing.
+    """
+    ReportBuilder(
+        monitors=monitors,
+        extensions=extensions,
+        monitor_extensions=monitor_extensions,
+    )
 
 
 def validate_report_extensions(extensions: object) -> tuple[ReportExtension, ...]:

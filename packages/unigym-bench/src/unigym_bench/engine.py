@@ -17,11 +17,16 @@ through the run's core ``ValuePublisher``; they are not stored by the engine.
 
 Lifecycle (delegated by the sink)::
 
-    sink.on_step -> engine.on_step(bundle)
+    sink.on_step -> engine.begin_tick(bundle) -> flow.on_tick
+                 -> engine.apply_decision(tick, decision)
     runner drain -> engine.drain_terminations()
-    runner due   -> engine.on_episode_end(due, bundle)   # finalize
+    runner due   -> engine.begin_episode_end(due, bundle) -> flow.on_episode_end
+                 -> engine.commit_episode_end(batch, None)   # finalize
     runner reset -> engine.on_reset(due)                 # reopen new episodes
-    runner end   -> engine.on_run_end()
+    runner end   -> engine.run_summary()
+
+The legacy ``engine.on_step`` and ``engine.on_episode_end`` entry points keep
+their behavior by beginning and committing with the monitor bridge decision.
 
 The core runner owns the episode boundary and calls the sink's reset-aware
 ``on_reset`` capability after every real reset chain.  The engine never infers
@@ -71,6 +76,13 @@ from .events import (
     EpisodeVerdict,
     Event,
     termination_from_json,
+)
+from .flow import (
+    BenchmarkTick,
+    EpisodeBatch,
+    FlowDecision,
+    _MonitorTickOutput,
+    _monitor_bridge_decision,
 )
 from .json import JsonValue, ensure_json_value
 from .monitors import Monitor
@@ -177,6 +189,29 @@ class _DecodedRewindState:
     extensions: dict[str, JsonValue]
 
 
+@dataclass(frozen=True)
+class _ActiveTick:
+    """One begun tick awaiting its flow decision and engine application."""
+
+    tick: BenchmarkTick
+    query: TickQuery | None
+    owns_query: bool
+
+
+@dataclass(frozen=True)
+class _ActiveEpisode:
+    """One validated episode boundary awaiting flow observation and commit."""
+
+    batch: EpisodeBatch
+    bundle: Mapping[str, object]
+    due: tuple[int, ...]
+    final_values: tuple[tuple[Monitor, dict[str, Tensor]], ...]
+    final_events: tuple[tuple[Monitor, tuple[Event, ...]], ...]
+    final_terminals: tuple[Termination, ...]
+    query: TickQuery | None
+    owns_query: bool
+
+
 class StreamingEngine:
     """One run's streaming state, monitor driver and terminal authority.
 
@@ -272,6 +307,10 @@ class StreamingEngine:
         self._termination_source_counts: dict[str, int] = {}
         self._episode_counts_by_env: list[int] = []
 
+        self._active_tick: _ActiveTick | None = None
+        self._active_episode: _ActiveEpisode | None = None
+        self._stop_requested = False
+
     # ------------------------------------------------------------------ #
     # Public read-only state
     # ------------------------------------------------------------------ #
@@ -329,6 +368,11 @@ class StreamingEngine:
     def conflict_count(self) -> int:
         """Total late terminal requests counted across the run."""
         return self._conflict_total
+
+    @property
+    def stop_requested(self) -> bool:
+        """Whether any applied flow decision requested a run stop."""
+        return self._stop_requested
 
     @property
     def records(self) -> tuple[EpisodeRecord, ...]:
@@ -440,7 +484,9 @@ class StreamingEngine:
         read-only ``validate_restore`` capability when present.  The live state
         of every rewindable monitor and extension is captured before anything is
         touched so an unexpected restore failure rolls all of them back; engine
-        fields are assigned only after every restore succeeded.
+        fields are assigned only after every restore succeeded.  The F2 stop
+        flag is transient and is cleared on a successful restore instead of
+        being checkpointed; F5 formalizes stop persistence.
         """
         decoded = self._decode_rewind_state(state)
         monitor_rollback: dict[str, JsonValue] = {}
@@ -482,12 +528,16 @@ class StreamingEngine:
                 expected_extensions[name].restore(previous)
             raise
         self._apply_engine_state(decoded.engine)
+        self._stop_requested = False
 
     # ------------------------------------------------------------------ #
     # Runner-facing lifecycle
     # ------------------------------------------------------------------ #
     def on_step(self, bundle: Mapping[str, object]) -> None:
-        """Consume one pre-reset engine step.
+        """Consume one pre-reset engine step through the flow conductor.
+
+        This legacy entry point keeps the engine-only API behavior identical:
+        it begins a tick, forwards the monitor bridge decision and applies it.
 
         Args:
             bundle: The core runner bundle.  Only its ``step`` entry is read;
@@ -502,7 +552,29 @@ class StreamingEngine:
                 output or value violates the contract.
             ValueError: A shape, device, source or code is invalid.
         """
+        tick = self.begin_tick(bundle)
+        try:
+            decision = _monitor_bridge_decision(tick)
+        except BaseException:
+            self.discard_tick(tick)
+            raise
+        self.apply_decision(tick, decision)
+
+    def begin_tick(self, bundle: Mapping[str, object]) -> BenchmarkTick:
+        """Drive the monitors and return one validated, immutable tick.
+
+        The tick keeps its query snapshot open until :meth:`apply_decision` or
+        :meth:`discard_tick` is called, so a flow may read ``tick.query`` during
+        ``on_tick``.  Every monitor output is validated before the tick is
+        returned; only the per-episode tick counters and the episode-start
+        capture are updated here.  A later flow exception does not roll those
+        updates or the drained monitor queues back.
+        """
         self._require_running()
+        if self._active_tick is not None:
+            raise EngineStateError(
+                "engine: a tick is already active; apply or discard it before " "beginning another"
+            )
         if not isinstance(bundle, Mapping):
             raise TypeError(f"engine bundle: expected a mapping, got {type(bundle).__name__}")
         context = self._build_context(bundle)
@@ -536,34 +608,123 @@ class StreamingEngine:
                         self._collect_terminals(monitor, num_envs),
                     )
                 )
-        finally:
+
+            # Validate every occurrence before returning the tick so a bad
+            # output cannot be half-applied by a later decision.
+            for monitor, _, events, terminals in collected:
+                for event in events:
+                    self._validate_event_envs(monitor, event)
+                for env_id in terminals:
+                    if not self._open[env_id]:
+                        raise EngineStateError(
+                            f"monitor {monitor.name!r}: terminal for closed env {env_id}; "
+                            f"open envs are {list(self.open_envs)}"
+                        )
+        except BaseException:
             if owns_query and tick_query is not None:
                 tick_query.close()
+            raise
 
-        # Validate every occurrence before mutating journal/latches so a bad
-        # output cannot leave a half-applied tick behind.
-        for monitor, _, events, terminals in collected:
-            for event in events:
-                self._validate_event_envs(monitor, event)
-            for env_id in terminals:
+        outputs = tuple(
+            _MonitorTickOutput(
+                monitor=monitor.name,
+                values=values,
+                events=events,
+                terminations=terminations,
+            )
+            for monitor, values, events, terminations in collected
+        )
+        tick = BenchmarkTick(step=context, monitor_outputs=outputs)
+        self._active_tick = _ActiveTick(tick=tick, query=tick_query, owns_query=owns_query)
+        return tick
+
+    def apply_decision(self, tick: BenchmarkTick, decision: FlowDecision) -> None:
+        """Validate one flow decision and apply it to the run state.
+
+        The tick's monitor values are published regardless of the decision;
+        the flow controls only the events, terminal requests and stop flag.
+        """
+        state = self._active_tick
+        if state is None or state.tick is not tick:
+            raise EngineStateError(
+                "engine: apply_decision received a tick that is not the active tick"
+            )
+        try:
+            if not isinstance(decision, FlowDecision):
+                raise TypeError(
+                    "engine flow decision: expected a FlowDecision, "
+                    f"got {type(decision).__name__}"
+                )
+            self._validate_flow_decision(decision)
+            if self._publisher is not None and all(self._open):
+                for output in tick.monitor_outputs:
+                    for local_name, value in output.values.items():
+                        self._publisher.publish(f"{output.monitor}/{local_name}", value)
+            for event in decision.events:
+                self._record_event(event)
+            for env_id, termination in decision.terminal_requests:
+                self._accept_terminal(env_id, termination)
+            if decision.stop:
+                self._stop_requested = True
+        finally:
+            self._close_active_tick(state)
+
+    def discard_tick(self, tick: BenchmarkTick | None = None) -> None:
+        """Close an active tick without applying any flow decision."""
+        state = self._active_tick
+        if state is None:
+            return
+        if tick is not None and state.tick is not tick:
+            raise EngineStateError(
+                "engine: discard_tick received a tick that is not the active tick"
+            )
+        self._close_active_tick(state)
+
+    def _close_active_tick(self, state: _ActiveTick) -> None:
+        """Close the tick snapshot and clear the active-tick slot."""
+        try:
+            if state.owns_query and state.query is not None:
+                state.query.close()
+        finally:
+            self._active_tick = None
+
+    def _validate_flow_decision(self, decision: FlowDecision) -> None:
+        """Reject a flow decision that names an invalid or closed environment."""
+        num_envs = self._require_bound()
+        for index, event in enumerate(decision.events):
+            for env_id in event.env_ids:
+                if env_id >= num_envs:
+                    raise ValueError(
+                        f"flow decision.events[{index}]: env id {env_id} is outside "
+                        f"[0, num_envs={num_envs})"
+                    )
                 if not self._open[env_id]:
                     raise EngineStateError(
-                        f"monitor {monitor.name!r}: terminal for closed env {env_id}; "
+                        f"flow decision.events[{index}]: env {env_id} is closed; "
                         f"open envs are {list(self.open_envs)}"
                     )
-
-        if self._publisher is not None and all(self._open):
-            for monitor, values, _, _ in collected:
-                for local_name, value in values.items():
-                    self._publisher.publish(f"{monitor.name}/{local_name}", value)
-
-        for _, _, events, _ in collected:
-            for event in events:
-                self._record_event(event)
-
-        for _, _, _, terminals in collected:
-            for env_id in sorted(terminals):
-                self._accept_terminal(env_id, terminals[env_id])
+        for env_id, termination in decision.terminal_requests:
+            if env_id >= num_envs:
+                raise ValueError(
+                    f"flow decision.terminations: env id {env_id} is outside "
+                    f"[0, num_envs={num_envs})"
+                )
+            if not self._open[env_id]:
+                raise EngineStateError(
+                    f"flow decision.terminations[{env_id}]: terminal for closed env "
+                    f"{env_id}; open envs are {list(self.open_envs)}"
+                )
+            if termination.source is not TerminationSource.CUSTOM:
+                raise ValueError(
+                    f"flow decision.terminations[{env_id}]: source must be custom, "
+                    f"got {termination.source.value!r}"
+                )
+            if not termination.code.startswith("custom."):
+                raise ValueError(
+                    f"flow decision.terminations[{env_id}]: code must start with "
+                    f"'custom.', got {termination.code!r}"
+                )
+            validate_code(termination.code)
 
     def drain_terminations(self) -> dict[int, Termination]:
         """Return and clear the pending first-terminal facts.
@@ -577,30 +738,45 @@ class StreamingEngine:
         return pending
 
     def on_episode_end(self, due: object, bundle: Mapping[str, object]) -> tuple[int, ...]:
-        """Finalize the due environments and clear their latches.
+        """Finalize the due environments through the flow conductor.
+
+        This legacy entry point keeps the engine-only API behavior identical:
+        it begins the boundary and commits it without a flow decision.
 
         Args:
             due: Sequence of env ids or a 1-D integer tensor from the runner.
             bundle: The runner's episode-end bundle.  ``final_step`` is the
                 required post-``on_step`` boundary context used for final
-                predicate evaluation.  ``terminations`` supplies the canonical
-                terminal stamps and core facts; ``reset_facts`` are not read
-                here because the record keeps the JSON-safe reset state captured
-                on the episode's first tick.
+                monitor evaluation.
 
         Returns:
-            The sorted, unique due env ids.  The sink may use this tuple for
-            diagnostics; reopening is driven by the core reset notification
-            (``on_reset``) that follows a real reset chain.
+            The sorted, unique due env ids.
+        """
+        batch = self.begin_episode_end(due, bundle)
+        if batch is None:
+            return ()
+        return self.commit_episode_end(batch, None)
 
-        Raises:
-            EngineStateError: The engine is unbound/ended, ``final_step`` is
-                missing, a due env is closed, or a monitor reports a lifecycle
-                violation.
-            TypeError: ``final_step`` or a monitor output has the wrong type.
-            ValueError: A shape, device, source, env id or code is invalid.
+    def begin_episode_end(self, due: object, bundle: Mapping[str, object]) -> EpisodeBatch | None:
+        """Evaluate the final monitor boundary and return an immutable batch.
+
+        Monitor values, final events and report/scoring terminals are validated
+        here.  The batch keeps the final query snapshot open until
+        :meth:`commit_episode_end` or :meth:`discard_episode_end`; no run
+        aggregate, record or reset is mutated here.  The final event/terminal
+        queues are consumed at this boundary, so a later flow exception does not
+        restore them.
+
+        Returns:
+            The episode batch, or ``None`` when ``due`` is empty (the existing
+            engine returns early without building a final context).
         """
         self._require_running()
+        if self._active_episode is not None:
+            raise EngineStateError(
+                "engine: an episode boundary is already active; commit or discard "
+                "it before beginning another"
+            )
         num_envs = self._require_bound()
         if not isinstance(bundle, Mapping):
             raise TypeError(
@@ -608,7 +784,7 @@ class StreamingEngine:
             )
         due_ids = _as_env_ids(due, num_envs, "engine episode_end.due")
         if not due_ids:
-            return ()
+            return None
         for env_id in due_ids:
             if not self._open[env_id]:
                 raise EngineStateError(
@@ -639,84 +815,148 @@ class StreamingEngine:
 
             # Read and validate the post-evaluation levels before draining
             # outputs, so a malformed value cannot consume events/terminals on a
-            # failed boundary.  Publication still happens only after every check.
+            # failed boundary.  Publication still happens only at commit.
             final_values = [
                 (monitor, self._collect_values(monitor, final_context))
                 for monitor in self._monitors
             ]
-        finally:
+
+            final_events = [(monitor, self._collect_events(monitor)) for monitor in self._monitors]
+            final_terminals: list[Termination] = []
+            for monitor in self._monitors:
+                drain = getattr(monitor, "drain_episode_terminals", None)
+                if callable(drain):
+                    final_terminals.extend(
+                        self._collect_episode_terminals(monitor, due_ids).values()
+                    )
+
+            # Validate every final occurrence before returning the batch.
+            for monitor, events in final_events:
+                for event in events:
+                    self._validate_final_event_envs(monitor, event, due_ids)
+        except BaseException:
             if owns_final_query and final_query is not None:
                 final_query.close()
+            raise
 
-        final_events = [(monitor, self._collect_events(monitor)) for monitor in self._monitors]
-        final_terminals: list[Termination] = []
-        for monitor in self._monitors:
-            drain = getattr(monitor, "drain_episode_terminals", None)
-            if callable(drain):
-                final_terminals.extend(self._collect_episode_terminals(monitor, due_ids).values())
+        monitor_values = {monitor.name: values for monitor, values in final_values}
+        batch = EpisodeBatch(
+            due=due_ids,
+            final_step=final_context,
+            monitor_values=monitor_values,
+            records={},
+        )
+        self._active_episode = _ActiveEpisode(
+            batch=batch,
+            bundle=bundle,
+            due=due_ids,
+            final_values=tuple(final_values),
+            final_events=tuple(final_events),
+            final_terminals=tuple(final_terminals),
+            query=final_query,
+            owns_query=owns_final_query,
+        )
+        return batch
 
-        # Validate every final occurrence before mutating journal/counters.
-        for monitor, events in final_events:
-            for event in events:
-                self._validate_final_event_envs(monitor, event, due_ids)
+    def commit_episode_end(
+        self,
+        batch: EpisodeBatch,
+        evidence: Mapping[int, Mapping[str, JsonValue]] | None = None,
+    ) -> tuple[int, ...]:
+        """Apply a begun episode boundary and finalize its due records.
 
-        # Publish after final evaluation so the store never receives stale tick
-        # levels for the due rows.  A partial open set is skipped for the same
-        # full-run level-vector reason as the tick publication.
-        if self._publisher is not None and all(self._open):
-            for monitor, values in final_values:
-                for local_name, value in values.items():
-                    self._publisher.publish(f"{monitor.name}/{local_name}", value)
+        F2 accepts only ``evidence=None``; episode evidence is a later card.
+        """
+        state = self._active_episode
+        if state is None or state.batch is not batch:
+            raise EngineStateError("engine: commit_episode_end received a batch that is not active")
+        try:
+            if evidence is not None:
+                raise NotImplementedError(
+                    "engine episode evidence is not supported in F2; a flow must "
+                    "return None from on_episode_end"
+                )
+            due_ids = state.due
+            bundle = state.bundle
 
-        # Account for final occurrences before records are built so their
-        # per-episode event counts are complete.
-        for _, events in final_events:
-            for event in events:
-                self._record_event(event)
+            # Publish after final evaluation so the store never receives stale tick
+            # levels for the due rows.  A partial open set is skipped for the same
+            # full-run level-vector reason as the tick publication.
+            if self._publisher is not None and all(self._open):
+                for monitor, values in state.final_values:
+                    for local_name, value in values.items():
+                        self._publisher.publish(f"{monitor.name}/{local_name}", value)
 
-        # Episode-end terminals are report/scoring facts only: count them in
-        # the run aggregate, never in the runner drain or first-terminal latch.
-        for termination in final_terminals:
-            self._count_termination(termination)
+            # Account for final occurrences before records are built so their
+            # per-episode event counts are complete.
+            for _, events in state.final_events:
+                for event in events:
+                    self._record_event(event)
 
-        records = [
-            EpisodeRecord(
-                env_id=env_id,
-                episode_seq=self._episode_seq[env_id],
-                ticks=self._episode_ticks[env_id],
-                verdict=(
-                    "terminal" if env_id in self._latched else self._due_verdict(bundle, env_id)
-                ),
-                command_at_start=self._episode_command[env_id],
-                first_terminal=self._first_terminal(bundle, env_id),
-                core_termination=self._core_termination(bundle, env_id),
-                reset_facts=dict(self._episode_reset[env_id]),
-                event_counts=dict(self._episode_events[env_id]),
-                rewound=self._rewound[env_id],
+            # Episode-end terminals are report/scoring facts only: count them in
+            # the run aggregate, never in the runner drain or first-terminal latch.
+            for termination in state.final_terminals:
+                self._count_termination(termination)
+
+            records = [
+                EpisodeRecord(
+                    env_id=env_id,
+                    episode_seq=self._episode_seq[env_id],
+                    ticks=self._episode_ticks[env_id],
+                    verdict=(
+                        "terminal" if env_id in self._latched else self._due_verdict(bundle, env_id)
+                    ),
+                    command_at_start=self._episode_command[env_id],
+                    first_terminal=self._first_terminal(bundle, env_id),
+                    core_termination=self._core_termination(bundle, env_id),
+                    reset_facts=dict(self._episode_reset[env_id]),
+                    event_counts=dict(self._episode_events[env_id]),
+                    rewound=self._rewound[env_id],
+                )
+                for env_id in due_ids
+            ]
+
+            if self._extensions:
+                # Only this boundary's envs are visible, and the records are frozen;
+                # an extension cannot reach another env or mutate a finalized record.
+                due_records = MappingProxyType({record.env_id: record for record in records})
+                for extension in self._extensions:
+                    extension.on_env_end(due_ids, due_records)
+            for monitor in self._monitors:
+                monitor.reset(due_ids)
+
+            for record in records:
+                self._finalize_record(record)
+            for env_id in due_ids:
+                self._latched.pop(env_id, None)
+                self._pending.pop(env_id, None)
+                self._episode_events[env_id].clear()
+                self._episode_command[env_id] = None
+                self._episode_reset[env_id].clear()
+                self._open[env_id] = False
+                self._rewound[env_id] = False
+            return due_ids
+        finally:
+            self._close_active_episode(state)
+
+    def discard_episode_end(self, batch: EpisodeBatch | None = None) -> None:
+        """Close an active episode boundary without finalizing it."""
+        state = self._active_episode
+        if state is None:
+            return
+        if batch is not None and state.batch is not batch:
+            raise EngineStateError(
+                "engine: discard_episode_end received a batch that is not active"
             )
-            for env_id in due_ids
-        ]
+        self._close_active_episode(state)
 
-        if self._extensions:
-            # Only this boundary's envs are visible, and the records are frozen;
-            # an extension cannot reach another env or mutate a finalized record.
-            due_records = MappingProxyType({record.env_id: record for record in records})
-            for extension in self._extensions:
-                extension.on_env_end(due_ids, due_records)
-        for monitor in self._monitors:
-            monitor.reset(due_ids)
-
-        for record in records:
-            self._finalize_record(record)
-        for env_id in due_ids:
-            self._latched.pop(env_id, None)
-            self._pending.pop(env_id, None)
-            self._episode_events[env_id].clear()
-            self._episode_command[env_id] = None
-            self._episode_reset[env_id].clear()
-            self._open[env_id] = False
-            self._rewound[env_id] = False
-        return due_ids
+    def _close_active_episode(self, state: _ActiveEpisode) -> None:
+        """Close the final snapshot and clear the active-episode slot."""
+        try:
+            if state.owns_query and state.query is not None:
+                state.query.close()
+        finally:
+            self._active_episode = None
 
     def on_reset(self, env_ids: object) -> None:
         """Apply the core reset notification to the pack episode state.
@@ -817,6 +1057,10 @@ class StreamingEngine:
         self._run_ended = True
         return self.summary
 
+    def run_summary(self) -> EpisodeSummary:
+        """Finalize the run and return its retention-independent aggregate."""
+        return self.on_run_end()
+
     def on_rewind(self, info: Mapping[str, object]) -> None:
         """Mark every currently open episode as belonging to a forked timeline.
 
@@ -824,8 +1068,12 @@ class StreamingEngine:
         restored timeline's first step.  The mark rides the episode until it
         finalizes: a due record keeps its natural verdict plus ``rewound=True``;
         an episode still open at run end is reported with verdict ``rewound``.
+        The F2 stop flag is cleared here too: a forked branch must not inherit
+        a stop request from the abandoned timeline.  F5 formalizes stop
+        persistence as part of the flow rewind contract.
         """
         del info
+        self._stop_requested = False
         for env_id, is_open in enumerate(self._open):
             if is_open:
                 self._rewound[env_id] = True

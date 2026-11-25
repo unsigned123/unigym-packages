@@ -29,12 +29,27 @@ from __future__ import annotations
 
 from .compat import assert_core_contract
 from .compose import ComposeError, TaskPlan, compose_task
+from .flow import (
+    BenchmarkFlow,
+    BenchmarkTick,
+    DefaultBenchmarkFlow,
+    EpisodeBatch,
+    FlowDecision,
+    FlowRun,
+    validate_flow,
+)
 from .json import JsonValue, ensure_json_value
 from .version import CORE_SURFACE_VERSION, REQUIRED_CORE_VERSION, __version__
 
 __all__ = [
+    "BenchmarkFlow",
+    "BenchmarkTick",
     "CORE_SURFACE_VERSION",
     "ComposeError",
+    "DefaultBenchmarkFlow",
+    "EpisodeBatch",
+    "FlowDecision",
+    "FlowRun",
     "JsonValue",
     "REQUIRED_CORE_VERSION",
     "TaskPlan",
@@ -42,4 +57,5 @@ __all__ = [
     "assert_core_contract",
     "compose_task",
     "ensure_json_value",
+    "validate_flow",
 ]

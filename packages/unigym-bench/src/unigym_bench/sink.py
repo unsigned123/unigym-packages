@@ -83,14 +83,20 @@ from unigym.errors import ConfigError
 
 from .compose import ComposeError, TaskPlan, compose_task
 from .engine import StreamingEngine
-from .json import JsonValue
+from .flow import (
+    BenchmarkFlow,
+    DefaultBenchmarkFlow,
+    FlowDecision,
+    FlowRun,
+    validate_flow,
+)
+from .json import JsonValue, ensure_json_value
 from .monitors import Monitor
 from .report import (
     REPORT_FILENAME,
-    ReportBuilder,
     ReportExtension,
     RunMetadata,
-    RunSummary,
+    validate_report_configuration,
 )
 from .specs import RetentionSpec, SpecError, load_task_document
 from .sources import SourceUnavailableError
@@ -269,6 +275,9 @@ class BenchmarkSink:
         engine: An already-built engine for tests or advanced composition.
             When supplied, ``retention``, ``publisher`` and ``extensions`` must
             be omitted because the engine already owns them.
+        flow: Optional benchmark flow.  The default is a stateless
+            :class:`~unigym_bench.flow.DefaultBenchmarkFlow` that reproduces
+            the pack's existing monitor and report behavior.
         retention: Explicit event/episode retention for a sink-built engine.
         publisher: Optional write-only value publisher for a sink-built engine.
         loop_mode: ``"pool"`` or ``"sink-steered"``.  A sink-steered sink needs
@@ -291,10 +300,12 @@ class BenchmarkSink:
         ConfigError: ``loop_mode`` is unknown, a sink-steered sink has no
             publisher, or ``write_report`` is true without a construction
             ``out_dir``.
-        TypeError: Both or neither of ``monitors``/``engine`` are supplied, or
-            an injected engine is mixed with separately supplied resources.
-        ValueError: A monitor/extension name is duplicated or a declared
-            ``report_extension`` reference is missing.
+        TypeError: Both or neither of ``monitors``/``engine`` are supplied, an
+            injected engine is mixed with separately supplied resources, or the
+            supplied flow is malformed.
+        ValueError: A monitor/extension name is duplicated, a declared
+            ``report_extension`` reference is missing, or the supplied flow
+            declares rewindable state (not supported until the rewind card).
     """
 
     def __init__(
@@ -302,6 +313,7 @@ class BenchmarkSink:
         monitors: Sequence[Monitor] | None = None,
         *,
         engine: StreamingEngine | None = None,
+        flow: BenchmarkFlow | None = None,
         retention: RetentionSpec | None = None,
         publisher: ValuePublisher | None = None,
         loop_mode: str = DEFAULT_LOOP_MODE,
@@ -311,6 +323,9 @@ class BenchmarkSink:
         write_report: bool = False,
     ) -> None:
         _validate_loop_mode(loop_mode)
+        requested_flow: BenchmarkFlow | None = None
+        if flow is not None:
+            requested_flow = validate_flow(flow)
         if not isinstance(write_report, bool):
             raise TypeError(
                 "BenchmarkSink: write_report must be a bool, " f"got {type(write_report).__name__}"
@@ -350,13 +365,23 @@ class BenchmarkSink:
         self._loop_mode = loop_mode
         self._metadata = metadata
         self._write_report = write_report
-        self._builder = ReportBuilder(
+        validate_report_configuration(
             monitors=self._engine.monitors,
             extensions=self._engine.extensions,
             monitor_extensions=monitor_extensions,
         )
+        self._flow = DefaultBenchmarkFlow() if requested_flow is None else requested_flow
+        self._fallback_flow = DefaultBenchmarkFlow()
+        self._monitor_extensions: Mapping[str, str] = (
+            {} if monitor_extensions is None else dict(monitor_extensions)
+        )
         self._report: dict[str, JsonValue] | None = None
         self._report_written = False
+
+    @property
+    def flow(self) -> BenchmarkFlow:
+        """The validated flow composed by this sink."""
+        return self._flow
 
     @property
     def loop_mode(self) -> str:
@@ -378,16 +403,50 @@ class BenchmarkSink:
         return Path(self._metadata.out_dir) / REPORT_FILENAME
 
     def on_step(self, t: int, bundle: dict[str, object]) -> None:
-        """Delegate one pre-reset tick to the engine."""
-        self._engine.on_step(bundle)
+        """Begin a tick, ask the flow, and apply the validated decision.
+
+        ``begin_tick`` has already advanced episode tick counters and drained
+        monitor outputs before ``flow.on_tick`` runs.  If the callback raises,
+        the sink discards the pending tick snapshot and re-raises; monitor
+        queues and tick counters are not rolled back, so the run must abort
+        rather than continue on partially observed state.
+        """
+        del t
+        tick = self._engine.begin_tick(bundle)
+        try:
+            on_tick = getattr(self._flow, "on_tick", None)
+            decision: FlowDecision | None = None
+            if callable(on_tick):
+                decision = on_tick(tick)
+        except BaseException:
+            self._engine.discard_tick(tick)
+            raise
+        if decision is None:
+            decision = FlowDecision()
+        self._engine.apply_decision(tick, decision)
 
     def drain_terminations(self) -> Mapping[int, Termination]:
         """Return and clear the engine's pending first-terminal facts."""
         return self._engine.drain_terminations()
 
     def on_episode_end(self, env_ids: object, bundle: dict[str, object]) -> None:
-        """Finalize the due episodes at the runner's explicit boundary."""
-        self._engine.on_episode_end(env_ids, bundle)
+        """Begin the boundary, ask the flow, then commit the episode end.
+
+        ``begin_episode_end`` has already evaluated monitors, drained final
+        events/terminals and built the final query snapshot before
+        ``flow.on_episode_end`` runs.  If the callback raises, the sink discards
+        the pending boundary and re-raises; no rollback of the drained queues
+        is attempted, so the run must abort.
+        """
+        batch = self._engine.begin_episode_end(env_ids, bundle)
+        if batch is None:
+            return
+        try:
+            evidence = self._flow.on_episode_end(batch)
+        except BaseException:
+            self._engine.discard_episode_end(batch)
+            raise
+        self._engine.commit_episode_end(batch, evidence)
 
     def on_step_end(self, t: int, bundle: dict[str, object]) -> None:
         """Post-reset metrics hook; the reset notification owns reopening."""
@@ -408,7 +467,7 @@ class BenchmarkSink:
         self._engine.on_reset(env_ids)
 
     def on_run_end(self) -> dict[str, object]:
-        """Finalize the run, assemble the pack report and return it.
+        """Finalize the run, let the flow own the report and return it.
 
         The report is assembled once and cached, so a second teardown call
         cannot drive extension ``on_run_end`` twice.  With ``write_report`` the
@@ -417,7 +476,7 @@ class BenchmarkSink:
         "success".  No core artifact is written.
         """
         if self._report is None:
-            aggregate = self._engine.on_run_end()
+            aggregate = self._engine.run_summary()
             metadata = self._metadata
             if metadata is None:
                 metadata = RunMetadata(
@@ -425,20 +484,30 @@ class BenchmarkSink:
                     loop_mode=self._loop_mode,
                     pack_version=__version__,
                 )
-            summary = RunSummary(
+            run = FlowRun(
                 metadata=metadata,
-                episodes=self._engine.records,
-                episode_summary=aggregate,
+                summary=aggregate,
+                records=self._engine.records,
                 monitor_views={
                     monitor.name: monitor.report_view() for monitor in self._engine.monitors
                 },
                 retention=self._engine.retention,
+                extensions=self._engine.extensions,
+                monitor_names=tuple(monitor.name for monitor in self._engine.monitors),
+                monitor_extensions=self._monitor_extensions,
             )
-            blocks = {
-                extension.name: extension.on_run_end(summary)
-                for extension in self._engine.extensions
-            }
-            self._report = self._builder.assemble(summary, blocks)
+            result = self._flow.on_run_end(run)
+            if result is None:
+                result = self._fallback_flow.on_run_end(run)
+            if not isinstance(result, Mapping):
+                raise TypeError(
+                    "benchmark flow.on_run_end: expected a mapping or None, "
+                    f"got {type(result).__name__}"
+                )
+            normalized = ensure_json_value(result, where="benchmark flow report")
+            if not isinstance(normalized, dict):
+                raise TypeError("benchmark flow report: expected an object")
+            self._report = normalized
         path = self.report_path
         if path is not None and not self._report_written:
             _write_report_file(path, self._report)
@@ -446,8 +515,8 @@ class BenchmarkSink:
         return {SUMMARY_KEY: self._report}
 
     def stop_when(self) -> bool:
-        """P4 never requests an early stop; P5+ owns any stop policy."""
-        return False
+        """Return the stop flag requested by an applied flow decision."""
+        return self._engine.stop_requested
 
     def on_rewind(self, info: dict[str, object]) -> None:
         """Mark the currently open episodes as belonging to a forked timeline."""
