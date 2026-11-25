@@ -12,7 +12,7 @@ does not replace it. Core (`unigym`) stays in its own repository
 | Path | Distribution | Purpose |
 | --- | --- | --- |
 | `packages/unigym-rl` | `unigym-rl` | L2 task-environment layer over core: `TaskEnv`, programmatic `EnvSpec`, optional Gymnasium `VectorEnv` face and skrl smoke. |
-| `packages/unigym-bench` | `unigym-bench` | External benchmark layer over the core sink/view contracts: monitor-driven scoring, custom reports and scenario commands. |
+| `packages/unigym-bench` | `unigym-bench` | External benchmark layer over the core value/context, sink and terminal contracts: monitor-driven scoring, custom reports and scenario commands. |
 | `packages/unigym-robots` | `unigym-robots` | Pinned Unitree Go1/Go2/G1 MJCF and USD assets, downloaded from GitHub Release tarballs. No core dependency and no binaries in the wheel. |
 | `test-packs/` | repo-only | Test-pack plugin and content-pack distributions plus their USD assets. Not a workspace member and not published by default; see `test-packs/README.md`. |
 

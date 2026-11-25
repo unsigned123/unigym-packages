@@ -19,6 +19,8 @@ to the pack-owned ``external_benchmark_report.json``.  P16 adds the validated
 task-document composition layer in :mod:`unigym_bench.compose`: the closed
 builtin registry, source/trigger/emit predicate composition, the
 scenario-derived coverage extension and the ``task_document`` sink option.
+P17 finalizes the 0.2.0 release documentation and release evidence; it adds no
+runtime behavior.
 """
 
 from __future__ import annotations

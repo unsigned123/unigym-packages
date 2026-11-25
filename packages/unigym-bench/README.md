@@ -5,16 +5,17 @@ streaming, monitor-driven benchmarking layer on the public sink, evaluation,
 value and step-context contracts, without importing `unigym.benchmarks`,
 `unigym.runner.evaluation` or `unigym.runner.episodes`.
 
-Status: P16, applied on the P15 value/context runtime baseline (core `0.107.0`;
-no throughput claim).
-P10 moves the import fence and version pin to core C13: the pack requires
-`unigym>=0.107,<0.108`, `CORE_SURFACE_VERSION` is `3`, and the fence checks
+Status: P17, the finalized `0.2.0` release documentation on the P15
+value/context runtime baseline (core `0.107.x`; no throughput claim). P17 adds
+no runtime behavior; it records the release surface and validates it. P10 moved
+the import fence and version pin to core C13: the pack requires
+`unigym>=0.107,<0.108` and `CORE_SURFACE_VERSION` is `3`. The fence checks
 `unigym.values` (`ValueStore`, `ValueView`, `ValuePublisher`, `StepValues`)
 and `unigym.evaluation.EnvStepContext` instead of the removed
 `unigym.signals`. This baseline includes the P15 runtime migration: P11
-replaces the pack `TickFrame` with `BenchmarkStepContext` (a core
-`EnvStepContext` subclass), P12 adds the source resolver and condition DSL, and
-P13 adds `PredicateMonitor`. P15 moves the runtime onto the core value
+replaced the pack `TickFrame` with `BenchmarkStepContext` (a core
+`EnvStepContext` subclass), P12 added the source resolver and condition DSL,
+and P13 added `PredicateMonitor`. P15 moved the runtime onto the core value
 transport:
 
 - `make_sink` reads `ctx.values` as a `ValuePublisher`, and `sink-steered`
@@ -54,18 +55,61 @@ named `scenario_coverage` unless the document already declares one; a name
 collision is a teaching error. `compose_task(document)` returns a frozen
 `TaskPlan(monitors, extensions, retention, scenario, monitor_extensions)`, and
 `make_sink` accepts a JSON-safe `task_document` path option that runs this
-composition instead of the factory path. The package contains the P0-P16 tree:
-version metadata, the core-contract import fence, strict JSON helpers, the
-closed YAML task-spec loader (`unigym_bench.specs`), the composition layer
-(`unigym_bench.compose`), the monitor protocol with the configured predicate and
-phase monitors (`unigym_bench.monitors`), the streaming engine
-(`unigym_bench.engine`), the core sink shell (`unigym_bench.sink`), the rewind
-provider, the report builder with report extensions (`unigym_bench.report`),
-and the validated command scenario with its rewind-capable sampler
-(`unigym_bench.scenario`, `unigym_bench.sampler`). The P9 tree includes a real
-tiny-arm MuJoCo integration test through `Run.runner` (the core SyncRunner
-tick engine), zero-episode and multi-env conformance coverage, a
-bounded-journal retention test, and the parity limitations documented below.
+composition instead of the factory path. The package contains the P0-P16
+implementation tree, finalized as the P17 `0.2.0` release: version metadata, the
+core-contract import fence, strict JSON helpers, the closed YAML task-spec
+loader (`unigym_bench.specs`), the composition layer (`unigym_bench.compose`),
+the monitor protocol with the configured predicate and phase monitors
+(`unigym_bench.monitors`), the streaming engine (`unigym_bench.engine`), the
+core sink shell (`unigym_bench.sink`), the rewind provider, the report builder
+with report extensions (`unigym_bench.report`), and the validated command
+scenario with its rewind-capable sampler (`unigym_bench.scenario`,
+`unigym_bench.sampler`). The pack includes a real tiny-arm MuJoCo integration
+test through `Run.runner` (the core SyncRunner tick engine), zero-episode and
+multi-env conformance coverage, a bounded-journal retention test, and the
+parity limitations documented below.
+
+## Release 0.2.0: breaking API
+
+`unigym-bench 0.2.0` is a breaking release with no compatibility shims. It
+requires core `unigym>=0.107,<0.108` (C13) and pack-local core surface revision
+`3`. The release keeps the report schema `external_benchmark_report/1`; the
+public pack seams below are new, removed or changed.
+
+Removed from the pack:
+
+- `TickFrame`: monitors now receive `BenchmarkStepContext`, a subclass of the
+  core `unigym.evaluation.EnvStepContext`.
+- The `Probe` protocol, the old typed monitors (`ThresholdMonitor`,
+  `HoldMonitor`, `SafetyMonitor`, `EventCounterMonitor`) and their state
+  classes. Use `PredicateMonitor` with `threshold_config`, `hold_config`,
+  `safety_config` or `event_counter_config` instead; the retired names are not
+  aliases.
+- All pack use of the removed core signal surface (`SignalBus`, `SignalView`,
+  `SignalPublisher`, `signal_bus_contract`) and `bind_signals`. Values flow
+  through core `ValueStore`/`ValueView`/`ValuePublisher`. The sampler binds with
+  `ScenarioSampler.bind_values(ValueView)`, and the engine publishes
+  `<monitor>/<local>` through `ctx.values`.
+
+Changed contracts:
+
+- Task documents use `unigym_extbench/2`; an explicit `/1` is rejected and
+  there is no dual-schema shim. `make_sink` accepts a `task_document` path and
+  composes it with `compose_task`.
+- Source references use the `record:`/`obs:`/`value:`/`query:` grammar. A
+  `query:` source fails at composition with `SourceUnavailableError`.
+- Episode-end evaluation uses the final step context (`bundle["final_step"]`
+  and `on_episode_end(env_ids, final_context)`). Episode-end report/scoring
+  terminals drain through the separate monitor face, not the runner drain.
+- The pack rewind schema is `unigym_bench.rewind/4` and monitor snapshots are
+  `unigym_bench.monitor/3`; older payloads are rejected explicitly.
+- The report schema remains `external_benchmark_report/1`. `PredicateMonitor`
+  blocks are predicate-shaped (`kind: predicate`, `condition`, `trigger`,
+  `emit`, `fired`, `fired_counts`); `PhaseMonitor` blocks keep `kind: phase`,
+  and `module`/API factory monitors contribute their own `report_view`. For
+  predicate monitors, event `data` is the generic trigger description and
+  predicate terminals carry empty `metrics`. The full field mapping is in
+  [Report field mapping](#report-field-mapping).
 
 ## Report
 
@@ -396,7 +440,7 @@ Known limitations in this revision:
 
 Parity against the core built-in benchmark is **documented, not claimed**:
 
-| Aspect | Core built-in benchmark | `unigym-bench` pack | P9 status |
+| Aspect | Core built-in benchmark | `unigym-bench` pack | Status |
 | --- | --- | --- | --- |
 | Entry | `mode=benchmark` + `EvaluationSession` over pack-runtime tasks | `mode=benchmark` + custom sink (`make_sink`) with monitors | Different composition; both use the same core runner tick engine |
 | Report artifact | `benchmark_report.json` / `results.json` / `metrics.npz` | `external_benchmark_report.json` (opt-in) | Disjoint, pack-owned filename |
@@ -408,9 +452,9 @@ Parity against the core built-in benchmark is **documented, not claimed**:
 | Distribution | needs a benchmark task provider/pack runtime | installed sink; no pack runtime in `benchmark` mode | Pack avoids task-provider activation |
 | Rewind | built-in session/buffer | pack engine provider `unigym_bench` | Same core rewind seam |
 
-P9 includes a real same-config parity test. Constructing the core built-in
-benchmark from a bare `Run` is not a normal external-pack path: the benchmark
-task catalog must be imported inside the core `ACTIVATE` registration window,
+The release includes a real same-config parity test. Constructing the core
+built-in benchmark from a bare `Run` is not a normal external-pack path: the
+benchmark task catalog must be imported inside the core `ACTIVATE` registration window,
 while core imports it lazily during `BACKEND_BUILD`. The test therefore runs
 the built-in lane in a fresh subprocess with that window opened explicitly,
 then runs the pack sink over the same tiny-arm config. Both runs use two policy
@@ -430,15 +474,34 @@ report vocabulary against the core `EpisodeOutcome` / `TerminationSource`
 enums. No throughput claim is made; the retention test proves the journal is
 bounded by `max_events`.
 
+### Release validation
+
+The P17 `0.2.0` release was validated against the C13 core environment. From
+`packages/unigym-bench`, using the Python from the core virtual environment:
+
+```bash
+python -m pytest -q tests
+python -m pytest -q \
+  tests/test_parity.py tests/test_retention.py tests/test_rewind.py
+python -m ruff check src tests
+python -m ruff format --check src tests
+```
+
+The full suite includes the real tiny-arm MuJoCo integration, zero-episode and
+multi-env conformance, and the bounded-retention test; the focused lane covers
+parity, retention and rewind. This evidence is a CPU/MuJoCo lane only. No GPU or
+Isaac Lab lane is claimed.
+
 ## Dependencies
 
-Development requires Python >=3.11 with a compatible `unigym` (`>=0.107.0`)
-installed, plus the `dev` extra. The YAML loader requires `PyYAML>=6.0,<7.0`,
-which is a direct runtime dependency of the pack. Pytest adds `src` to its own
-path, so tests do not need a caller-provided `PYTHONPATH`; the import-fence
-subprocess also sets its own path from the imported package.
+Development requires Python >=3.11 with a compatible `unigym`
+(`>=0.107,<0.108`) installed, plus the `dev` extra. The YAML loader requires
+`PyYAML>=6.0,<7.0`, which is a direct runtime dependency of the pack. Pytest
+adds `src` to its own path, so tests do not need a caller-provided
+`PYTHONPATH`; the import-fence subprocess also sets its own path from the
+imported package.
 
-`unigym_bench.__version__` is `0.2.0` for the core `0.107.0` baseline release.
+`unigym_bench.__version__` is `0.2.0` for the core `0.107.x` baseline release.
 `CORE_SURFACE_VERSION` is a pack-local revision
 of the required `unigym` public surface (currently `3`, after adopting the
 core value/context seams), not the distribution version.
