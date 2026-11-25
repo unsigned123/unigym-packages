@@ -24,10 +24,24 @@ from unigym_bench.specs import (
 )
 
 
+def _monitor_declaration() -> dict[str, object]:
+    return {
+        "builtin": "predicate",
+        "when": {"source": "value:force", "op": "gte", "value": 1.0},
+        "trigger": "edge",
+    }
+
+
+def _monitor_spec(name: str, **overrides: object) -> MonitorSpec:
+    values: dict[str, object] = {"name": name, **_monitor_declaration()}
+    values.update(overrides)
+    return MonitorSpec(**values)
+
+
 def _document(**overrides: object) -> dict[str, object]:
     document: dict[str, object] = {
         "name": "reach",
-        "monitors": {"grasp": {"builtin": "threshold"}},
+        "monitors": {"grasp": _monitor_declaration()},
     }
     document.update(overrides)
     return document
@@ -48,12 +62,16 @@ def test_parse_minimal_document() -> None:
     assert list(document.task.monitors) == ["grasp"]
     monitor = document.task.monitors["grasp"]
     assert monitor.name == "grasp"
-    assert monitor.builtin == "threshold"
+    assert monitor.builtin == "predicate"
     assert monitor.module is None
     assert monitor.factory is None
     assert monitor.report_extension is None
     assert monitor.params == {}
     assert monitor.resources == {}
+    assert monitor.when == {"source": "value:force", "op": "gte", "value": 1.0}
+    assert monitor.trigger == "edge"
+    assert monitor.emit is None
+    assert monitor.source is None
     assert document.task.extensions == {}
     assert document.task.retention == RetentionSpec()
     assert document.scenario is None
@@ -71,14 +89,24 @@ def test_parse_full_document() -> None:
             "name": "grasp",
             "monitors": {
                 "contact": {
-                    "builtin": "threshold",
-                    "params": {"level": 0.5, "hold": 3},
+                    "builtin": "predicate",
+                    "when": {"source": "value:force", "op": "gte", "value": 0.5},
+                    "trigger": {"kind": "hold", "steps": 3},
+                    "emit": {
+                        "event": "contact",
+                        "severity": "warning",
+                        "terminal_reason": "hit",
+                        "terminal_outcome": "failure",
+                    },
                     "report_extension": "contact_report",
                 },
                 "custom": {"module": "my_pkg.monitors:make", "params": {}},
             },
             "extensions": {
-                "contact_report": {"builtin": "contact", "params": {"bins": [1, 2]}},
+                "contact_report": {
+                    "module": "my_pkg.report:make_contact",
+                    "params": {"bins": [1, 2]},
+                },
                 "summary": {"module": "my_pkg.report:make_summary"},
             },
             "retention": {"retain_episodes": True, "max_events": 10, "event_log": False},
@@ -95,7 +123,10 @@ def test_parse_full_document() -> None:
     )
     contact = document.task.monitors["contact"]
     assert contact.report_extension == "contact_report"
-    assert contact.params["level"] == 0.5
+    assert contact.when["value"] == 0.5
+    assert contact.trigger["kind"] == "hold"
+    assert contact.trigger["steps"] == 3
+    assert contact.emit["terminal_outcome"] == "failure"
     assert document.task.extensions["contact_report"].params["bins"] == (1, 2)
     assert document.scenario == ScenarioSpec(command_pool=((0.1, 0.2), (0.3, 0.4)), plan=(1, 0, 1))
 
@@ -118,7 +149,7 @@ def test_load_document_records_provenance(tmp_path: Path) -> None:
         _document(extensions={"report": {"module": "pkg.ext:make"}}),
         _document(monitors={"custom": {"module": "pkg.monitors:make"}}),
         _document(monitors={"custom": {"factory": len}}),
-        _document(monitors={"m": {"builtin": "threshold", "params": {"a": [1, 2]}}}),
+        _document(monitors={"m": {"module": "pkg.monitors:make", "params": {"a": [1, 2]}}}),
         _document(retention={"retain_episodes": True}),
         _document(scenario={"command_pool": [[0.0], [1.0]]}),
         _document(scenario={"command_pool": [[0, 1]], "plan": [0]}),
@@ -243,7 +274,7 @@ def test_invalid_documents(document: object, fragment: str) -> None:
 )
 def test_rejects_bad_monitor_names(name: str) -> None:
     with pytest.raises(SpecError) as excinfo:
-        parse_task_document(_document(monitors={name: {"builtin": "threshold"}}))
+        parse_task_document(_document(monitors={name: _monitor_declaration()}))
 
     assert "expected a name matching [a-z][a-z0-9_]*" in str(excinfo.value)
 
@@ -349,9 +380,13 @@ def test_load_rejects_duplicate_monitor_names(tmp_path: Path) -> None:
 name: duplicate
 monitors:
   same:
-    builtin: threshold
+    builtin: predicate
+    when: {source: value:x, op: gt, value: 0.0}
+    trigger: edge
   same:
-    builtin: hold
+    builtin: predicate
+    when: {source: value:y, op: gt, value: 0.0}
+    trigger: edge
 """,
     )
 
@@ -370,7 +405,9 @@ def test_load_rejects_duplicate_extension_names(tmp_path: Path) -> None:
 name: duplicate
 monitors:
   m:
-    builtin: threshold
+    builtin: predicate
+    when: {source: value:x, op: gt, value: 0.0}
+    trigger: edge
 extensions:
   same:
     builtin: one
@@ -393,7 +430,9 @@ name: first
 name: second
 monitors:
   m:
-    builtin: threshold
+    builtin: predicate
+    when: {source: value:x, op: gt, value: 0.0}
+    trigger: edge
 """,
     )
 
@@ -469,9 +508,12 @@ def test_load_rejects_non_finite_yaml_number(tmp_path: Path) -> None:
 name: non_finite
 monitors:
   m:
-    builtin: threshold
-    params:
-      level: .nan
+    builtin: predicate
+    when:
+      source: value:x
+      op: gt
+      value: .nan
+    trigger: edge
 """,
     )
 
@@ -488,7 +530,9 @@ def test_load_error_names_file_field_expected_and_actual(tmp_path: Path) -> None
 name: bad
 monitors:
   grasp:
-    builtin: threshold
+    builtin: predicate
+    when: {source: value:x, op: gt, value: 0.0}
+    trigger: edge
     module: pkg.mod:make
 """,
     )
@@ -579,7 +623,7 @@ def test_specs_are_frozen_and_read_only(tmp_path: Path) -> None:
         _document(
             monitors={
                 "m": {
-                    "builtin": "threshold",
+                    "module": "pkg.monitors:make",
                     "params": {"nested": {"levels": [1, 2]}},
                     "resources": {"levels": "data/levels.yaml"},
                 }
@@ -596,7 +640,7 @@ def test_specs_are_frozen_and_read_only(tmp_path: Path) -> None:
     with pytest.raises(FrozenInstanceError):
         task.name = "changed"
     with pytest.raises(FrozenInstanceError):
-        monitor.builtin = "hold"
+        monitor.module = "pkg.monitors:other"
     with pytest.raises(TypeError):
         task.monitors["m"] = monitor
     with pytest.raises(TypeError):
@@ -610,26 +654,28 @@ def test_specs_are_frozen_and_read_only(tmp_path: Path) -> None:
 
 def test_parse_does_not_alias_the_source_document() -> None:
     source = _document()
-    source["monitors"]["grasp"]["params"] = {"levels": [1, 2]}
+    source["monitors"]["grasp"]["when"] = {"all": [{"source": "value:x", "op": "gt", "value": 1.0}]}
     parsed = parse_task_document(source)
 
     source["name"] = "changed"
-    source["monitors"]["grasp"]["builtin"] = "hold"
-    source["monitors"]["grasp"]["params"]["levels"].append(3)
+    source["monitors"]["grasp"]["builtin"] = "phase"
+    source["monitors"]["grasp"]["when"]["all"].append(
+        {"source": "value:y", "op": "lt", "value": 2.0}
+    )
 
     monitor = parsed.task.monitors["grasp"]
     assert parsed.task.name == "reach"
-    assert monitor.builtin == "threshold"
-    assert monitor.params["levels"] == (1, 2)
+    assert monitor.builtin == "predicate"
+    assert len(monitor.when["all"]) == 1
 
 
 def test_programmatic_specs_validate_invariants() -> None:
     with pytest.raises(SpecError) as excinfo:
-        MonitorSpec(name="Bad", builtin="threshold")
+        _monitor_spec("Bad")
     assert "expected a name matching" in str(excinfo.value)
 
     with pytest.raises(SpecError) as excinfo:
-        MonitorSpec(name="ok", builtin="threshold", module="pkg.mod:make")
+        _monitor_spec("ok", module="pkg.mod:make")
     assert "expected exactly one" in str(excinfo.value)
 
     with pytest.raises(SpecError) as excinfo:
@@ -648,7 +694,7 @@ def test_programmatic_specs_validate_invariants() -> None:
 
 
 def test_programmatic_task_rejects_key_name_mismatch() -> None:
-    monitor = MonitorSpec(name="other", builtin="threshold")
+    monitor = _monitor_spec("other")
     with pytest.raises(SpecError) as excinfo:
         TaskSpec(name="task", monitors={"key": monitor})
     assert "the mapping key is the monitor name" in str(excinfo.value)
@@ -657,14 +703,14 @@ def test_programmatic_task_rejects_key_name_mismatch() -> None:
     with pytest.raises(SpecError) as excinfo:
         TaskSpec(
             name="task",
-            monitors={"m": MonitorSpec(name="m", builtin="threshold")},
+            monitors={"m": _monitor_spec("m")},
             extensions={"key": extension},
         )
     assert "the mapping key is the extension name" in str(excinfo.value)
 
 
 def test_programmatic_task_rejects_missing_extension_reference() -> None:
-    monitor = MonitorSpec(name="m", builtin="threshold", report_extension="missing")
+    monitor = _monitor_spec("m", report_extension="missing")
 
     with pytest.raises(SpecError) as excinfo:
         TaskSpec(name="task", monitors={"m": monitor})
@@ -675,9 +721,187 @@ def test_programmatic_task_rejects_missing_extension_reference() -> None:
 
 
 def test_programmatic_task_document_schema_is_closed() -> None:
-    task = TaskSpec(name="task", monitors={"m": MonitorSpec(name="m", builtin="threshold")})
+    task = TaskSpec(name="task", monitors={"m": _monitor_spec("m")})
 
     assert TaskDocument(task=task, schema=SCHEMA).schema == SCHEMA
     with pytest.raises(SpecError) as excinfo:
         TaskDocument(task=task, schema="other/1")
-    assert "expected 'unigym_extbench/1'" in str(excinfo.value)
+    assert "expected 'unigym_extbench/2'" in str(excinfo.value)
+    with pytest.raises(SpecError) as excinfo:
+        TaskDocument(task=task, schema="unigym_extbench/1")
+    assert "expected 'unigym_extbench/2'" in str(excinfo.value)
+
+
+def test_schema_is_two_and_rejects_the_old_explicit_schema() -> None:
+    assert SCHEMA == "unigym_extbench/2"
+    assert parse_task_document(_document()).schema is None
+    assert parse_task_document(_document(schema=SCHEMA)).schema == SCHEMA
+
+    with pytest.raises(SpecError) as excinfo:
+        parse_task_document(_document(schema="unigym_extbench/1"))
+
+    assert "task document.schema" in str(excinfo.value)
+    assert "unigym_extbench/2" in str(excinfo.value)
+
+
+def test_predicate_fields_are_frozen_and_validate_trigger_emit() -> None:
+    document = parse_task_document(
+        _document(
+            monitors={
+                "contact": {
+                    "builtin": "predicate",
+                    "when": {
+                        "all": [
+                            {"source": "value:force", "op": "gte", "value": 1.0},
+                            {"source": "record:arm/limit", "op": "lt", "value": 2.0},
+                        ]
+                    },
+                    "trigger": {"kind": "hold", "steps": 2},
+                    "emit": {"event": "held", "severity": "warning"},
+                }
+            }
+        )
+    )
+
+    monitor = document.task.monitors["contact"]
+    assert isinstance(monitor.when, MappingProxyType)
+    assert monitor.trigger == {"kind": "hold", "steps": 2}
+    assert monitor.emit == {"event": "held", "severity": "warning"}
+    with pytest.raises(TypeError):
+        monitor.when["all"] = ()
+
+
+def test_phase_declaration_uses_source_and_params() -> None:
+    document = parse_task_document(
+        _document(
+            monitors={
+                "phase": {
+                    "builtin": "phase",
+                    "source": "value:height",
+                    "params": {"boundaries": [0.0, 1.0], "phase_names": ["low", "mid", "high"]},
+                }
+            }
+        )
+    )
+
+    monitor = document.task.monitors["phase"]
+    assert monitor.source == "value:height"
+    assert monitor.params["boundaries"] == (0.0, 1.0)
+
+
+@pytest.mark.parametrize(
+    ("monitor", "fragment"),
+    [
+        (
+            {"builtin": "predicate", "trigger": "edge"},
+            "when: required for builtin 'predicate'",
+        ),
+        (
+            {
+                "builtin": "predicate",
+                "when": {"source": "value:x", "op": "gt", "value": 0.0},
+            },
+            "trigger: required for builtin 'predicate'",
+        ),
+        (
+            {
+                "builtin": "predicate",
+                "when": {"source": "value:x", "op": "gt", "value": 0.0},
+                "trigger": "level",
+            },
+            "not implemented in pack v1",
+        ),
+        (
+            {
+                "builtin": "predicate",
+                "when": {"source": "value:x", "op": "gt", "value": 0.0},
+                "trigger": "always",
+            },
+            "reserved",
+        ),
+        (
+            {
+                "builtin": "predicate",
+                "when": {"source": "value:x", "op": "gt", "value": 0.0},
+                "trigger": "edge",
+                "source": "value:x",
+            },
+            "reads sources through 'when'",
+        ),
+        (
+            {
+                "builtin": "predicate",
+                "when": {"source": "value:x", "op": "gt", "value": 0.0},
+                "trigger": "edge",
+                "params": {"x": 1},
+            },
+            "takes no params",
+        ),
+        (
+            {
+                "builtin": "predicate",
+                "when": {"source": "value:x", "op": "gt", "value": 0.0},
+                "trigger": "edge",
+                "emit": {"unknown": 1},
+            },
+            "emit mapping has unknown keys",
+        ),
+        (
+            {
+                "builtin": "phase",
+                "params": {"boundaries": [0.0]},
+            },
+            "source: required for builtin 'phase'",
+        ),
+        (
+            {
+                "builtin": "phase",
+                "source": "bare-key",
+                "params": {"boundaries": [0.0]},
+            },
+            "no namespace prefix",
+        ),
+        (
+            {
+                "module": "pkg.monitors:make",
+                "when": {"source": "value:x", "op": "gt", "value": 0.0},
+                "trigger": "edge",
+            },
+            "require a builtin that consumes them",
+        ),
+        (
+            {"factory": len, "source": "value:x"},
+            "require a builtin that consumes them",
+        ),
+        (
+            {
+                "builtin": "predicate",
+                "when": {"source": "value:x", "op": "gt", "value": 0.0},
+                "trigger": "edge",
+                "emit": None,
+            },
+            "explicit null is not allowed",
+        ),
+    ],
+)
+def test_rejects_invalid_predicate_field_forms(monitor: dict[str, object], fragment: str) -> None:
+    with pytest.raises(SpecError) as excinfo:
+        parse_task_document(_document(monitors={"m": monitor}))
+
+    assert fragment in str(excinfo.value)
+
+
+def test_query_source_is_accepted_by_the_spec_and_deferred_to_composition() -> None:
+    document = parse_task_document(
+        _document(
+            monitors={
+                "m": {
+                    "builtin": "predicate",
+                    "when": {"source": "query:height", "op": "gt", "value": 0.0},
+                    "trigger": "edge",
+                }
+            }
+        )
+    )
+
+    assert document.task.monitors["m"].when["source"] == "query:height"

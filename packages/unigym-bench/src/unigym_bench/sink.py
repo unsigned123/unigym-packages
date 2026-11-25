@@ -13,6 +13,11 @@ Construction seam (P4/P6 boundary)
 
 - ``loop_mode``: ``"pool"`` (default) or ``"sink-steered"``.  A sink-steered
   run requires ``ctx.values``; an absent publisher is a construction error.
+- ``task_document``: optional non-empty path string to a YAML task document.
+  The document is loaded and composed with :func:`unigym_bench.compose.compose_task`;
+  its monitors, extensions, retention and scenario-derived coverage replace the
+  factory injection path.  It conflicts with ``monitor_factory``,
+  ``extension_factory`` and a different ``monitor_extensions`` map.
 - ``monitor_factory``: optional ``"pkg.mod:callable"`` path.  The zero-argument
   callable returns the monitor sequence in task declaration order.
 - ``extension_factory``: optional ``"pkg.mod:callable"`` path returning the
@@ -26,11 +31,13 @@ Construction seam (P4/P6 boundary)
   it is a filesystem side effect; the fixed pack-owned filename never replaces
   the core ``benchmark_report.json`` or ``results.json``.
 
-There is deliberately no YAML ``TaskDocument -> monitors/extensions``
-composition here yet: that is a later composition layer.  Tests and other
-programmatic callers construct :class:`BenchmarkSink` directly with monitor and
-extension instances or an existing engine.  Instances are not accepted through
-``ctx.options`` because they are not JSON-safe.
+A YAML ``TaskDocument`` is composed into monitors/extensions only through the
+explicit ``task_document`` path option; :func:`unigym_bench.compose.compose_task`
+owns that boundary.  Tests and other programmatic callers may still construct
+:class:`BenchmarkSink` directly with monitor and extension instances or an
+existing engine, and may use ``monitor_factory``/``extension_factory``.  Live
+instances are not accepted through ``ctx.options`` because they are not
+JSON-safe.
 
 Lifecycle glue
 --------------
@@ -72,6 +79,7 @@ from typing import TYPE_CHECKING, TypeAlias, cast
 
 from unigym.errors import ConfigError
 
+from .compose import ComposeError, TaskPlan, compose_task
 from .engine import StreamingEngine
 from .json import JsonValue
 from .monitors import Monitor
@@ -82,7 +90,8 @@ from .report import (
     RunMetadata,
     RunSummary,
 )
-from .specs import RetentionSpec
+from .specs import RetentionSpec, SpecError, load_task_document
+from .sources import SourceUnavailableError
 from .version import __version__
 
 if TYPE_CHECKING:
@@ -117,6 +126,7 @@ _MONITOR_FACTORY_PATH = re.compile(
 _OPTION_KEYS = frozenset(
     {
         "loop_mode",
+        "task_document",
         "monitor_factory",
         "extension_factory",
         "monitor_extensions",
@@ -170,14 +180,40 @@ def make_sink(ctx: SinkContext) -> BenchmarkSink:
             "reset chain runs after on_episode_end; got runner.auto_reset: false. "
             "The pack sink cannot detect whether a backend reset actually ran."
         )
+    raw_task_document = options.get("task_document")
     raw_monitor_factory = options.get("monitor_factory")
-    monitors: Sequence[Monitor] = ()
-    if raw_monitor_factory is not None:
-        monitors = _resolve_monitor_factory(raw_monitor_factory)()
     raw_extension_factory = options.get("extension_factory")
-    extensions: Sequence[ReportExtension] = ()
-    if raw_extension_factory is not None:
-        extensions = _resolve_extension_factory(raw_extension_factory)()
+    plan: TaskPlan | None = None
+    retention: RetentionSpec | None = None
+    if raw_task_document is not None:
+        if raw_monitor_factory is not None or raw_extension_factory is not None:
+            raise ConfigError(
+                "unigym-bench sink task_document conflicts with monitor_factory/"
+                "extension_factory; a task document already declares its monitors "
+                "and extensions. Use one composition path."
+            )
+        if not isinstance(raw_task_document, str) or not raw_task_document.strip():
+            raise ConfigError(
+                "unigym-bench sink task_document: expected a non-empty path string, "
+                f"got {raw_task_document!r}"
+            )
+        try:
+            document = load_task_document(raw_task_document)
+            plan = compose_task(document)
+        except (SpecError, ComposeError, SourceUnavailableError, OSError) as exc:
+            raise ConfigError(
+                f"unigym-bench sink task_document={raw_task_document!r}: {exc}"
+            ) from exc
+        monitors: Sequence[Monitor] = plan.monitors
+        extensions: Sequence[ReportExtension] = plan.extensions
+        retention = plan.retention
+    else:
+        monitors = ()
+        if raw_monitor_factory is not None:
+            monitors = _resolve_monitor_factory(raw_monitor_factory)()
+        extensions = ()
+        if raw_extension_factory is not None:
+            extensions = _resolve_extension_factory(raw_extension_factory)()
     monitor_extensions: Mapping[str, str] | None = None
     raw_monitor_extensions = options.get("monitor_extensions")
     if raw_monitor_extensions is not None:
@@ -186,6 +222,15 @@ def make_sink(ctx: SinkContext) -> BenchmarkSink:
             monitor_names=tuple(monitor.name for monitor in monitors),
             extension_names=tuple(extension.name for extension in extensions),
         )
+        if plan is not None and dict(monitor_extensions) != dict(plan.monitor_extensions):
+            raise ConfigError(
+                "unigym-bench sink monitor_extensions conflicts with the task "
+                f"document's report_extension declarations: option "
+                f"{dict(sorted(monitor_extensions.items()))!r}, document "
+                f"{dict(plan.monitor_extensions)!r}"
+            )
+    elif plan is not None:
+        monitor_extensions = plan.monitor_extensions
     raw_write_report = options.get("write_report", False)
     if not isinstance(raw_write_report, bool):
         raise ConfigError(
@@ -206,6 +251,7 @@ def make_sink(ctx: SinkContext) -> BenchmarkSink:
     )
     return BenchmarkSink(
         monitors,
+        retention=retention,
         publisher=ctx.values,
         loop_mode=loop_mode,
         reset_after_episode=auto_reset,

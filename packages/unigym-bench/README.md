@@ -5,7 +5,7 @@ streaming, monitor-driven benchmarking layer on the public sink, evaluation,
 value and step-context contracts, without importing `unigym.benchmarks`,
 `unigym.runner.evaluation` or `unigym.runner.episodes`.
 
-Status: P14, applied on the P15 value/context runtime baseline (core `0.107.0`;
+Status: P16, applied on the P15 value/context runtime baseline (core `0.107.0`;
 no throughput claim).
 P10 moves the import fence and version pin to core C13: the pack requires
 `unigym>=0.107,<0.108`, `CORE_SURFACE_VERSION` is `3`, and the fence checks
@@ -37,11 +37,27 @@ configurations built by `threshold_config`, `hold_config`, `safety_config` and
 constructors/state classes are deleted. `PhaseMonitor` takes an explicit
 `SourceRef` and resolves it through `SourceResolver`. Scenario coverage is a
 stateful `ScenarioCoverageExtension` in `report.py`, fed by finalized
-`EpisodeRecord.command_at_start` values instead of a tick monitor. P16
-(TaskDocument composition) remains a later card. The package already contains
-the P0-P15 tree with the P14 collapse: version metadata, the core-contract
-import fence, strict JSON helpers, the closed YAML task-spec loader
-(`unigym_bench.specs`), the monitor protocol with the configured predicate and
+`EpisodeRecord.command_at_start` values instead of a tick monitor.
+
+P16 adds the task-document composition layer in `unigym_bench.compose`. The
+schema is now `unigym_extbench/2`; an explicit `/1` is rejected with no
+dual-schema shim. A monitor declares either `builtin: predicate` with
+`when`/`trigger`/`emit`, `builtin: phase` with `source` and boundary params, or
+a `module`/API `factory`. Predicate fields are closed and rejected on
+declarations that do not consume them. Source references use the P12
+`record:`/`obs:`/`value:`/`query:` grammar, and a `query:` source fails at
+composition with `SourceUnavailableError`. Trigger and emit specs parse through
+the P13 `TriggerSpec`/`EmitSpec`, so `level` and reserved temporal operators are
+rejected. Extensions close over `scenario_coverage`, which reads the document
+scenario command pool. A declared scenario auto-composes a coverage extension
+named `scenario_coverage` unless the document already declares one; a name
+collision is a teaching error. `compose_task(document)` returns a frozen
+`TaskPlan(monitors, extensions, retention, scenario, monitor_extensions)`, and
+`make_sink` accepts a JSON-safe `task_document` path option that runs this
+composition instead of the factory path. The package contains the P0-P16 tree:
+version metadata, the core-contract import fence, strict JSON helpers, the
+closed YAML task-spec loader (`unigym_bench.specs`), the composition layer
+(`unigym_bench.compose`), the monitor protocol with the configured predicate and
 phase monitors (`unigym_bench.monitors`), the streaming engine
 (`unigym_bench.engine`), the core sink shell (`unigym_bench.sink`), the rewind
 provider, the report builder with report extensions (`unigym_bench.report`),
@@ -104,12 +120,34 @@ summary = runner.run(stop_when=instance.stop_when)
 
 `monitor_factory` and `extension_factory` are zero-argument callables, given as
 `module:callable` paths, that return the instances in task declaration order;
-they must be importable from the run process. A factory is the only injection
-seam because monitor/extension instances are not JSON-safe. `make_sink(ctx)`
-fails fast on unknown options, an unknown loop mode, a `sink-steered` run
-without `ctx.values`, `runner.auto_reset: false`, or a declared
-`monitor_extensions` reference that does not exist. `ctx.values` is the core
-`ValuePublisher` from `SinkContext`; the pack never reads a signal surface.
+they must be importable from the run process. A factory is the injection seam
+for programmatic callers because monitor/extension instances are not JSON-safe.
+`make_sink(ctx)` fails fast on unknown options, an unknown loop mode, a
+`sink-steered` run without `ctx.values`, `runner.auto_reset: false`, or a
+declared `monitor_extensions` reference that does not exist. `ctx.values` is
+the core `ValuePublisher` from `SinkContext`; the pack never reads a signal
+surface.
+
+A YAML task document is the other, JSON-safe composition path:
+
+```python
+options={
+    "task_document": "tasks/reach.yaml",
+    "loop_mode": "pool",
+    "write_report": True,
+    # "monitor_extensions": {"contact": "coverage"},  # optional; must match
+}
+```
+
+`task_document` is a non-empty path string resolved by
+`unigym_bench.specs.load_task_document`; relative paths resolve against the run
+process working directory. `make_sink` then calls `compose_task(document)` and
+uses the plan's monitors, extensions, retention and scenario coverage. It
+rejects `task_document` together with `monitor_factory` or
+`extension_factory`, and rejects a `monitor_extensions` option that differs
+from the document's declared `report_extension` map. Missing files, duplicate
+names, invalid schema and composition failures surface as `ConfigError` at
+this boundary.
 
 With `write_report: true` the sink writes the assembled document to
 `<out_dir>/external_benchmark_report.json` at run end. The filename and the
@@ -280,20 +318,74 @@ optional scenario.
 The schema is closed. Unknown keys are rejected, names match
 `[a-z][a-z0-9_]*`, monitor/extension params must be JSON objects, module paths
 use `pkg.mod:attr`, and duplicate YAML keys fail instead of being merged. An
-explicit `null` for an object field (`schema`, `retention`, `scenario`,
-`extensions`, `resources`) is a configuration error; omit the key to apply the
-documented default. `schema` may be omitted for authoring; when present it must
-be `unigym_extbench/1`. Relative resource paths resolve against the task
-document directory, never the process working directory.
+explicit `null` for a document object field (`schema`, `retention`, `scenario`,
+`extensions`, `resources`) or a predicate field (`when`, `trigger`, `emit`,
+`source`) is a configuration error; omit the key to apply the documented
+default. `schema` may be omitted for authoring; omission means the current
+`unigym_extbench/2`, and an explicit `unigym_extbench/1` is rejected. Relative
+resource paths resolve against the task document directory, never the process
+working directory.
+
+### Schema `/2` monitor forms
+
+```yaml
+schema: unigym_extbench/2
+name: reach
+monitors:
+  contact:
+    builtin: predicate
+    when:
+      source: value:force
+      op: gte
+      value: 0.5
+    trigger: {kind: hold, steps: 3}
+    emit: {event: contact, severity: warning}
+    report_extension: contact_report
+  height_phase:
+    builtin: phase
+    source: value:height
+    params:
+      boundaries: [0.0, 1.0]
+      phase_names: [low, mid, high]
+extensions:
+  contact_report:
+    builtin: scenario_coverage
+scenario:
+  command_pool: [[0.0], [1.0]]
+  plan: [0, 1]
+retention:
+  retain_episodes: true
+  max_events: 10000
+  event_log: true
+```
+
+The closed monitor builtins are `predicate` and `phase`; the closed extension
+builtin is `scenario_coverage`. The retired typed monitor names are not aliases.
+A `module` declaration imports its `pkg.mod:attr` callable only at composition
+and invokes it with the declaration's JSON `params` as keyword arguments; an
+API `factory` callable follows the same call convention. The returned object's
+name must equal the declaration name. Builtin `predicate`/`phase` and
+module/factory declarations do not consume `resources`; a non-empty
+`resources` map is rejected at composition before any module import or factory
+call. YAML cannot express a callable factory, and a `!!python/...` YAML tag is
+rejected by the safe loader.
+
+`compose_task(document)` is the composition entry point and returns a frozen
+`TaskPlan`. It rejects an unknown builtin with the registry names, duplicate
+live names, a missing `report_extension` reference and a `query:` source
+(`SourceUnavailableError`). A declared scenario auto-composes a
+`scenario_coverage` extension when the document does not already declare one;
+declaring `builtin: scenario_coverage` under another name uses that name and
+suppresses the automatic extension. A `scenario_coverage` extension without a
+document scenario is a configuration error, as is an automatic-name collision.
 
 ## Limitations and parity
 
 Known limitations in this revision:
 
-- **No YAML `TaskDocument` composition yet.** `load_task_document` validates a
-  task document, but `make_sink` accepts factory paths, not a task document.
-  Turning a document's monitor/extension specs into live instances is a later
-  composition layer.
+- **Closed composition registry only.** The task-document composer supports
+  only `predicate`/`phase` monitors and the `scenario_coverage` extension.
+  Other builtins must be declared as `module`/API `factory` declarations.
 - **Events are in-memory only.** The capped journal is not persisted; there is
   no `external_benchmark_events.jsonl` writer in this revision.
 - **No early-stop policy.** `BenchmarkSink.stop_when()` always returns false;

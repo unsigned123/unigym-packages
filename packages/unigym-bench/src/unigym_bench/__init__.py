@@ -15,20 +15,27 @@ closed-loop convention: a ``scenario`` monitor publishes ``scenario/*`` level
 signals through the engine, and the sampler applies a valid desired command at
 the next update.  P9 adds the real tiny-arm integration, bounded-retention and
 built-in fact-parity tests, plus opt-in report persistence (``write_report``)
-to the pack-owned ``external_benchmark_report.json``.
+to the pack-owned ``external_benchmark_report.json``.  P16 adds the validated
+task-document composition layer in :mod:`unigym_bench.compose`: the closed
+builtin registry, source/trigger/emit predicate composition, the
+scenario-derived coverage extension and the ``task_document`` sink option.
 """
 
 from __future__ import annotations
 
 from .compat import assert_core_contract
+from .compose import ComposeError, TaskPlan, compose_task
 from .json import JsonValue, ensure_json_value
 from .version import CORE_SURFACE_VERSION, REQUIRED_CORE_VERSION, __version__
 
 __all__ = [
     "CORE_SURFACE_VERSION",
+    "ComposeError",
     "JsonValue",
     "REQUIRED_CORE_VERSION",
+    "TaskPlan",
     "__version__",
     "assert_core_contract",
+    "compose_task",
     "ensure_json_value",
 ]

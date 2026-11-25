@@ -572,3 +572,209 @@ def test_episode_record_rejects_non_json_reset_facts() -> None:
             verdict="incomplete",
             reset_facts={"bad": torch.tensor(1.0)},
         )
+
+
+def _write_task_document(
+    tmp_path,
+    *,
+    schema: str = "unigym_extbench/2",
+    extensions: str = "",
+    scenario: str = "scenario:\n  command_pool: [[0.0], [1.0]]\n",
+    retention: str = "retention:\n  retain_episodes: true\n  max_events: 3\n",
+    report_extension: str | None = None,
+) -> object:
+    path = tmp_path / "task.yaml"
+    extension_line = (
+        "" if report_extension is None else f"    report_extension: {report_extension}\n"
+    )
+    text = f"""
+schema: {schema}
+name: composed
+monitors:
+  contact:
+    builtin: predicate
+    when:
+      source: value:level
+      op: gte
+      value: 0.5
+    trigger: edge
+    emit:
+      event: contact
+{extension_line}{extensions}{retention}{scenario}"""
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def test_make_sink_task_document_composes_the_plan(tmp_path) -> None:
+    path = _write_task_document(tmp_path)
+
+    sink = make_sink(make_sink_context(options={"task_document": str(path)}))
+
+    engine = sink.rewind_provider
+    assert [monitor.name for monitor in engine.monitors] == ["contact"]
+    assert [extension.name for extension in engine.extensions] == ["scenario_coverage"]
+    assert engine.retention == RetentionSpec(retain_episodes=True, max_events=3, event_log=True)
+    summary = sink.on_run_end()["BenchmarkSink"]
+    assert summary["tasks"] == {
+        "name": "sink-context",
+        "monitors": ["contact"],
+        "extensions": ["scenario_coverage"],
+    }
+    assert summary["execution"]["retention"] == {
+        "retain_episodes": True,
+        "max_events": 3,
+        "event_log": True,
+    }
+
+
+def test_make_sink_task_document_resolves_a_relative_path(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_task_document(tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    sink = make_sink(make_sink_context(options={"task_document": "task.yaml"}))
+
+    assert [monitor.name for monitor in sink.rewind_provider.monitors] == ["contact"]
+
+
+def test_make_sink_task_document_conflicts_with_factories(tmp_path) -> None:
+    path = _write_task_document(tmp_path)
+
+    with pytest.raises(ConfigError, match="task_document conflicts"):
+        make_sink(
+            make_sink_context(
+                options={
+                    "task_document": str(path),
+                    "monitor_factory": _FACTORY,
+                }
+            )
+        )
+    with pytest.raises(ConfigError, match="task_document conflicts"):
+        make_sink(
+            make_sink_context(
+                options={
+                    "task_document": str(path),
+                    "extension_factory": "_support:make_report_extensions",
+                }
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("task_document", "fragment"),
+    [
+        (123, "expected a non-empty path string"),
+        ("", "expected a non-empty path string"),
+        ("   ", "expected a non-empty path string"),
+        ("/no/such/task-document.yaml", "cannot read task document"),
+    ],
+)
+def test_make_sink_rejects_bad_task_document_paths(task_document: object, fragment: str) -> None:
+    with pytest.raises(ConfigError, match="task_document") as excinfo:
+        make_sink(make_sink_context(options={"task_document": task_document}))
+
+    assert fragment in str(excinfo.value)
+
+
+def test_make_sink_rejects_the_old_schema_in_a_task_document(tmp_path) -> None:
+    path = _write_task_document(tmp_path, schema="unigym_extbench/1")
+
+    with pytest.raises(ConfigError, match="expected 'unigym_extbench/2'") as excinfo:
+        make_sink(make_sink_context(options={"task_document": str(path)}))
+
+    assert "task_document" in str(excinfo.value)
+
+
+def test_make_sink_rejects_duplicate_yaml_keys_in_a_task_document(tmp_path) -> None:
+    path = tmp_path / "task.yaml"
+    path.write_text(
+        """
+name: duplicate
+monitors:
+  same:
+    builtin: predicate
+    when: {source: value:x, op: gt, value: 0.0}
+    trigger: edge
+  same:
+    builtin: predicate
+    when: {source: value:y, op: gt, value: 0.0}
+    trigger: edge
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="duplicate mapping key 'same'"):
+        make_sink(make_sink_context(options={"task_document": str(path)}))
+
+
+def test_make_sink_task_document_accepts_a_matching_monitor_extensions_option(
+    tmp_path,
+) -> None:
+    path = _write_task_document(
+        tmp_path,
+        extensions=("extensions:\n" "  coverage:\n" "    builtin: scenario_coverage\n"),
+        report_extension="coverage",
+    )
+
+    sink = make_sink(
+        make_sink_context(
+            options={
+                "task_document": str(path),
+                "monitor_extensions": {"contact": "coverage"},
+                "write_report": False,
+            }
+        )
+    )
+
+    assert [extension.name for extension in sink.rewind_provider.extensions] == ["coverage"]
+    summary = sink.on_run_end()["BenchmarkSink"]
+    assert summary["tasks"]["extensions"] == ["coverage"]
+    assert "contact" not in summary["monitors"]
+
+
+def test_make_sink_task_document_rejects_a_conflicting_monitor_extensions_option(
+    tmp_path,
+) -> None:
+    path = _write_task_document(
+        tmp_path,
+        extensions=(
+            "extensions:\n"
+            "  coverage:\n"
+            "    builtin: scenario_coverage\n"
+            "  counts:\n"
+            "    module: unigym_bench.report:ScenarioCoverageExtension\n"
+            "    params:\n"
+            "      name: counts\n"
+            "      commands: [[0.0]]\n"
+        ),
+        report_extension="coverage",
+    )
+
+    with pytest.raises(ConfigError, match="conflicts with the task document"):
+        make_sink(
+            make_sink_context(
+                options={
+                    "task_document": str(path),
+                    "monitor_extensions": {"contact": "counts"},
+                }
+            )
+        )
+
+
+def test_make_sink_task_document_rejects_a_query_source_at_composition(tmp_path) -> None:
+    path = tmp_path / "task.yaml"
+    path.write_text(
+        """
+name: query
+monitors:
+  m:
+    builtin: predicate
+    when: {source: "query:height", op: gt, value: 0.0}
+    trigger: edge
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="query source"):
+        make_sink(make_sink_context(options={"task_document": str(path)}))

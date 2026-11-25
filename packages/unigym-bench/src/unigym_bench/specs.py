@@ -12,12 +12,18 @@ The schema is closed:
   object field is rejected rather than treated as omission; omit the key to
   use the documented default;
 - ``schema`` is optional for authoring; when present it must be
-  ``unigym_extbench/1``.  Absent and explicit null are distinct;
+  ``unigym_extbench/2``.  Absent and explicit null are distinct; an explicit
+  ``unigym_extbench/1`` is rejected (there is no dual-schema shim);
 - monitor and extension names are the mapping keys and must match
   ``[a-z][a-z0-9_]*``; duplicate YAML keys are rejected, not silently merged;
 - a monitor declares exactly one of ``builtin``, ``module`` or an inline
   ``factory`` callable; an extension declares exactly one of ``builtin`` or
   ``module``;
+- a ``builtin: predicate`` monitor composes its condition from ``when`` and
+  its trigger/emit specs from ``trigger``/``emit``; a ``builtin: phase``
+  monitor reads its explicit ``source`` and boundary params.  Predicate fields
+  are rejected on module/factory declarations and on builtins that do not
+  consume them;
 - ``params`` is a JSON object; it is validated with
   :func:`unigym_bench.json.ensure_json_value` and deep-frozen;
 - ``module`` references use the ``pkg.mod:attr`` form and are checked for
@@ -41,7 +47,10 @@ from typing import TypeAlias
 
 import yaml
 
+from .conditions import ConditionError, parse_condition
 from .json import JsonScalar, JsonValue, ensure_json_value
+from .predicates import EmitSpec, TriggerSpec
+from .sources import SourceError, SourceRef
 
 __all__ = [
     "SCHEMA",
@@ -58,7 +67,7 @@ __all__ = [
 ]
 
 #: Document schema understood by this loader.
-SCHEMA = "unigym_extbench/1"
+SCHEMA = "unigym_extbench/2"
 
 #: Read-only counterpart of :data:`unigym_bench.json.JsonValue`.  Mappings
 #: become ``MappingProxyType`` and lists become tuples so a parsed spec cannot
@@ -74,7 +83,18 @@ _MISSING = object()
 
 _DOCUMENT_KEYS = frozenset({"schema", "name", "monitors", "extensions", "retention", "scenario"})
 _MONITOR_KEYS = frozenset(
-    {"builtin", "module", "factory", "params", "report_extension", "resources"}
+    {
+        "builtin",
+        "module",
+        "factory",
+        "params",
+        "report_extension",
+        "resources",
+        "when",
+        "trigger",
+        "emit",
+        "source",
+    }
 )
 _EXTENSION_KEYS = frozenset({"builtin", "module", "params", "resources"})
 _RETENTION_KEYS = frozenset({"retain_episodes", "max_events", "event_log"})
@@ -111,6 +131,13 @@ class MonitorSpec:
     Exactly one of ``builtin``, ``module`` or ``factory`` selects the monitor.
     ``factory`` is an inline callable for programmatic composition; a YAML
     document cannot express it and must use ``builtin`` or ``module``.
+
+    A ``builtin: predicate`` declaration carries the closed predicate fields
+    ``when`` (condition mapping), ``trigger`` (kind string or closed mapping)
+    and optional ``emit`` (closed mapping).  A ``builtin: phase`` declaration
+    carries the explicit ``source`` reference and its boundaries through
+    ``params``.  Predicate fields are not accepted on a module/factory
+    declaration or on a builtin that does not consume them.
     """
 
     name: str
@@ -120,6 +147,10 @@ class MonitorSpec:
     params: Mapping[str, FrozenJson] = field(default_factory=lambda: MappingProxyType({}))
     report_extension: str | None = None
     resources: Mapping[str, Path] = field(default_factory=lambda: MappingProxyType({}))
+    when: Mapping[str, FrozenJson] | None = None
+    trigger: str | Mapping[str, FrozenJson] | None = None
+    emit: Mapping[str, FrozenJson] | None = None
+    source: str | None = None
 
     def __post_init__(self) -> None:
         """Validate the monitor declaration."""
@@ -155,6 +186,97 @@ class MonitorSpec:
         object.__setattr__(
             self, "resources", _validate_resources(self.resources, f"{where}.resources")
         )
+        self._validate_predicate_fields(where)
+
+    def _validate_predicate_fields(self, where: str) -> None:
+        """Validate and freeze the closed predicate fields."""
+        when = None
+        if self.when is not None:
+            when = _validate_json_object(self.when, f"{where}.when")
+            try:
+                parse_condition(dict(when))
+            except (ConditionError, TypeError) as exc:
+                raise SpecError(f"{where}.when: {exc}") from exc
+        trigger = None
+        if self.trigger is not None:
+            if isinstance(self.trigger, str):
+                try:
+                    TriggerSpec.from_mapping({"kind": self.trigger})
+                except (TypeError, ValueError) as exc:
+                    raise SpecError(f"{where}.trigger: {exc}") from exc
+                trigger = self.trigger
+            elif isinstance(self.trigger, Mapping):
+                raw_trigger = _validate_json_object(self.trigger, f"{where}.trigger")
+                try:
+                    TriggerSpec.from_mapping(raw_trigger)
+                except (TypeError, ValueError) as exc:
+                    raise SpecError(f"{where}.trigger: {exc}") from exc
+                trigger = raw_trigger
+            else:
+                raise SpecError(
+                    f"{where}.trigger: expected a trigger kind string or a mapping, "
+                    f"got {type(self.trigger).__name__}"
+                )
+        emit = None
+        if self.emit is not None:
+            emit = _validate_json_object(self.emit, f"{where}.emit")
+            try:
+                EmitSpec.from_mapping(emit)
+            except (TypeError, ValueError) as exc:
+                raise SpecError(f"{where}.emit: {exc}") from exc
+        source = None
+        if self.source is not None:
+            if not isinstance(self.source, str):
+                raise SpecError(
+                    f"{where}.source: expected a 'kind:key' string, "
+                    f"got {type(self.source).__name__}"
+                )
+            try:
+                SourceRef.parse(self.source)
+            except SourceError as exc:
+                raise SpecError(f"{where}.source: {exc}") from exc
+            source = self.source
+        object.__setattr__(self, "when", when)
+        object.__setattr__(self, "trigger", trigger)
+        object.__setattr__(self, "emit", emit)
+        object.__setattr__(self, "source", source)
+        has_predicate = when is not None or trigger is not None or emit is not None
+        if self.module is not None or self.factory is not None:
+            if has_predicate or source is not None:
+                raise SpecError(
+                    f"{where}: 'when'/'trigger'/'emit'/'source' require a builtin "
+                    "that consumes them ('predicate' or 'phase'), not a "
+                    "module/factory declaration"
+                )
+            return
+        if self.builtin == "predicate":
+            if when is None:
+                raise SpecError(f"{where}.when: required for builtin 'predicate'")
+            if trigger is None:
+                raise SpecError(f"{where}.trigger: required for builtin 'predicate'")
+            if source is not None:
+                raise SpecError(
+                    f"{where}.source: builtin 'predicate' reads sources through "
+                    "'when'; remove 'source' or declare builtin 'phase'"
+                )
+            if self.params:
+                raise SpecError(
+                    f"{where}.params: builtin 'predicate' takes no params; put the "
+                    "condition in 'when' and the outputs in 'trigger'/'emit'"
+                )
+            return
+        if self.builtin == "phase":
+            if source is None:
+                raise SpecError(f"{where}.source: required for builtin 'phase'")
+            if has_predicate:
+                raise SpecError(
+                    f"{where}: builtin 'phase' accepts 'source' and params, not "
+                    "'when'/'trigger'/'emit'"
+                )
+            return
+        # An unknown builtin is rejected by the composition registry; the
+        # predicate fields are left untouched so the registry error names the
+        # available builtins instead of hiding behind a field-shape error.
 
 
 @dataclass(frozen=True)
@@ -405,6 +527,12 @@ def _parse_monitors(
             )
         _reject_inline_name(entry, where, key)
         _check_keys(entry, _MONITOR_KEYS, where)
+        for field_name in ("when", "trigger", "emit", "source"):
+            if field_name in entry and entry[field_name] is None:
+                raise SpecError(
+                    f"{where}.{field_name}: explicit null is not allowed; omit the "
+                    "key when the field does not apply"
+                )
         parsed[key] = MonitorSpec(
             name=key,
             builtin=entry.get("builtin"),
@@ -417,6 +545,10 @@ def _parse_monitors(
                 f"{where}.resources",
                 base_dir,
             ),
+            when=entry.get("when"),
+            trigger=entry.get("trigger"),
+            emit=entry.get("emit"),
+            source=entry.get("source"),
         )
     return MappingProxyType(parsed)
 
@@ -567,6 +699,16 @@ def _validate_extension_mapping(raw: object) -> Mapping[str, ExtensionSpec]:
 
 
 def _validate_params(raw: object, where: str) -> Mapping[str, FrozenJson]:
+    normalized = _normalize_json_object(raw, where)
+    return MappingProxyType({key: _freeze(value) for key, value in normalized.items()})
+
+
+def _validate_json_object(raw: object, where: str) -> Mapping[str, FrozenJson]:
+    normalized = _normalize_json_object(raw, where)
+    return MappingProxyType({key: _freeze(value) for key, value in normalized.items()})
+
+
+def _normalize_json_object(raw: object, where: str) -> dict[str, JsonValue]:
     try:
         normalized = ensure_json_value(raw, where=where)
     except (TypeError, ValueError) as exc:
@@ -575,7 +717,7 @@ def _validate_params(raw: object, where: str) -> Mapping[str, FrozenJson]:
         raise SpecError(
             f"{where}: expected a JSON object (mapping), " f"got {type(normalized).__name__}"
         )
-    return MappingProxyType({key: _freeze(value) for key, value in normalized.items()})
+    return normalized
 
 
 def _freeze(value: JsonValue) -> FrozenJson:
