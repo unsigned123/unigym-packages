@@ -5,7 +5,7 @@ repository. Each package release declares the core range it supports.
 
 | Package | Package version | Core requirement | Notes |
 | --- | --- | --- | --- |
-| `unigym-rl` | `0.2.x` | `unigym >=0.109,<0.110` | L2 task-environment layer over the post-deletion core explicit reset/terminate lifecycle; no core episode clock; code unchanged in `0.2.1`, validated against core `0.109.0`. |
+| `unigym-rl` | `0.2.x` | `unigym >=0.109,<0.110` | L2 task-environment layer over the post-deletion core explicit reset/terminate lifecycle; no core episode clock; `0.2.1` reads `runner.ticks_done` directly, validated against core `0.109.0`. |
 | `unigym-bench` | `0.4.x` | `unigym >=0.109,<0.110` | Flow-owned external benchmark layer over the post-deletion core explicit sink, reset-aware lifecycle, value/context and termination contracts; values-only monitors, `BenchmarkFlow` decision/report ownership, task/report `/3`, rewind `/5`, monitor `/4`; validated against core `0.109.0`. |
 | `unigym-robots` | `0.1.x` | none | Standalone asset downloader for pinned Unitree Go1/Go2/G1 MJCF and USD assets. Assets are GitHub Release tarballs, not wheel content. |
 
@@ -23,3 +23,8 @@ against the new core lane.
 Release ordering: core `0.109.0` must be on core `main` before
 `unigym-bench 0.4.x` and `unigym-rl 0.2.x` can resolve their dependency range
 or run their CI lanes.
+
+The nested `test-packs/` workspace is vendored and out of scope for these
+package release ranges. `test-packs/ci/core-pin.toml` pins the upstream core
+commit for its own nightly/pinned lanes and is not part of the `unigym-bench` /
+`unigym-rl` release set; do not update it as part of a package release.

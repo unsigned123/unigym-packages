@@ -18,10 +18,13 @@ implementation, or policy execution/deployment (L3 stays in core).
 
 ## Release 0.2.1: core 0.109 range
 
-`unigym-rl 0.2.1` is a patch release with no code or API change. It only moves
-the core range to `unigym >=0.109,<0.110` so the lane resolves against the
-additive `ValueStore.subscribe` core release. `unigym-rl` does not use
-subscriptions; its task/lifecycle behavior is the `0.2.0` contract below.
+`unigym-rl 0.2.1` is a patch release. It moves the core range to
+`unigym >=0.109,<0.110` so the lane resolves against the additive
+`ValueStore.subscribe` core release, and `task.py` now reads
+`runner.ticks_done` directly for the post-step tick count instead of the
+`getattr(self.runner, "ticks_done", int(result.t))` fallback. The
+task/lifecycle behavior is otherwise the `0.2.0` contract below; `unigym-rl`
+does not use subscriptions.
 
 ## Release 0.2.0: core 0.108 lockstep
 

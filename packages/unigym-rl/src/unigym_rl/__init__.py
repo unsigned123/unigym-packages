@@ -22,6 +22,9 @@ The minimal task loop is::
 
 from __future__ import annotations
 
+from importlib import metadata
+from pathlib import Path
+
 from unigym_rl.buffers import RingBuffer
 from unigym_rl.context import (
     EpisodeEnd,
@@ -59,7 +62,34 @@ __all__ = [
     "Transition",
 ]
 
-__version__ = "0.0.0"
+
+def _resolve_version() -> str:
+    """The installed distribution version, with a checkout fallback.
+
+    Reads ``unigym-rl`` distribution metadata when the package is installed;
+    otherwise falls back to the adjacent ``pyproject.toml`` so a source checkout
+    on ``PYTHONPATH`` still reports its real version.  Returns ``"unknown"``
+    only when neither source is readable.
+    """
+    try:
+        return metadata.version("unigym-rl")
+    except metadata.PackageNotFoundError:
+        pass
+    pyproject = Path(__file__).resolve().parents[2] / "pyproject.toml"
+    try:
+        for line in pyproject.read_text(encoding="utf-8").splitlines():
+            entry = line.strip()
+            if entry.startswith("version"):
+                _, _, rhs = entry.partition("=")
+                value = rhs.strip().strip('"').strip("'")
+                if value:
+                    return value
+    except OSError:
+        pass
+    return "unknown"
+
+
+__version__ = _resolve_version()
 
 _LAZY_EXPORTS = {"GymTaskEnv": "unigym_rl.gym"}
 
