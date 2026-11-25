@@ -48,7 +48,7 @@ from __future__ import annotations
 import math
 import operator
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import TYPE_CHECKING
 
@@ -74,6 +74,7 @@ from .events import (
 )
 from .json import JsonValue, ensure_json_value
 from .monitors import Monitor
+from .query import TickQuery
 from .report import ReportExtension, validate_report_extensions
 from .specs import RetentionSpec
 
@@ -507,29 +508,37 @@ class StreamingEngine:
         context = self._build_context(bundle)
         self._bind(context)
 
-        num_envs = self._require_bound()
-        for env_id in range(num_envs):
-            if self._open[env_id]:
-                self._episode_ticks[env_id] += 1
-        for env_id in range(num_envs):
-            if self._open[env_id] and self._episode_ticks[env_id] == 1:
-                self._capture_episode_start(env_id, context)
-
-        for monitor in self._monitors:
-            monitor.on_tick(context)
-
+        tick_query: TickQuery | None = None
+        owns_query = False
         collected: list[
             tuple[Monitor, dict[str, Tensor], tuple[Event, ...], dict[int, Termination]]
         ] = []
-        for monitor in self._monitors:
-            collected.append(
-                (
-                    monitor,
-                    self._collect_values(monitor, context),
-                    self._collect_events(monitor),
-                    self._collect_terminals(monitor, num_envs),
+        try:
+            context, tick_query, owns_query = self._attach_tick_query(context)
+
+            num_envs = self._require_bound()
+            for env_id in range(num_envs):
+                if self._open[env_id]:
+                    self._episode_ticks[env_id] += 1
+            for env_id in range(num_envs):
+                if self._open[env_id] and self._episode_ticks[env_id] == 1:
+                    self._capture_episode_start(env_id, context)
+
+            for monitor in self._monitors:
+                monitor.on_tick(context)
+
+            for monitor in self._monitors:
+                collected.append(
+                    (
+                        monitor,
+                        self._collect_values(monitor, context),
+                        self._collect_events(monitor),
+                        self._collect_terminals(monitor, num_envs),
+                    )
                 )
-            )
+        finally:
+            if owns_query and tick_query is not None:
+                tick_query.close()
 
         # Validate every occurrence before mutating journal/latches so a bad
         # output cannot leave a half-applied tick behind.
@@ -618,16 +627,27 @@ class StreamingEngine:
                 f"to {final_context.device}"
             )
 
-        # Evaluate only this boundary's rows against the one final context.
-        for monitor in self._monitors:
-            monitor.on_episode_end(due_ids, final_context)
+        final_query: TickQuery | None = None
+        owns_final_query = False
+        final_values: list[tuple[Monitor, dict[str, Tensor]]] = []
+        try:
+            final_context, final_query, owns_final_query = self._attach_tick_query(final_context)
 
-        # Read and validate the post-evaluation levels before draining outputs,
-        # so a malformed value cannot consume events/terminals on a failed
-        # boundary.  Publication still happens only after every check.
-        final_values = [
-            (monitor, self._collect_values(monitor, final_context)) for monitor in self._monitors
-        ]
+            # Evaluate only this boundary's rows against the one final context.
+            for monitor in self._monitors:
+                monitor.on_episode_end(due_ids, final_context)
+
+            # Read and validate the post-evaluation levels before draining
+            # outputs, so a malformed value cannot consume events/terminals on a
+            # failed boundary.  Publication still happens only after every check.
+            final_values = [
+                (monitor, self._collect_values(monitor, final_context))
+                for monitor in self._monitors
+            ]
+        finally:
+            if owns_final_query and final_query is not None:
+                final_query.close()
+
         final_events = [(monitor, self._collect_events(monitor)) for monitor in self._monitors]
         final_terminals: list[Termination] = []
         for monitor in self._monitors:
@@ -1055,6 +1075,27 @@ class StreamingEngine:
     # ------------------------------------------------------------------ #
     # Step context and output validation
     # ------------------------------------------------------------------ #
+    def _attach_tick_query(
+        self, context: BenchmarkStepContext
+    ) -> tuple[BenchmarkStepContext, TickQuery, bool]:
+        """Attach one lazy tick snapshot unless the context already carries one.
+
+        Returns the possibly replaced context, the snapshot and whether this
+        engine built it and therefore owns closing it.  A caller-supplied
+        context that already carries a snapshot keeps that object, so
+        ``context.query`` is the single shared snapshot for the tick.
+        """
+        existing = context.query
+        if existing is not None:
+            return context, existing, False
+        snapshot = TickQuery(context.view)
+        try:
+            attached = replace(context, query=snapshot)
+        except Exception:
+            snapshot.close()
+            raise
+        return attached, snapshot, True
+
     def _build_context(self, bundle: Mapping[str, object]) -> BenchmarkStepContext:
         """Return the pack step context from the runner bundle.
 

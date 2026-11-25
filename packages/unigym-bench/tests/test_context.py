@@ -20,6 +20,7 @@ from unigym.values import StepValues
 from unigym_bench.context import BenchmarkStepContext
 from unigym_bench.engine import EngineStateError, StreamingEngine
 from unigym_bench.events import Event
+from unigym_bench.query import TickQuery
 
 
 def _view(num_envs: int = 2) -> EnvView:
@@ -31,6 +32,7 @@ def _context(
     *,
     events: object = (),
     terminals: object = None,
+    query: object = None,
 ) -> BenchmarkStepContext:
     return BenchmarkStepContext(
         view=_view(num_envs),
@@ -42,6 +44,7 @@ def _context(
         reset_state={},
         events=events,  # type: ignore[arg-type]
         terminals={} if terminals is None else terminals,  # type: ignore[arg-type]
+        query=query,  # type: ignore[arg-type]
     )
 
 
@@ -64,6 +67,7 @@ def test_subclass_construction_and_defaults() -> None:
     assert isinstance(context, BenchmarkStepContext)
     assert context.events == ()
     assert dict(context.terminals) == {}
+    assert context.query is None
     assert context.num_envs == 2
     assert context.t == 0
 
@@ -139,6 +143,15 @@ def test_replace_preserves_pack_fields() -> None:
     assert dict(replace(context, terminals={1: termination}).terminals) == {1: termination}
 
 
+def test_query_field_requires_a_tick_query_or_none() -> None:
+    view = _view(2)
+    tick = TickQuery(view)
+
+    assert _context(query=tick).query is tick
+    with pytest.raises(TypeError, match="TickQuery or None"):
+        _context(query=object())
+
+
 def test_from_env_step_wraps_without_a_bundle() -> None:
     step = EnvStepContext(
         view=_view(2),
@@ -160,9 +173,28 @@ def test_from_env_step_wraps_without_a_bundle() -> None:
     assert dict(context.reset_state) == dict(step.reset_state)
     assert context.events == ()
     assert dict(context.terminals) == {}
+    assert context.query is None
 
     with pytest.raises(TypeError, match="expected an EnvStepContext"):
         BenchmarkStepContext.from_env_step(object())  # type: ignore[arg-type]
+
+
+def test_from_env_step_does_not_inherit_a_tick_snapshot() -> None:
+    source = _context(query=TickQuery(_view(2)))
+    explicit = TickQuery(_view(2))
+
+    wrapped = BenchmarkStepContext.from_env_step(source)
+    attached = BenchmarkStepContext.from_env_step(source, query=explicit)
+
+    assert wrapped.query is None
+    assert attached.query is explicit
+
+
+def test_replace_preserves_an_attached_tick_snapshot() -> None:
+    tick = TickQuery(_view(2))
+    context = _context(query=tick)
+
+    assert replace(context, t=5).query is tick
 
 
 def test_no_pack_frame_type_remains() -> None:

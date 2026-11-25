@@ -308,6 +308,17 @@ Each condition reads explicit `SourceRef` values (`record:`, `obs:`, `value:`;
 `query:` is rejected in v1) through `SourceResolver`; there is no `Probe`
 callable and no fallback lookup.
 
+Every engine tick attaches one `BenchmarkStepContext.query`: a pack-private
+`TickQuery` bound to that boundary's view and shared by all monitors on the
+tick. Contact `scan`/`manifold` reads are memoized by normalized env selection
+(and group), while `state` and `geometry` are read-only passthroughs to the core
+`EvalQuery`. The snapshot is lazy, so a view with no runtime query only raises
+the core `EvalQueryUnavailableError` when a consumer actually reads it. The
+engine closes the snapshot when the monitor callbacks return; direct and
+offline contexts leave `query` as `None`. A `state` or `geometry` subface
+extracted before close stays governed by the core view lifetime; the snapshot
+itself rejects new accessor reads after close.
+
 The retired typed monitors are configuration helpers that return a validated
 `PredicateMonitor`:
 

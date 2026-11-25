@@ -20,6 +20,7 @@ from unigym.core.episode_termination import (
     TerminationSource,
 )
 from unigym.evaluation import EnvStepContext, EnvView
+from unigym.query import AABB, ContactManifold, Pose
 from unigym.run import SinkContext
 from unigym.run.spec import build_spec
 from unigym.values import StepValues, ValueView
@@ -35,6 +36,154 @@ from unigym_bench.sink import BenchmarkSink, make_sink
 def make_view(num_envs: int = 2, *, device: str | torch.device = "cpu") -> EnvView:
     """Build a real, empty vector view with no observation snapshot."""
     return EnvView(record={}, obs=None, env_id=None, num_envs=num_envs, device=device)
+
+
+def _env_values(env: object) -> tuple[int, ...] | None:
+    """Return one env selection's ids for the counting query spy."""
+    if env is None:
+        return None
+    if isinstance(env, torch.Tensor):
+        return tuple(int(value) for value in env.detach().reshape(-1).tolist())
+    if isinstance(env, int) and not isinstance(env, bool):
+        return (int(env),)
+    return tuple(int(value) for value in env)  # type: ignore[union-attr]
+
+
+def _env_ids(env: object, num_envs: int) -> tuple[int, ...]:
+    """Return the resolved ids for one env selection."""
+    values = _env_values(env)
+    return tuple(range(num_envs)) if values is None else values
+
+
+class _UnusedQueryFace:
+    """Explicit stand-in for a core query subface this card does not read."""
+
+    def __getattr__(self, name: str) -> object:
+        raise AssertionError(f"query face {name!r} is not used by this test double")
+
+
+class CountingContacts:
+    """Explicit spy over the narrow core contact boundary."""
+
+    def __init__(self, num_envs: int = 2) -> None:
+        self._num_envs = num_envs
+        self.scan_calls: list[tuple[int, ...] | None] = []
+        self.manifold_calls: list[tuple[str, tuple[int, ...] | None]] = []
+
+    def _manifold(self, group: str, env: object) -> ContactManifold:
+        ids = _env_ids(env, self._num_envs)
+        return ContactManifold(
+            env_ids=torch.tensor(ids, dtype=torch.int64),
+            group=group,
+            points=(),
+        )
+
+    def scan(self, *, env: object = None) -> ContactManifold:
+        """Record the selection and return an empty real manifold."""
+        self.scan_calls.append(_env_values(env))
+        return self._manifold("*", env)
+
+    def manifold(self, group: str, *, env: object = None) -> ContactManifold:
+        """Record the group and selection and return an empty real manifold."""
+        self.manifold_calls.append((group, _env_values(env)))
+        return self._manifold(group, env)
+
+    def jacobian(self, point: object, articulation: str) -> object:
+        """Reject an unexercised read instead of returning a fake success."""
+        raise AssertionError("contact jacobian is not used by this test double")
+
+    def wrench_to_joint(self, point: object, articulation: str) -> torch.Tensor:
+        """Reject an unexercised read instead of returning a fake success."""
+        raise AssertionError("contact wrench_to_joint is not used by this test double")
+
+
+class CountingState:
+    """Explicit spy over the state subface used for a passthrough check."""
+
+    def __init__(self, num_envs: int = 2) -> None:
+        self._num_envs = num_envs
+        self.body_pose_calls: list[tuple[str, str | None, tuple[int, ...] | None]] = []
+
+    def body_pose(
+        self,
+        name: str,
+        *,
+        articulation: str | None = None,
+        env: object = None,
+    ) -> Pose:
+        """Record the read and return one real per-env pose."""
+        self.body_pose_calls.append((name, articulation, _env_values(env)))
+        ids = _env_ids(env, self._num_envs)
+        rows = len(ids)
+        return Pose(
+            env_ids=torch.tensor(ids, dtype=torch.int64),
+            pos_w=torch.zeros(rows, 3),
+            quat_wxyz=torch.tensor([[1.0, 0.0, 0.0, 0.0]]).repeat(rows, 1),
+        )
+
+
+class CountingGeometry:
+    """Explicit spy over the geometry subface used for a passthrough check."""
+
+    def __init__(self, num_envs: int = 2) -> None:
+        self._num_envs = num_envs
+        self.aabb_calls: list[tuple[object, tuple[int, ...] | None]] = []
+
+    def aabb(self, entity: object, *, env: object = None) -> AABB:
+        """Record the read and return a real zero-sized per-env box."""
+        self.aabb_calls.append((entity, _env_values(env)))
+        ids = _env_ids(env, self._num_envs)
+        zeros = torch.zeros(len(ids), 3)
+        return AABB(env_ids=torch.tensor(ids, dtype=torch.int64), min_w=zeros, max_w=zeros)
+
+
+class CountingQuery:
+    """Explicit spy implementing the core read subfaces TickQuery uses."""
+
+    def __init__(self, num_envs: int = 2) -> None:
+        self.num_envs = num_envs
+        self.contacts = CountingContacts(num_envs)
+        self.state = CountingState(num_envs)
+        self.geometry = CountingGeometry(num_envs)
+        self.model = _UnusedQueryFace()
+        self.kinematics = _UnusedQueryFace()
+        self.actuators = _UnusedQueryFace()
+
+    @property
+    def backend(self) -> str:
+        """The canonical fake backend name."""
+        return "counting"
+
+    def scratch(self, env: int | None = None) -> object:
+        """Reject scratch access; the evaluation snapshot never exposes it."""
+        raise AssertionError("scratch is not reachable from TickQuery")
+
+    def require(self, *ops: str) -> None:
+        """Accept every capability check; the spy implements the read subset."""
+        del ops
+
+    def close(self) -> None:
+        """No-op: the spy owns no resources."""
+
+
+def make_query_view(num_envs: int = 2) -> tuple[EnvView, CountingQuery, list[int]]:
+    """Build a real vector view whose lazy query resolves to a counting spy."""
+    fake = CountingQuery(num_envs)
+    factory_calls: list[int] = []
+
+    def factory() -> CountingQuery:
+        factory_calls.append(1)
+        return fake
+
+    view = EnvView(
+        record={},
+        obs=None,
+        env_id=None,
+        num_envs=num_envs,
+        device="cpu",
+        query_factory=factory,
+    )
+    return view, fake, factory_calls
 
 
 def make_context(
@@ -298,6 +447,80 @@ class IntegrationMonitor(BaseMonitor):
 def make_integration_monitors() -> tuple[Monitor, ...]:
     """Importable zero-argument monitor factory for the real-run test."""
     return (IntegrationMonitor(),)
+
+
+class ContextSpyMonitor(BaseMonitor):
+    """Test monitor that records each tick context without reading a query."""
+
+    def __init__(self, name: str = "context_spy") -> None:
+        super().__init__(name)
+        self.contexts: list[BenchmarkStepContext] = []
+
+    def on_tick(self, context: EnvStepContext) -> None:
+        """Record this tick's context for identity assertions."""
+        assert isinstance(context, BenchmarkStepContext)
+        self.contexts.append(context)
+
+
+class QuerySpyMonitor(ContextSpyMonitor):
+    """Test monitor that reads one contact scan through the tick snapshot."""
+
+    def on_tick(self, context: EnvStepContext) -> None:
+        """Record the context and exercise the shared scan cache."""
+        super().on_tick(context)
+        query = self.contexts[-1].query
+        if query is not None:
+            query.contacts.scan()
+
+
+class QueryErrorSpyMonitor(BaseMonitor):
+    """Test monitor that records the error from one attempted contact read."""
+
+    def __init__(self, name: str = "query_error_spy") -> None:
+        super().__init__(name)
+        self.errors: list[Exception] = []
+
+    def on_tick(self, context: EnvStepContext) -> None:
+        """Attempt a query read, recording the raised error instead of escaping."""
+        assert isinstance(context, BenchmarkStepContext)
+        try:
+            query = context.query
+            if query is None:
+                raise AssertionError("engine tick did not attach a TickQuery")
+            _ = query.contacts
+        except Exception as exc:
+            self.errors.append(exc)
+
+
+class QueryFailMonitor(BaseMonitor):
+    """Test monitor that records its boundary context then raises on demand."""
+
+    def __init__(
+        self,
+        name: str = "query_fail",
+        *,
+        fail_on_tick: bool = False,
+        fail_on_episode_end: bool = False,
+    ) -> None:
+        super().__init__(name)
+        self._fail_on_tick = fail_on_tick
+        self._fail_on_episode_end = fail_on_episode_end
+        self.contexts: list[BenchmarkStepContext] = []
+        self.final_contexts: list[BenchmarkStepContext] = []
+
+    def on_tick(self, context: EnvStepContext) -> None:
+        """Record the context, then raise when configured."""
+        assert isinstance(context, BenchmarkStepContext)
+        self.contexts.append(context)
+        if self._fail_on_tick:
+            raise RuntimeError("query fail tick")
+
+    def on_episode_end(self, env_ids: Sequence[int], context: EnvStepContext | None = None) -> None:
+        """Record the final context, then raise when configured."""
+        assert isinstance(context, BenchmarkStepContext)
+        self.final_contexts.append(context)
+        if self._fail_on_episode_end:
+            raise RuntimeError("query fail episode_end")
 
 
 class BundleRecordingSink:

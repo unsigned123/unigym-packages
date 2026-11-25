@@ -3,9 +3,10 @@
 A :class:`BenchmarkStepContext` is the only data a monitor receives for a tick.
 It subclasses the core :class:`~unigym.evaluation.EnvStepContext` and adds the
 pack's own defaulted fields: the one-shot :class:`~unigym_bench.events.Event`
-records produced by monitors and the per-env :class:`Termination` requests they
-raised.  The core context owns the borrowed view, value snapshot, tick position
-and reset bookkeeping; this module owns the pack extras only.
+records produced by monitors, the per-env :class:`Termination` requests they
+raised, and the tick's optional :class:`~unigym_bench.query.TickQuery` read
+snapshot.  The core context owns the borrowed view, value snapshot, tick
+position and reset bookkeeping; this module owns the pack extras only.
 
 Events are copied into an immutable tuple and terminals into a read-only
 mapping, so a context never aliases caller-owned mutable state.  The view is
@@ -24,6 +25,7 @@ from unigym.core.episode_termination import Termination
 from unigym.evaluation import EnvStepContext
 
 from .events import Event
+from .query import TickQuery
 
 __all__ = ["BenchmarkStepContext"]
 
@@ -35,14 +37,24 @@ class BenchmarkStepContext(EnvStepContext):
     Attributes:
         events: One-shot occurrences produced for this tick, stored as a tuple.
         terminals: Per-env terminal requests keyed by env id, stored read-only.
+        query: Optional one-tick memoized query read snapshot.  Engine ticks
+            attach one; direct and offline contexts leave it ``None``.
     """
 
     events: tuple[Event, ...] = ()
     terminals: Mapping[int, Termination] = field(default_factory=dict)
+    query: TickQuery | None = None
 
     def __post_init__(self) -> None:
         """Validate the core boundary, then copy and validate the pack fields."""
         super(BenchmarkStepContext, self).__post_init__()
+
+        query = self.query
+        if query is not None and not isinstance(query, TickQuery):
+            raise TypeError(
+                "BenchmarkStepContext.query must be a TickQuery or None, "
+                f"got {type(query).__name__}"
+            )
 
         raw_events = self.events
         if isinstance(raw_events, (str, bytes, bytearray)) or not isinstance(raw_events, Sequence):
@@ -92,6 +104,7 @@ class BenchmarkStepContext(EnvStepContext):
         *,
         events: Sequence[Event] = (),
         terminals: Mapping[int, Termination] | None = None,
+        query: TickQuery | None = None,
     ) -> BenchmarkStepContext:
         """Wrap an already-built core context without re-reading a bundle.
 
@@ -99,6 +112,9 @@ class BenchmarkStepContext(EnvStepContext):
             step: The core context produced by the runner boundary.
             events: Optional one-shot occurrences to attach.
             terminals: Optional per-env terminal requests to attach.
+            query: Optional tick snapshot to attach.  A wrapped context never
+                inherits the source context's snapshot, so a boundary cannot
+                accidentally reuse a previous tick's cache.
 
         Returns:
             A new benchmark context that shares only the borrowed view and
@@ -122,4 +138,5 @@ class BenchmarkStepContext(EnvStepContext):
             reset_state=step.reset_state,
             events=events,
             terminals={} if terminals is None else terminals,
+            query=query,
         )
