@@ -21,4 +21,5 @@ a checkout. Do not widen a package's core range without running its test suite
 against the new core lane.
 
 Release ordering: core `0.108.0` must be on core `main` before
-`unigym-bench 0.3.x` can resolve its dependency range or run its CI lane.
+`unigym-bench 0.3.x` and `unigym-rl 0.2.x` can resolve their dependency range
+or run their CI lanes.

@@ -103,7 +103,8 @@ python examples/cartpole/train_skrl.py --num-envs 1 --max-iterations 1
   authority; the current lanes are `unigym-rl 0.2.x` -> `unigym >=0.108,<0.109`
   and `unigym-bench 0.3.x` -> `unigym >=0.108,<0.109`.
 - Release ordering: core `0.108.0` must be on core `main` before
-  `unigym-bench 0.3.x` can resolve its dependency or its CI lane can run.
+  `unigym-bench 0.3.x` and `unigym-rl 0.2.x` can resolve their dependency or
+  their CI lanes can run.
 - `unigym-robots` code is versioned independently. Its robot assets are attached
   to the GitHub Release `unigym-robots-assets-v0.1.0` and are never published to
   PyPI. See `packages/unigym-robots/PROVENANCE.md`.

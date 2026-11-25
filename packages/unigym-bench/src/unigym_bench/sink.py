@@ -42,16 +42,17 @@ JSON-safe.
 Lifecycle glue
 --------------
 
-The runner owns the episode clock and calls ``on_episode_end`` at an explicit
-boundary.  The sink finalizes the due episodes there.  When the runner then
-runs a real reset chain, it calls the sink's :class:`~unigym.sink.ResetAwareSink`
-``on_reset`` capability (tick auto-reset, ``runner.reset`` and
-``terminate(..., reset=True)``).  A reset of a finalized env reopens it; a core
-reset of an already-open env restarts it in place and fabricates no episode
-record; a pre-start reset-all is a no-op because the engine binds on the first
-tick.  The sink never infers a reset from ``on_step_end`` and never owns an
-episode horizon, so a pack run must end episodes with ``runner.terminate(...)``
-or a pack sink terminal rather than a core clock.
+The runner owns the episode-end boundary and calls ``on_episode_end`` when an
+explicit boundary fires.  The sink finalizes the due episodes there.  When the
+runner then runs a real reset chain, it calls the sink's
+:class:`~unigym.sink.ResetAwareSink` ``on_reset`` capability (tick auto-reset,
+``runner.reset`` and ``terminate(..., reset=True)``).  A reset of a finalized
+env reopens it; a core reset of an already-open env restarts it in place and
+fabricates no episode record; a pre-start reset-all is a no-op because the
+engine binds on the first tick.  The sink never infers a reset from
+``on_step_end`` and never owns an episode horizon, so a pack run must end
+episodes with ``runner.terminate(...)`` or a pack sink terminal rather than a
+core clock.
 
 Report.  ``on_run_end`` finalizes the engine, drives every report extension's
 ``on_run_end`` once and returns the pack report under :data:`SUMMARY_KEY`.  It

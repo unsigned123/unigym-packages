@@ -276,7 +276,7 @@ class TaskEnv:
         if bool(done.any()):
             self.on_episode_end(done_ids, pre, transition)
             self._end_done_episodes(done_ids, due_mask, task_terminated, truncated)
-            post_t = int(getattr(self.runner, "ticks_done", int(result.t)))
+            post_t = int(self.runner.ticks_done)
             post = self._snapshot(t=post_t, reset_env_ids=done_ids)
             self._reset_buffers(done_ids)
             self.on_reset(done_ids, post)
