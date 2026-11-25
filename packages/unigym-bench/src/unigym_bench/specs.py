@@ -1,8 +1,8 @@
 """Closed task-document schema for the external benchmark pack.
 
 A task document is a single YAML task: a task name, a mapping of monitors, a
-mapping of report extensions, the run retention policy and an optional
-scenario.  This module owns the authoring surface.  It validates a document at
+mapping of report extensions, the run retention policy, an optional scenario and
+the task flow rules.  This module owns the authoring surface.  It validates a document at
 the boundary where it enters the pack and returns frozen, read-only specs; it
 does not import monitors, extensions, samplers or the streaming engine.
 
@@ -12,18 +12,24 @@ The schema is closed:
   object field is rejected rather than treated as omission; omit the key to
   use the documented default;
 - ``schema`` is optional for authoring; when present it must be
-  ``unigym_extbench/2``.  Absent and explicit null are distinct; an explicit
-  ``unigym_extbench/1`` is rejected (there is no dual-schema shim);
+  ``unigym_extbench/3``.  Absent and explicit null are distinct; the retired
+  ``unigym_extbench/1`` and ``/2`` forms are rejected with a migration error
+  (there is no dual-schema shim);
 - monitor and extension names are the mapping keys and must match
   ``[a-z][a-z0-9_]*``; duplicate YAML keys are rejected, not silently merged;
 - a monitor declares exactly one of ``builtin``, ``module`` or an inline
   ``factory`` callable; an extension declares exactly one of ``builtin`` or
   ``module``;
 - a ``builtin: predicate`` monitor composes its condition from ``when`` and
-  its trigger/emit specs from ``trigger``/``emit``; a ``builtin: phase``
-  monitor reads its explicit ``source`` and boundary params.  Predicate fields
-  are rejected on module/factory declarations and on builtins that do not
-  consume them;
+  its trigger/value specs from ``trigger``/``emit``; ``emit`` accepts only the
+  local ``value`` name.  A ``builtin: phase`` monitor reads its explicit
+  ``source`` and boundary params.  Predicate fields are rejected on
+  module/factory declarations and on builtins that do not consume them;
+- the optional ``flow`` section owns terminal and event decisions.  Its
+  ``termination_rules`` name a monitor boolean value, an outcome and a
+  ``custom.*`` code; its ``events`` name a monitor boolean value and an event.
+  A document without ``flow`` has no automatic termination and no automatic
+  events;
 - ``params`` is a JSON object; it is validated with
   :func:`unigym_bench.json.ensure_json_value` and deep-frozen;
 - ``module`` references use the ``pkg.mod:attr`` form and are checked for
@@ -43,18 +49,22 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import MappingProxyType
-from typing import TypeAlias
+from typing import TypeAlias, cast
 
 import yaml
+from unigym.core.episode_termination import EpisodeOutcome, validate_code
 
 from .conditions import ConditionError, parse_condition
+from .events import SEVERITIES, Severity
 from .json import JsonScalar, JsonValue, ensure_json_value
 from .predicates import EmitSpec, TriggerSpec
 from .sources import SourceError, SourceRef
 
 __all__ = [
     "SCHEMA",
+    "EventRuleSpec",
     "ExtensionSpec",
+    "FlowSpec",
     "FrozenJson",
     "MonitorSpec",
     "RetentionSpec",
@@ -62,12 +72,17 @@ __all__ = [
     "SpecError",
     "TaskDocument",
     "TaskSpec",
+    "TerminationRuleSpec",
     "load_task_document",
     "parse_task_document",
 ]
 
 #: Document schema understood by this loader.
-SCHEMA = "unigym_extbench/2"
+SCHEMA = "unigym_extbench/3"
+_RETIRED_SCHEMAS: frozenset[str] = frozenset({"unigym_extbench/1", "unigym_extbench/2"})
+_MONITOR_OUTCOMES: frozenset[EpisodeOutcome] = frozenset(
+    {EpisodeOutcome.SUCCESS, EpisodeOutcome.FAILURE, EpisodeOutcome.DEADLINE}
+)
 
 #: Read-only counterpart of :data:`unigym_bench.json.JsonValue`.  Mappings
 #: become ``MappingProxyType`` and lists become tuples so a parsed spec cannot
@@ -81,7 +96,9 @@ _MODULE_PATTERN = re.compile(
 
 _MISSING = object()
 
-_DOCUMENT_KEYS = frozenset({"schema", "name", "monitors", "extensions", "retention", "scenario"})
+_DOCUMENT_KEYS = frozenset(
+    {"schema", "name", "monitors", "extensions", "retention", "scenario", "flow"}
+)
 _MONITOR_KEYS = frozenset(
     {
         "builtin",
@@ -99,6 +116,9 @@ _MONITOR_KEYS = frozenset(
 _EXTENSION_KEYS = frozenset({"builtin", "module", "params", "resources"})
 _RETENTION_KEYS = frozenset({"retain_episodes", "max_events", "event_log"})
 _SCENARIO_KEYS = frozenset({"command_pool", "plan"})
+_FLOW_KEYS = frozenset({"termination_rules", "events"})
+_TERMINATION_RULE_KEYS = frozenset({"monitor", "value", "outcome", "code"})
+_EVENT_RULE_KEYS = frozenset({"monitor", "value", "name", "severity", "code", "data"})
 
 
 class SpecError(ValueError):
@@ -331,6 +351,98 @@ class ScenarioSpec:
 
 
 @dataclass(frozen=True)
+class TerminationRuleSpec:
+    """One explicit value-to-terminal rule in a task document."""
+
+    monitor: str
+    value: str
+    outcome: str
+    code: str
+
+    def __post_init__(self) -> None:
+        """Validate the rule fields at the document boundary."""
+        _require_name(self.monitor, "flow.termination_rules.monitor")
+        _require_name(self.value, "flow.termination_rules.value")
+        outcome = _require_flow_outcome(self.outcome, "flow.termination_rules.outcome")
+        object.__setattr__(self, "outcome", outcome.value)
+        if not isinstance(self.code, str) or not self.code.startswith("custom."):
+            raise SpecError(
+                "flow.termination_rules.code: expected a 'custom.*' code, " f"got {self.code!r}"
+            )
+        try:
+            validate_code(self.code)
+        except (TypeError, ValueError) as exc:
+            raise SpecError(f"flow.termination_rules.code: {exc}") from exc
+
+
+@dataclass(frozen=True)
+class EventRuleSpec:
+    """One explicit value-to-event rule in a task document."""
+
+    monitor: str
+    value: str
+    name: str
+    severity: Severity = "info"
+    code: str | None = None
+    data: Mapping[str, FrozenJson] = field(default_factory=lambda: MappingProxyType({}))
+
+    def __post_init__(self) -> None:
+        """Validate the event rule fields at the document boundary."""
+        _require_name(self.monitor, "flow.events.monitor")
+        _require_name(self.value, "flow.events.value")
+        _require_name(self.name, "flow.events.name")
+        if not isinstance(self.severity, str) or self.severity not in SEVERITIES:
+            raise SpecError(
+                f"flow.events.severity: expected one of {sorted(SEVERITIES)}, "
+                f"got {self.severity!r}"
+            )
+        if self.code is not None:
+            if not isinstance(self.code, str):
+                raise SpecError(f"flow.events.code: expected a string, got {self.code!r}")
+            try:
+                validate_code(self.code)
+            except (TypeError, ValueError) as exc:
+                raise SpecError(f"flow.events.code: {exc}") from exc
+        object.__setattr__(self, "data", _validate_params(self.data, "flow.events.data"))
+
+
+@dataclass(frozen=True)
+class FlowSpec:
+    """Explicit decision rules owned by the task document."""
+
+    termination_rules: tuple[TerminationRuleSpec, ...] = ()
+    events: tuple[EventRuleSpec, ...] = ()
+
+    def __post_init__(self) -> None:
+        """Validate and freeze the flow rule tuples."""
+        rules = tuple(self.termination_rules)
+        seen: set[tuple[str, str]] = set()
+        for index, rule in enumerate(rules):
+            if not isinstance(rule, TerminationRuleSpec):
+                raise SpecError(
+                    f"flow.termination_rules[{index}]: expected a TerminationRuleSpec, "
+                    f"got {type(rule).__name__}"
+                )
+            key = (rule.monitor, rule.value)
+            if key in seen:
+                raise SpecError(
+                    "flow.termination_rules: duplicate "
+                    f"(monitor={rule.monitor!r}, value={rule.value!r}) rule; the later "
+                    "rule is dead policy"
+                )
+            seen.add(key)
+        events = tuple(self.events)
+        for index, rule in enumerate(events):
+            if not isinstance(rule, EventRuleSpec):
+                raise SpecError(
+                    f"flow.events[{index}]: expected an EventRuleSpec, "
+                    f"got {type(rule).__name__}"
+                )
+        object.__setattr__(self, "termination_rules", rules)
+        object.__setattr__(self, "events", events)
+
+
+@dataclass(frozen=True)
 class TaskSpec:
     """A validated task: monitors, report extensions and retention.
 
@@ -343,9 +455,10 @@ class TaskSpec:
     monitors: Mapping[str, MonitorSpec]
     extensions: Mapping[str, ExtensionSpec] = field(default_factory=lambda: MappingProxyType({}))
     retention: RetentionSpec = field(default_factory=RetentionSpec)
+    flow: FlowSpec = field(default_factory=FlowSpec)
 
     def __post_init__(self) -> None:
-        """Validate names, namespaces and extension references."""
+        """Validate names, namespaces, extension references and flow monitors."""
         _require_str(self.name, "task.name")
         monitors = _validate_monitor_mapping(self.monitors)
         extensions = _validate_extension_mapping(self.extensions)
@@ -355,6 +468,8 @@ class TaskSpec:
             raise SpecError(
                 "task.retention: expected a RetentionSpec, " f"got {type(self.retention).__name__}"
             )
+        if not isinstance(self.flow, FlowSpec):
+            raise SpecError(f"task.flow: expected a FlowSpec, got {type(self.flow).__name__}")
         available = sorted(extensions)
         for monitor_name, monitor in monitors.items():
             reference = monitor.report_extension
@@ -362,6 +477,19 @@ class TaskSpec:
                 raise SpecError(
                     f"task.monitors.{monitor_name}.report_extension: expected an "
                     f"existing extension name from {available}, got {reference!r}"
+                )
+        monitor_names = set(monitors)
+        for rule in self.flow.termination_rules:
+            if rule.monitor not in monitor_names:
+                raise SpecError(
+                    f"flow.termination_rules.monitor: unknown monitor {rule.monitor!r}; "
+                    f"declared monitors are {sorted(monitor_names)}"
+                )
+        for rule in self.flow.events:
+            if rule.monitor not in monitor_names:
+                raise SpecError(
+                    f"flow.events.monitor: unknown monitor {rule.monitor!r}; "
+                    f"declared monitors are {sorted(monitor_names)}"
                 )
 
 
@@ -391,7 +519,7 @@ class TaskDocument:
                 f"got {type(self.scenario).__name__}"
             )
         if self.schema is not None and self.schema != SCHEMA:
-            raise SpecError(f"task document.schema: expected {SCHEMA!r}, got {self.schema!r}")
+            raise SpecError(_schema_error(self.schema))
         if self.base_dir is not None and not isinstance(self.base_dir, Path):
             raise SpecError(
                 "task document.base_dir: expected a Path or None, "
@@ -474,7 +602,7 @@ def parse_task_document(mapping: object, base_dir: Path | str | None = None) -> 
                 f"or use {SCHEMA!r}"
             )
         if schema != SCHEMA:
-            raise SpecError(f"task document.schema: expected {SCHEMA!r}, got {schema!r}")
+            raise SpecError(_schema_error(schema))
     else:
         schema = None
     name = mapping.get("name")
@@ -490,11 +618,13 @@ def parse_task_document(mapping: object, base_dir: Path | str | None = None) -> 
     )
     retention = _parse_retention(mapping["retention"] if "retention" in mapping else _MISSING)
     scenario = _parse_scenario(mapping["scenario"] if "scenario" in mapping else _MISSING, name)
+    flow = _parse_flow(mapping["flow"] if "flow" in mapping else _MISSING, name)
     task = TaskSpec(
         name=name,
         monitors=monitors,
         extensions=extensions,
         retention=retention,
+        flow=flow,
     )
     return TaskDocument(task=task, scenario=scenario, schema=schema, base_dir=base)
 
@@ -624,6 +754,123 @@ def _parse_scenario(raw: object, task_name: str) -> ScenarioSpec | None:
             "numeric command vectors)"
         )
     return ScenarioSpec(command_pool=raw["command_pool"], plan=raw.get("plan"))
+
+
+def _parse_flow(raw: object, task_name: str) -> FlowSpec:
+    where = f"task {task_name!r}.flow"
+    if raw is _MISSING:
+        return FlowSpec()
+    if raw is None:
+        raise SpecError(
+            f"{where}: explicit null is not allowed; omit the key to declare no "
+            "automatic termination or events"
+        )
+    if not isinstance(raw, Mapping):
+        raise SpecError(f"{where}: expected a mapping, got {type(raw).__name__}")
+    _check_keys(raw, _FLOW_KEYS, where)
+    termination_rules = _parse_termination_rules(
+        raw["termination_rules"] if "termination_rules" in raw else _MISSING, where
+    )
+    events = _parse_event_rules(raw["events"] if "events" in raw else _MISSING, where)
+    return FlowSpec(termination_rules=termination_rules, events=events)
+
+
+def _parse_termination_rules(raw: object, where: str) -> tuple[TerminationRuleSpec, ...]:
+    if raw is _MISSING:
+        return ()
+    if raw is None:
+        raise SpecError(
+            f"{where}.termination_rules: explicit null is not allowed; omit the key "
+            "to declare no automatic termination"
+        )
+    if not _is_sequence(raw):
+        raise SpecError(
+            f"{where}.termination_rules: expected a list of rules, " f"got {type(raw).__name__}"
+        )
+    rules: list[TerminationRuleSpec] = []
+    for index, item in enumerate(raw):
+        item_where = f"{where}.termination_rules[{index}]"
+        if not isinstance(item, Mapping):
+            raise SpecError(f"{item_where}: expected a mapping, got {type(item).__name__}")
+        _check_keys(item, _TERMINATION_RULE_KEYS, item_where)
+        missing = sorted(_TERMINATION_RULE_KEYS - set(item))
+        if missing:
+            raise SpecError(f"{item_where}: missing required keys {missing}")
+        rules.append(
+            TerminationRuleSpec(
+                monitor=cast(str, item["monitor"]),
+                value=cast(str, item["value"]),
+                outcome=cast(str, item["outcome"]),
+                code=cast(str, item["code"]),
+            )
+        )
+    return tuple(rules)
+
+
+def _parse_event_rules(raw: object, where: str) -> tuple[EventRuleSpec, ...]:
+    if raw is _MISSING:
+        return ()
+    if raw is None:
+        raise SpecError(
+            f"{where}.events: explicit null is not allowed; omit the key to declare "
+            "no automatic events"
+        )
+    if not _is_sequence(raw):
+        raise SpecError(f"{where}.events: expected a list of rules, got {type(raw).__name__}")
+    rules: list[EventRuleSpec] = []
+    for index, item in enumerate(raw):
+        item_where = f"{where}.events[{index}]"
+        if not isinstance(item, Mapping):
+            raise SpecError(f"{item_where}: expected a mapping, got {type(item).__name__}")
+        _check_keys(item, _EVENT_RULE_KEYS, item_where)
+        for required in ("monitor", "value", "name"):
+            if required not in item:
+                raise SpecError(f"{item_where}: missing required key {required!r}")
+        data = item.get("data", MappingProxyType({}))
+        rules.append(
+            EventRuleSpec(
+                monitor=cast(str, item["monitor"]),
+                value=cast(str, item["value"]),
+                name=cast(str, item["name"]),
+                severity=cast(Severity, item.get("severity", "info")),
+                code=cast(str | None, item.get("code")),
+                data=cast(Mapping[str, object], data),
+            )
+        )
+    return tuple(rules)
+
+
+def _require_flow_outcome(value: object, where: str) -> EpisodeOutcome:
+    if isinstance(value, EpisodeOutcome):
+        outcome = value
+    elif isinstance(value, str):
+        try:
+            outcome = EpisodeOutcome(value)
+        except ValueError as exc:
+            raise SpecError(
+                f"{where}: unknown episode outcome {value!r}; "
+                f"allowed: {sorted(item.value for item in _MONITOR_OUTCOMES)}"
+            ) from exc
+    else:
+        raise SpecError(f"{where}: expected an EpisodeOutcome or str, got {value!r}")
+    if outcome not in _MONITOR_OUTCOMES:
+        raise SpecError(
+            f"{where}: {outcome.value!r} is not a flow-owned terminal outcome; "
+            f"allowed: {sorted(item.value for item in _MONITOR_OUTCOMES)}"
+        )
+    return outcome
+
+
+def _schema_error(schema: object) -> str:
+    if schema in _RETIRED_SCHEMAS:
+        return (
+            f"task document.schema: {schema!r} is retired; migrate to {SCHEMA!r}. "
+            "Monitor 'emit' now accepts only 'value' (monitors publish values only); "
+            "move event/terminal output to flow.termination_rules / flow.events. "
+            "Monitor snapshots are unigym_bench.monitor/4 and rewind payloads are "
+            "unigym_bench.rewind/5; old checkpoints are rejected."
+        )
+    return f"task document.schema: expected {SCHEMA!r}, got {schema!r}"
 
 
 def _resolve_resources(raw: object, where: str, base_dir: Path | None) -> Mapping[str, Path]:

@@ -27,12 +27,11 @@ transport:
   episode-end evaluation, publishes monitor values as `<monitor>/<local>` and
   never uses a raw signal publisher;
 - `PredicateMonitor.on_episode_end` evaluates final-context `episode_end`
-  predicates; their events are recorded in the ending episode and their
-  report/scoring terminals are counted in the aggregate/report without a
-  runner drain or latch conflict;
+  predicates and refreshes their observed values only; monitors produce no
+  events and no terminals;
 - `ScenarioSampler.bind_values(ValueView)` replaces `bind_signals`;
-- the pack rewind schema is `unigym_bench.rewind/4` and monitor snapshots are
-  `unigym_bench.monitor/3`; older payloads are rejected explicitly.
+- the pack rewind schema is `unigym_bench.rewind/5` and monitor snapshots are
+  `unigym_bench.monitor/4`; older payloads are rejected explicitly.
 
 P14 collapses the typed built-in monitors. `ThresholdMonitor`, `HoldMonitor`,
 `SafetyMonitor` and `EventCounterMonitor` are now `PredicateMonitor`
@@ -44,11 +43,13 @@ stateful `ScenarioCoverageExtension` in `report.py`, fed by finalized
 `EpisodeRecord.command_at_start` values instead of a tick monitor.
 
 P16 adds the task-document composition layer in `unigym_bench.compose`. The
-schema is now `unigym_extbench/2`; an explicit `/1` is rejected with no
-dual-schema shim. A monitor declares either `builtin: predicate` with
-`when`/`trigger`/`emit`, `builtin: phase` with `source` and boundary params, or
-a `module`/API `factory`. Predicate fields are closed and rejected on
-declarations that do not consume them. Source references use the P12
+schema is now `unigym_extbench/3`; the retired `/1` and `/2` forms are rejected
+with a migration error and no dual-schema shim. A monitor declares either
+`builtin: predicate` with `when`/`trigger`/`emit` (emit is a value name only),
+`builtin: phase` with `source` and boundary params, or a `module`/API
+`factory`. Predicate fields are closed and rejected on declarations that do not
+consume them. The optional `flow` section owns explicit
+`termination_rules`/`events`; monitors publish values only. Source references use the P12
 `record:`/`obs:`/`value:`/`query:` grammar, and a `query:` source fails at
 composition with `SourceUnavailableError`. Trigger and emit specs parse through
 the P13 `TriggerSpec`/`EmitSpec`, so `level` and reserved temporal operators are
@@ -56,7 +57,7 @@ rejected. Extensions close over `scenario_coverage`, which reads the document
 scenario command pool. A declared scenario auto-composes a coverage extension
 named `scenario_coverage` unless the document already declares one; a name
 collision is a teaching error. `compose_task(document)` returns a frozen
-`TaskPlan(monitors, extensions, retention, scenario, monitor_extensions)`, and
+`TaskPlan(monitors, extensions, retention, scenario, monitor_extensions, flow)`, and
 `make_sink` accepts a JSON-safe `task_document` path option that runs this
 composition instead of the factory path. The package contains the P0-P16
 implementation tree, first finalized as the `0.2.0` release and carried forward
@@ -116,7 +117,7 @@ range, report schema and lifecycle contracts.
 
 `unigym-bench 0.2.0` is a breaking release with no compatibility shims. It
 requires core `unigym>=0.107,<0.108` (C13) and pack-local core surface revision
-`3`. The release keeps the report schema `external_benchmark_report/1`; the
+`3`. The release keeps the report schema `external_benchmark_report/2`; the
 public pack seams below are new, removed or changed.
 
 Removed from the pack:
@@ -136,17 +137,19 @@ Removed from the pack:
 
 Changed contracts:
 
-- Task documents use `unigym_extbench/2`; an explicit `/1` is rejected and
-  there is no dual-schema shim. `make_sink` accepts a `task_document` path and
-  composes it with `compose_task`.
+- Task documents use `unigym_extbench/3`; the retired `/1` and `/2` forms are
+  rejected with a migration error and there is no dual-schema shim. Monitors
+  publish values only; the `flow` section owns `termination_rules` and `events`.
+  `make_sink` accepts a `task_document` path and composes it with
+  `compose_task`.
 - Source references use the `record:`/`obs:`/`value:`/`query:` grammar. A
   `query:` source fails at composition with `SourceUnavailableError`.
 - Episode-end evaluation uses the final step context (`bundle["final_step"]`
-  and `on_episode_end(env_ids, final_context)`). Episode-end report/scoring
-  terminals drain through the separate monitor face, not the runner drain.
-- The pack rewind schema is `unigym_bench.rewind/4` and monitor snapshots are
-  `unigym_bench.monitor/3`; older payloads are rejected explicitly.
-- The report schema remains `external_benchmark_report/1`. `PredicateMonitor`
+  and `on_episode_end(env_ids, final_context)`) and refreshes observed values
+  only; it produces no event or terminal.
+- The pack rewind schema is `unigym_bench.rewind/5` and monitor snapshots are
+  `unigym_bench.monitor/4`; older payloads are rejected explicitly.
+- The report schema remains `external_benchmark_report/2`. `PredicateMonitor`
   blocks are predicate-shaped (`kind: predicate`, `condition`, `trigger`,
   `emit`, `fired`, `fired_counts`); `PhaseMonitor` blocks keep `kind: phase`,
   and `module`/API factory monitors contribute their own `report_view`. For
@@ -171,20 +174,22 @@ that declares an extension is emitted only through that extension's
 `unigym_bench` rewind provider restores its accumulator. The pack never writes
 the core `benchmark_report.json` or `results.json`.
 
-## Benchmark flow (F2 bridge)
+## Benchmark flow
 
-`BenchmarkSink(flow=...)` now composes a `unigym_bench.flow.BenchmarkFlow`
-beside the engine. The stable seam is:
+`BenchmarkSink(flow=...)` composes a `unigym_bench.flow.BenchmarkFlow` beside
+the engine. Monitors are observation-only; the flow is the only event/terminal
+decision owner for ticks. The stable seam is:
 
 - `BenchmarkFlow`: `name`, `stateful`, optional `on_tick(tick)`, required
   `on_episode_end(batch)` and `on_run_end(run)`;
-- `BenchmarkTick`: the tick's step context, monitor values and (for this card)
-  the current monitor event/terminal outputs;
-- `FlowDecision`: events, terminal requests and a run-stop flag;
-- `EpisodeBatch`: the due ids, final step context and final monitor values;
+- `BenchmarkTick`: the tick's step context and per-monitor observed values;
+- `FlowDecision`: flow-authored events, per-env terminations and a run-stop
+  flag;
+- `EpisodeBatch`: the due ids, final step context and final observed values;
 - `FlowRun`: metadata, run summary, retained records, monitor views and the
   report-extension set;
-- `DefaultBenchmarkFlow`: the stateless default that reproduces today's report.
+- `DefaultBenchmarkFlow`: the stateless default that applies explicit
+  `TerminationRule`/`EventRule` declarations and assembles the report.
 
 The engine remains the validation, latch, journal, record and rewind owner.
 The sink drives `begin_tick -> flow.on_tick -> apply_decision` and
@@ -193,27 +198,45 @@ validates every decision before it mutates run state. A flow without `on_tick`
 is valid and applies no tick policy. A `stateful=True` flow is rejected until
 the rewind card adds flow snapshots.
 
-F2 is a temporary bridge, not the final ownership model. Monitors still drain
-events and terminals, and `DefaultBenchmarkFlow` forwards them unchanged so
-existing behavior (including terminal-conflict counts) is identical. The
-monitor output fields and this bridge are removed by F3; the report schema
-stays `external_benchmark_report/2` and no evidence or `FlowSequence` exists
-yet. `FlowRun` carries monitor report views plus the declaration-order names,
-never live monitor objects, so the default flow builds the report without
-touching monitor internals.
+`DefaultBenchmarkFlow` semantics are intentionally small:
 
-The F2 stop flag is transient. A successful rewind restore, and the core
+- a `TerminationRule(monitor, value, outcome, code)` reads a per-env boolean
+  value; rules are evaluated in declaration order and the first true rule per
+  env wins;
+- duplicate `(monitor, value)` rules are rejected; there is no hidden
+  "monitor active => terminal" fallback and no flow-level trigger (the monitor
+  trigger is the only cadence owner);
+- an `EventRule(monitor, value, name, ...)` consumes the same boolean value;
+  event code defaults to `task.<monitor>.<name>`;
+- empty rules mean no automatic termination and no automatic events.
+
+The stop flag is transient. A successful rewind restore, and the core
 `on_rewind` notification, clear it so a forked branch never inherits a stop
 from the abandoned timeline. Stop persistence is deferred to the flow-rewind
 card; the report schema is unchanged.
 
 Flow callback exceptions are fail-fast with no rollback. `begin_tick` advances
-the episode tick counters and drains monitor outputs before `flow.on_tick`, and
-`begin_episode_end` drains final queues before `flow.on_episode_end`. If a flow
-callback raises, the sink discards the pending tick/boundary and closes its
-query snapshot, but it does not restore monitor queues, tick counters or
-already-observed outputs. The exception propagates and the run must abort; it
-must not silently continue on partially observed state.
+the episode tick counters and reads monitor values before `flow.on_tick`, and
+`begin_episode_end` refreshes final monitor values before
+`flow.on_episode_end`. If a flow callback raises, the sink discards the pending
+tick/boundary and closes its query snapshot, but it does not restore tick
+counters or already-observed values. The exception propagates and the run must
+abort; it must not silently continue on partially observed state.
+
+### F3 report and episode-end semantics
+
+The report schema stays `external_benchmark_report/2` in F3. Because monitors
+no longer produce terminal/event metadata, monitor report blocks no longer carry
+`terminal_reason`, `terminal_outcome` or event severity/content even though the
+top-level schema id is unchanged. The `/3` report shape, evidence and flow-owned
+report selection are F4 work. Consumers that inspect monitor blocks must treat
+the F3 payload as changed content under a stable `/2` id until F4.
+
+Episode-end monitor terminals are gone, not silently reinterpreted. A monitor's
+`episode_end` trigger now only refreshes its observed value for due rows; it
+never schedules a report/scoring terminal. Any termination policy must be an
+explicit flow `TerminationRule` evaluated on a tick value. A document without
+`flow` therefore has no automatic termination and no automatic events.
 
 ## Authoring a run
 
@@ -331,23 +354,23 @@ memory only in this revision: no event log file is written.
 
 ## Monitors
 
-`unigym_bench.monitors.Monitor` is the stateful per-env contract. A monitor
-observes a `BenchmarkStepContext` (a core `EnvStepContext` subclass), returns
-per-env level values, drains one-shot `Event` occurrences and runner
-`Termination` requests, and observes the due env ids plus the final step
-context through `on_episode_end(env_ids, final_context)`. Episode-end
-report/scoring terminals are drained through the separate optional
-`drain_episode_terminals()` face, never through the runner drain. A monitor
-clears per-env measurement state through `reset` and contributes a JSON-safe
-`report_view`. Stateful monitors implement the optional
-`RewindableMonitor.snapshot()/restore()` capability with JSON-safe private
-copies; a snapshot carries a construction/config fingerprint and `restore`
-rejects a monitor with a different configuration.
+`unigym_bench.monitors.Monitor` is the stateful per-env observation contract.
+A monitor observes a `BenchmarkStepContext` (a core `EnvStepContext`
+subclass), returns per-env level values through `values()`, and observes the
+due env ids plus the final step context through
+`on_episode_end(env_ids, final_context)`. It produces no events and no
+terminals; `DefaultBenchmarkFlow` applies explicit `TerminationRule` and
+`EventRule` declarations to the observed values. A monitor clears per-env
+measurement state through `reset` and contributes a JSON-safe `report_view`.
+Stateful monitors implement the optional `RewindableMonitor.snapshot()/restore()`
+capability with JSON-safe private copies; a snapshot carries a
+construction/config fingerprint and `restore` rejects a monitor with a
+different configuration.
 
 `BaseMonitor` is a convenience class with empty values and no-op lifecycle.
 `PredicateMonitor` is the compositional monitor: one condition tree, one
 `TriggerSpec` (`tick`, `edge`, `hold`, `once`, `episode_end`) and one
-`EmitSpec` (local value name, optional event/severity and optional terminal).
+`EmitSpec` (local value name only).
 Each condition reads explicit `SourceRef` values (`record:`, `obs:`, `value:`;
 `query:` is rejected in v1) through `SourceResolver`; there is no `Probe`
 callable and no fallback lookup.
@@ -371,11 +394,16 @@ from unigym_bench.monitors import (
     event_counter_config, hold_config, safety_config, threshold_config,
 )
 
-contact = threshold_config("contact", "value:force", threshold=5.0,
-                           terminal_outcome="failure")
+contact = threshold_config("contact", "value:force", threshold=5.0)
 settled = hold_config("settled", "value:error", threshold=0.05, hold_steps=10)
-danger = safety_config("danger", "value:tilt", threshold=0.6, severity="fatal")
+danger = safety_config("danger", "value:tilt", threshold=0.6)
 bounces = event_counter_config("bounces", "value:contact")
+
+from unigym_bench.flow import DefaultBenchmarkFlow, TerminationRule
+
+flow = DefaultBenchmarkFlow(
+    [TerminationRule("contact", "threshold_reached", "failure", "custom.contact.threshold")]
+)
 ```
 
 `PhaseMonitor(name, source, boundaries=..., phase_names=...)` remains a
@@ -404,19 +432,18 @@ no predicate equivalent, the table names the replacement and the reason.
 | `trigger_events`, `holds`, `violation_events`, `occurrences` | `fired` | One count per fired environment row. |
 | per-env trigger counters | `fired_counts` | Same per-env edge/hold counts. |
 | `episodes` | `episodes` | Unchanged. |
-| `terminal_outcome` | `terminal_outcome` | Unchanged; the terminal code keeps `custom.<monitor>.<reason>`. |
-| `severity` | `severity` | Event severity for threshold/hold/safety; report metadata for the event counter. |
+| `terminal_outcome` | flow rule `outcome` | A monitor value never terminates; an explicit flow `TerminationRule` supplies the outcome and `custom.*` code. |
+| `severity` | flow event rule | Event severity belongs to a flow `EventRule`, not a monitor. |
 | `active_ticks`, `violation_ticks`, `max_streak` | (none) | A `PredicateMonitor` publishes the trigger mask, not a continuous level, so these watchers have no equivalent. |
 | signal `level` | (none) | Only the configured emit value is published (`<monitor>/<value>`). |
 | signal `active` / `violating` / `holding` / `count` | emit value | The published bit is the trigger firing mask, not the continuous condition or cumulative counter. |
-| event data `value`, `threshold`, `operator`, `hold_steps` | generic trigger data | Events carry only `{"trigger": <kind>}` plus `steps` for a hold trigger. The old monitor-specific data fields are not preserved. |
-| terminal metrics `value`, `threshold`, `hold_steps` | empty `metrics` | Predicate terminals have `metrics: {}`; outcome, code, source and first-terminal behavior are preserved. |
+| event data `value`, `threshold`, `operator`, `hold_steps` | flow event `data` | Events are declared by the flow; a rule may supply a static JSON-safe payload. |
+| terminal metrics `value`, `threshold`, `hold_steps` | empty `metrics` | Flow terminals have `metrics: {}`; outcome, code, source and first-terminal behavior are preserved. |
 | scenario coverage fields | `extensions/<name>` | `ScenarioCoverageExtension` returns the original `pool_size`, `covered`, `coverage_ratio`, `episode_counts`, `unmatched_episodes` and `episodes` facts. |
 
-Event grouping also differs: `PredicateMonitor` emits one event per firing tick
-with the fired env ids grouped, while the retired typed monitors emitted one
-event per env. Per-episode `event_counts` and the firing counts above remain
-per env; `execution.event_total` counts grouped occurrences.
+Event grouping is flow-owned: an `EventRule` emits one event per tick with the
+true env ids grouped. Per-episode `event_counts` and the firing counts above
+remain per env; `execution.event_total` counts grouped occurrences.
 
 Event and terminal payload parity is therefore limited. Event names, codes,
 severity and env ids are preserved, but event `data` is the generic trigger
@@ -476,14 +503,14 @@ explicit `null` for a document object field (`schema`, `retention`, `scenario`,
 `extensions`, `resources`) or a predicate field (`when`, `trigger`, `emit`,
 `source`) is a configuration error; omit the key to apply the documented
 default. `schema` may be omitted for authoring; omission means the current
-`unigym_extbench/2`, and an explicit `unigym_extbench/1` is rejected. Relative
-resource paths resolve against the task document directory, never the process
-working directory.
+`unigym_extbench/3`, and the retired `unigym_extbench/1`/`/2` forms are rejected
+with a migration error. Relative resource paths resolve against the task
+document directory, never the process working directory.
 
-### Schema `/2` monitor forms
+### Schema `/3` monitor and flow forms
 
 ```yaml
-schema: unigym_extbench/2
+schema: unigym_extbench/3
 name: reach
 monitors:
   contact:
@@ -493,7 +520,7 @@ monitors:
       op: gte
       value: 0.5
     trigger: {kind: hold, steps: 3}
-    emit: {event: contact, severity: warning}
+    emit: {value: contact}
     report_extension: contact_report
   height_phase:
     builtin: phase
@@ -501,6 +528,17 @@ monitors:
     params:
       boundaries: [0.0, 1.0]
       phase_names: [low, mid, high]
+flow:
+  termination_rules:
+    - monitor: contact
+      value: contact
+      outcome: failure
+      code: custom.contact.threshold
+  events:
+    - monitor: contact
+      value: contact
+      name: contact
+      severity: warning
 extensions:
   contact_report:
     builtin: scenario_coverage

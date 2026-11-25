@@ -17,7 +17,8 @@ from unigym.core.identity import RobotIdentity, RunIdentity
 from unigym.errors import ConfigError
 
 from unigym_bench.engine import StreamingEngine
-from unigym_bench.events import EpisodeRecord, EpisodeSummary, Event
+from unigym_bench.events import EpisodeRecord, EpisodeSummary
+from unigym_bench.flow import DefaultBenchmarkFlow, EventRule, TerminationRule
 from unigym_bench.json import ensure_json_value
 from unigym_bench.monitors import BaseMonitor, PredicateMonitor
 from unigym_bench.report import (
@@ -99,13 +100,14 @@ def _sink(
     *,
     extensions: list[object] | None = None,
     retention: RetentionSpec | None = None,
+    flow: DefaultBenchmarkFlow | None = None,
 ) -> tuple[BenchmarkSink, StreamingEngine]:
     engine = StreamingEngine(
         monitors,
         retention=RetentionSpec() if retention is None else retention,
         extensions=() if extensions is None else extensions,  # type: ignore[arg-type]
     )
-    return BenchmarkSink(engine=engine, metadata=_metadata()), engine
+    return BenchmarkSink(engine=engine, metadata=_metadata(), flow=flow), engine
 
 
 def test_base_fallback_and_extension_blocks_assemble_the_fixed_layout() -> None:
@@ -273,10 +275,9 @@ def test_incomplete_and_rewound_episodes_are_counted_and_filtered() -> None:
 
 
 def test_default_retention_terminal_episode_uses_run_counters() -> None:
-    monitor = ScriptedMonitor(
-        "hit", {0: TickScript(terminals={0: make_termination("custom.hit.one")})}
-    )
-    sink, engine = _sink([monitor])
+    monitor = ScriptedMonitor("hit", {0: TickScript(values={"fired": torch.tensor([True])})})
+    flow = DefaultBenchmarkFlow((TerminationRule("hit", "fired", "success", "custom.hit.one"),))
+    sink, engine = _sink([monitor], flow=flow)
     bundle = make_bundle(num_envs=1, t=0)
 
     sink.on_step(0, bundle)
@@ -340,9 +341,14 @@ def test_default_retention_core_episode_counts_terminations() -> None:
 
 def test_default_retention_rewound_episode_is_counted_without_records() -> None:
     monitor = ScriptedMonitor(
-        "hit", {0: TickScript(terminals={0: make_termination("custom.hit.one")})}
+        "hit",
+        {
+            0: TickScript(values={"fired": torch.tensor([True])}),
+            1: TickScript(values={"fired": torch.tensor([False])}),
+        },
     )
-    sink, engine = _sink([monitor])
+    flow = DefaultBenchmarkFlow((TerminationRule("hit", "fired", "success", "custom.hit.one"),))
+    sink, engine = _sink([monitor], flow=flow)
     first = make_bundle(num_envs=1, t=0)
 
     sink.on_step(0, first)
@@ -370,31 +376,38 @@ def test_default_retention_rewound_episode_is_counted_without_records() -> None:
 
 
 def test_default_retention_reports_event_cap_and_terminal_conflicts() -> None:
-    first = ScriptedMonitor(
+    monitor = ScriptedMonitor(
         "a",
         {
-            0: TickScript(
-                events=(Event(name="hit", code="task.a.hit", env_ids=(0,)),),
-                terminals={0: make_termination("custom.a.hit")},
-            )
+            0: TickScript(values={"fired": torch.tensor([True])}),
+            1: TickScript(values={"fired": torch.tensor([True])}),
         },
     )
-    second = ScriptedMonitor("b", {0: TickScript(terminals={0: make_termination("custom.b.hit")})})
-    sink, engine = _sink([first, second], retention=RetentionSpec(max_events=0))
+    flow = DefaultBenchmarkFlow(
+        (TerminationRule("a", "fired", "success", "custom.a.hit"),),
+        events=(EventRule("a", "fired", "hit", code="task.a.hit"),),
+    )
+    sink, engine = _sink(
+        [monitor],
+        retention=RetentionSpec(max_events=0),
+        flow=flow,
+    )
     bundle = make_bundle(num_envs=1, t=0)
 
     sink.on_step(0, bundle)
     assert set(sink.drain_terminations()) == {0}
+    sink.on_step(1, make_bundle(num_envs=1, t=1))
+    assert sink.drain_terminations() == {}
     sink.on_episode_end([0], bundle)
     report = sink.on_run_end()["BenchmarkSink"]
 
     assert engine.records == ()
     assert engine.journal == ()
-    assert engine.dropped_events == 1
+    assert engine.dropped_events == 2
     assert engine.conflict_count == 1
     assert report["execution"] == {
-        "event_total": 1,
-        "dropped_events": 1,
+        "event_total": 2,
+        "dropped_events": 2,
         "terminal_conflicts": 1,
         "retention": {
             "retain_episodes": False,
@@ -502,15 +515,18 @@ def test_stateful_extension_state_round_trips_through_the_rewind_provider() -> N
     monitor = ScriptedMonitor(
         "hit",
         {
-            1: TickScript(terminals={0: make_termination("custom.hit.one")}),
-            2: TickScript(terminals={0: make_termination("custom.hit.two")}),
+            0: TickScript(values={"fired": torch.tensor([False])}),
+            1: TickScript(values={"fired": torch.tensor([True])}),
+            2: TickScript(values={"fired": torch.tensor([True])}),
         },
     )
+    flow = DefaultBenchmarkFlow((TerminationRule("hit", "fired", "success", "custom.hit.one"),))
     extension = CountingReportExtension()
     sink, engine = _sink(
         [monitor],
         extensions=[extension],
         retention=RetentionSpec(retain_episodes=True),
+        flow=flow,
     )
 
     sink.on_step(0, make_bundle(num_envs=1, t=0))
@@ -555,7 +571,7 @@ def test_scenario_coverage_extension_uses_record_start_commands_and_rewinds() ->
     extension = ScenarioCoverageExtension("coverage", commands=[[0.0], [1.0]])
     monitor = ScriptedMonitor(
         "hit",
-        {0: TickScript(terminals={0: make_termination("custom.hit.one")})},
+        {0: TickScript(values={"fired": torch.tensor([True, False])})},
     )
     sink, engine = _sink(
         [monitor],
@@ -611,14 +627,17 @@ def test_scenario_coverage_extension_uses_record_start_commands_and_rewinds() ->
 def test_rewind_rejects_missing_extension_state_on_a_plain_engine() -> None:
     source_monitor = ScriptedMonitor(
         "hit",
-        {0: TickScript(terminals={0: make_termination("custom.hit.one")})},
+        {0: TickScript(values={"fired": torch.tensor([True])})},
+    )
+    source_flow = DefaultBenchmarkFlow(
+        (TerminationRule("hit", "fired", "success", "custom.hit.one"),)
     )
     source = StreamingEngine(
         [source_monitor],
         retention=RetentionSpec(retain_episodes=True),
         extensions=[CountingReportExtension()],
     )
-    source_sink = BenchmarkSink(engine=source, metadata=_metadata())
+    source_sink = BenchmarkSink(engine=source, metadata=_metadata(), flow=source_flow)
     bundle = make_bundle(num_envs=1, t=0)
     source_sink.on_step(0, bundle)
     source_sink.drain_terminations()
@@ -722,14 +741,16 @@ def test_on_run_end_is_idempotent_and_calls_extensions_once() -> None:
 def test_on_env_end_receives_only_due_envs_and_frozen_records() -> None:
     monitor = ScriptedMonitor(
         "hit",
-        {0: TickScript(terminals={1: make_termination("custom.hit.one")})},
+        {0: TickScript(values={"fired": torch.tensor([False, True])})},
     )
+    flow = DefaultBenchmarkFlow((TerminationRule("hit", "fired", "success", "custom.hit.one"),))
     calls: list[tuple[tuple[int, ...], object]] = []
     capture = CaptureReportExtension(calls)
     sink, _ = _sink(
         [monitor],
         extensions=[capture],
         retention=RetentionSpec(retain_episodes=True),
+        flow=flow,
     )
     bundle = make_bundle(num_envs=2, t=0)
 
@@ -760,12 +781,11 @@ def test_on_run_end_writes_no_core_report_artifact(tmp_path: Path) -> None:
     assert not (tmp_path / "results.json").exists()
 
 
-def test_final_episode_end_terminal_is_counted_in_the_report() -> None:
+def test_final_episode_value_is_not_counted_as_a_termination() -> None:
     monitor = PredicateMonitor(
         "end_pred",
         {"source": "value:flag", "op": "gt", "value": 0.0},
         "episode_end",
-        {"terminal_reason": "score", "terminal_outcome": "success"},
     )
     sink, engine = _sink([monitor])
     bundle = make_bundle(
@@ -781,10 +801,11 @@ def test_final_episode_end_terminal_is_counted_in_the_report() -> None:
 
     assert isinstance(report, dict)
     assert report["terminations"] == {
-        "total": 1,
-        "outcome": {"success": 1},
-        "code": {"custom.end_pred.score": 1},
-        "source": {"custom": 1},
+        "total": 0,
+        "outcome": {},
+        "code": {},
+        "source": {},
     }
     assert report["execution"]["terminal_conflicts"] == 0
     assert engine.drain_terminations() == {}
+    assert monitor.report_view()["episode_end_fired"] == 1

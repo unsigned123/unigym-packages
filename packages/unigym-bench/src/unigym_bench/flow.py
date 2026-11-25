@@ -1,4 +1,4 @@
-"""The stable benchmark-flow seam and its F2 default implementation.
+"""The stable benchmark-flow seam and its default implementation.
 
 A :class:`BenchmarkFlow` owns benchmark policy: it reads one immutable
 :class:`BenchmarkTick`, decides which events and terminals apply, observes
@@ -6,27 +6,36 @@ episode boundaries and returns the pack report at run end.  The flow never
 mutates the engine, a monitor or an environment; the sink and engine validate
 every decision before changing run state.
 
-F2 is a temporary bridge.  Monitors still own their event/terminal queues, so
-:class:`DefaultBenchmarkFlow` reads the monitor outputs carried by the tick and
-forwards them unchanged.  F3 removes that monitor output bridge and makes the
-flow the only event/terminal decision owner.  This module deliberately imports
-only pack-side context/event/report modules and the core termination type; a
-custom flow must be able to depend on these types without importing the engine,
-the sink or composition code.
+Monitors publish values only.  :class:`DefaultBenchmarkFlow` applies explicit
+:class:`TerminationRule` declarations to those values (first true rule per env
+wins) and optional :class:`EventRule` declarations.  There is no hidden
+``monitor active => terminal`` fallback and no flow-level trigger: the monitor
+trigger is the only cadence owner.  Empty rules mean no automatic termination.
+
+This module deliberately imports only pack-side context/event/report modules and
+the core termination type; a custom flow must be able to depend on these types
+without importing the engine, the sink or composition code.
 """
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Protocol, cast, runtime_checkable
 
+import torch
 from torch import Tensor
-from unigym.core.episode_termination import Termination
+from unigym.core.episode_termination import (
+    EpisodeOutcome,
+    Termination,
+    TerminationSource,
+    validate_code,
+)
 
 from .context import BenchmarkStepContext
-from .events import Event, EpisodeRecord, EpisodeSummary
+from .events import SEVERITIES, Event, EpisodeRecord, EpisodeSummary, Severity
 from .json import JsonValue, ensure_json_value
 from .query import TickQuery
 from .report import ReportBuilder, ReportExtension, RunMetadata, RunSummary
@@ -37,31 +46,30 @@ __all__ = [
     "BenchmarkTick",
     "DefaultBenchmarkFlow",
     "EpisodeBatch",
+    "EventRule",
     "FlowDecision",
     "FlowRun",
+    "TerminationRule",
     "validate_flow",
 ]
+
+_MONITOR_OUTCOMES: frozenset[EpisodeOutcome] = frozenset(
+    {EpisodeOutcome.SUCCESS, EpisodeOutcome.FAILURE, EpisodeOutcome.DEADLINE}
+)
+_RULE_NAME_PATTERN = re.compile(r"[a-z][a-z0-9_]*")
 
 
 @dataclass(frozen=True, slots=True)
 class _MonitorTickOutput:
     """One monitor's immutable contribution to a benchmark tick.
 
-    F2 carries the current monitor event/terminal queues here so the default
-    flow can forward them unchanged.  F3 deletes the ``events``/``terminations``
-    fields and leaves only observed values.
-
     Attributes:
         monitor: The monitor name.
         values: Fresh per-env value tensors keyed by local value name.
-        events: Occurrences drained from the monitor for this tick.
-        terminations: Per-env terminal requests drained from the monitor.
     """
 
     monitor: str
     values: Mapping[str, Tensor] = field(default_factory=dict)
-    events: tuple[Event, ...] = ()
-    terminations: Mapping[int, Termination] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         """Validate and copy one monitor contribution."""
@@ -88,44 +96,6 @@ class _MonitorTickOutput:
             values[name] = value
         object.__setattr__(self, "values", MappingProxyType(values))
 
-        raw_events = self.events
-        if isinstance(raw_events, (str, bytes, bytearray)) or not isinstance(raw_events, Sequence):
-            raise TypeError(
-                "monitor tick output.events: expected a sequence of Event, "
-                f"got {type(raw_events).__name__}"
-            )
-        events = tuple(raw_events)
-        for index, event in enumerate(events):
-            if not isinstance(event, Event):
-                raise TypeError(
-                    f"monitor tick output.events[{index}]: expected an Event, "
-                    f"got {type(event).__name__}"
-                )
-        object.__setattr__(self, "events", events)
-
-        if not isinstance(self.terminations, Mapping):
-            raise TypeError(
-                "monitor tick output.terminations: expected a mapping, "
-                f"got {type(self.terminations).__name__}"
-            )
-        terminations: dict[int, Termination] = {}
-        for env_id, termination in self.terminations.items():
-            if isinstance(env_id, bool) or not isinstance(env_id, int):
-                raise TypeError(
-                    "monitor tick output.terminations: keys must be int env ids, " f"got {env_id!r}"
-                )
-            if env_id < 0:
-                raise ValueError(
-                    f"monitor tick output.terminations: env id must be >= 0, got {env_id}"
-                )
-            if not isinstance(termination, Termination):
-                raise TypeError(
-                    f"monitor tick output.terminations[{env_id}]: expected a "
-                    f"Termination, got {type(termination).__name__}"
-                )
-            terminations[env_id] = termination
-        object.__setattr__(self, "terminations", MappingProxyType(terminations))
-
 
 @dataclass(frozen=True, slots=True)
 class BenchmarkTick:
@@ -134,7 +104,7 @@ class BenchmarkTick:
     Attributes:
         step: The pack step context for this tick.  Its borrowed view is valid
             only for the callback boundary.
-        monitor_outputs: Per-monitor values and (F2 only) event/terminal queues.
+        monitor_outputs: Per-monitor observed values.
     """
 
     step: BenchmarkStepContext
@@ -168,11 +138,6 @@ class BenchmarkTick:
         return self.step.query
 
     @property
-    def monitor_events(self) -> tuple[Event, ...]:
-        """Every monitor event in declaration order (F2 bridge)."""
-        return tuple(event for output in self.monitor_outputs for event in output.events)
-
-    @property
     def monitor_values(self) -> Mapping[str, Mapping[str, Tensor]]:
         """Per-monitor value mappings keyed by monitor name."""
         return MappingProxyType({output.monitor: output.values for output in self.monitor_outputs})
@@ -184,19 +149,14 @@ class FlowDecision:
 
     Attributes:
         events: Occurrences the flow wants journaled for this tick.
-        terminations: Per-env terminal requests.  The public mapping view holds
-            one request per env; F2's monitor bridge also preserves the ordered
-            request list so terminal conflicts remain identical to the current
-            engine behavior.
+        terminations: Per-env terminal requests.  The mapping holds at most one
+            request per env; the engine validates and latches the first one.
         stop: Request the run to stop after the current tick.
     """
 
     events: tuple[Event, ...] = ()
     terminations: Mapping[int, Termination] = field(default_factory=lambda: MappingProxyType({}))
     stop: bool = False
-    _terminal_requests: tuple[tuple[int, Termination], ...] = field(
-        default=(), repr=False, compare=False
-    )
 
     def __post_init__(self) -> None:
         """Validate and freeze the decision."""
@@ -226,60 +186,8 @@ class FlowDecision:
             terminations[env_id] = termination
         object.__setattr__(self, "terminations", MappingProxyType(terminations))
 
-        requests = tuple(self._terminal_requests)
-        if requests:
-            checked_requests: list[tuple[int, Termination]] = []
-            for index, request in enumerate(requests):
-                if not isinstance(request, tuple) or len(request) != 2:
-                    raise TypeError(
-                        "flow decision terminal requests: expected (env_id, "
-                        f"Termination) pairs, got {request!r} at index {index}"
-                    )
-                env_id, termination = request
-                _validate_terminal_request(env_id, termination, "flow decision terminal requests")
-                checked_requests.append((env_id, termination))
-            object.__setattr__(self, "_terminal_requests", tuple(checked_requests))
-        elif terminations:
-            object.__setattr__(self, "_terminal_requests", tuple(terminations.items()))
-
         if not isinstance(self.stop, bool):
             raise TypeError(f"flow decision.stop: expected a bool, got {self.stop!r}")
-
-    @classmethod
-    def from_requests(
-        cls,
-        *,
-        events: Sequence[Event] = (),
-        requests: Sequence[tuple[int, Termination]] = (),
-        stop: bool = False,
-    ) -> FlowDecision:
-        """Build a decision from an ordered terminal request sequence.
-
-        A plain mapping cannot represent two monitors requesting a terminal for
-        the same env; the ordered form is what preserves conflict accounting in
-        the F2 monitor bridge.
-
-        Args:
-            events: Occurrences to journal.
-            requests: Ordered ``(env_id, Termination)`` pairs.
-            stop: Whether to request a run stop after this tick.
-
-        Returns:
-            A validated decision with the ordered request list retained.
-        """
-        pairs = tuple(requests)
-        terminations = MappingProxyType(dict(pairs))
-        return cls(
-            events=tuple(events),
-            terminations=terminations,
-            stop=stop,
-            _terminal_requests=pairs,
-        )
-
-    @property
-    def terminal_requests(self) -> tuple[tuple[int, Termination], ...]:
-        """The ordered terminal requests applied by the engine."""
-        return self._terminal_requests
 
 
 def _validate_terminal_request(env_id: object, termination: object, where: str) -> None:
@@ -298,17 +206,17 @@ def _validate_terminal_request(env_id: object, termination: object, where: str) 
 class EpisodeBatch:
     """The due-episode facts handed to :meth:`BenchmarkFlow.on_episode_end`.
 
-    F2 is intentionally minimal: it carries the due ids, the final step
-    context, final monitor values and an empty record mapping.  F4 adds
-    evidence and the finalized records; no flow may schedule a runner terminal
-    from this callback.
+    This release is intentionally minimal: it carries the due ids, the final
+    step context, final monitor values and an empty record mapping.  A later
+    card adds evidence and the finalized records; no flow may schedule a runner
+    terminal from this callback.
 
     Attributes:
         due: Sorted, unique due environment ids.
         final_step: The post-``on_step`` boundary context for the due episodes.
         monitor_values: Final per-monitor value tensors.
-        records: The finalized due records.  Empty until F4 owns record
-            projection for the flow.
+        records: The finalized due records.  Empty until a later card owns
+            record projection for the flow.
     """
 
     due: tuple[int, ...]
@@ -449,7 +357,7 @@ class BenchmarkFlow(Protocol):
     stateful: bool
 
     def on_episode_end(self, batch: EpisodeBatch) -> None:
-        """Observe the due episode boundary; F2 cannot add evidence."""
+        """Observe the due episode boundary; this release has no evidence."""
 
     def on_run_end(self, run: FlowRun) -> Mapping[str, JsonValue] | None:
         """Return the pack report document (or delegate to the default)."""
@@ -466,7 +374,7 @@ def validate_flow(value: object) -> BenchmarkFlow:
 
     Raises:
         TypeError: A required attribute or callback is missing or malformed.
-        ValueError: ``stateful`` is true; flow rewind is not part of F2.
+        ValueError: ``stateful`` is true; flow rewind is not part of this release.
     """
     name = getattr(value, "name", None)
     if not isinstance(name, str) or not name:
@@ -481,8 +389,8 @@ def validate_flow(value: object) -> BenchmarkFlow:
     has_restore = callable(getattr(value, "restore", None))
     if stateful:
         raise ValueError(
-            f"benchmark flow {name!r}: stateful flows are not supported in F2; "
-            "flow rewind lands with the later rewind card"
+            f"benchmark flow {name!r}: stateful flows are not supported in this "
+            "release; flow rewind lands with the later rewind card"
         )
     if has_snapshot or has_restore:
         raise TypeError(
@@ -496,29 +404,6 @@ def validate_flow(value: object) -> BenchmarkFlow:
         if not callable(getattr(value, callback, None)):
             raise TypeError(f"benchmark flow {name!r}: missing callable {callback}()")
     return cast(BenchmarkFlow, value)
-
-
-def _monitor_bridge_decision(tick: BenchmarkTick) -> FlowDecision:
-    """Forward the F2 monitor event/terminal queues as one flow decision.
-
-    This is the single temporary bridge used by both ``engine.on_step`` (for
-    the legacy engine-only path) and :class:`DefaultBenchmarkFlow`.  F3 deletes
-    it with the monitor drains.
-
-    Args:
-        tick: The tick whose monitor outputs should be forwarded.
-
-    Returns:
-        A decision containing every monitor occurrence and terminal request in
-        monitor declaration order.
-    """
-    events: list[Event] = []
-    requests: list[tuple[int, Termination]] = []
-    for output in tick.monitor_outputs:
-        events.extend(output.events)
-        for env_id in sorted(output.terminations):
-            requests.append((env_id, output.terminations[env_id]))
-    return FlowDecision.from_requests(events=tuple(events), requests=tuple(requests))
 
 
 class _MonitorView:
@@ -535,29 +420,250 @@ class _MonitorView:
         return self._view
 
 
-class DefaultBenchmarkFlow:
-    """Stateless flow that reproduces the current monitor and report behavior.
+@dataclass(frozen=True, slots=True)
+class TerminationRule:
+    """One explicit value-to-terminal decision rule.
 
-    The flow forwards the temporary monitor event/terminal bridge unchanged and
-    assembles the pack report from the run's monitor report views and report
-    extensions.  It never receives a live monitor object.  F3 removes the
-    monitor bridge; F4 makes report selection flow-owned.
+    The named ``monitor/value`` must be a per-env boolean value produced by the
+    monitor trigger.  Rules are evaluated in declaration order and the first
+    true rule per env wins; later true rules are not conflicts, they are simply
+    not selected.
+
+    Args:
+        monitor: Monitor name that publishes the value.
+        value: Local value name inside that monitor.
+        outcome: Episode outcome for the produced terminal.
+        code: Full ``custom.*`` termination code.
+    """
+
+    monitor: str
+    value: str
+    outcome: EpisodeOutcome | str
+    code: str
+
+    def __post_init__(self) -> None:
+        """Validate names, outcome and code at construction."""
+        _require_rule_name(self.monitor, "TerminationRule.monitor")
+        _require_rule_name(self.value, "TerminationRule.value")
+        object.__setattr__(self, "outcome", _require_rule_outcome(self.outcome))
+        if not isinstance(self.code, str) or not self.code.startswith("custom."):
+            raise ValueError(f"TerminationRule.code: expected a 'custom.*' code, got {self.code!r}")
+        validate_code(self.code)
+
+
+@dataclass(frozen=True, slots=True)
+class EventRule:
+    """One explicit value-to-event decision rule.
+
+    For every env whose boolean value is true, the flow journals one event with
+    the grouped true env ids.  The default code is ``task.<monitor>.<name>``.
+
+    Args:
+        monitor: Monitor name that publishes the value.
+        value: Local value name inside that monitor.
+        name: Event name.
+        severity: Event severity.
+        code: Optional full event code; defaults to the pack event namespace.
+        data: Optional JSON-safe static event detail payload.
+    """
+
+    monitor: str
+    value: str
+    name: str
+    severity: Severity = "info"
+    code: str | None = None
+    data: Mapping[str, JsonValue] = field(default_factory=lambda: MappingProxyType({}))
+
+    def __post_init__(self) -> None:
+        """Validate names, severity, code and data at construction."""
+        _require_rule_name(self.monitor, "EventRule.monitor")
+        _require_rule_name(self.value, "EventRule.value")
+        _require_rule_name(self.name, "EventRule.name")
+        if not isinstance(self.severity, str) or self.severity not in SEVERITIES:
+            raise ValueError(
+                f"EventRule.severity: expected one of {sorted(SEVERITIES)}, "
+                f"got {self.severity!r}"
+            )
+        if self.code is None:
+            code = f"task.{self.monitor}.{self.name}"
+        elif isinstance(self.code, str):
+            code = self.code
+        else:
+            raise TypeError(f"EventRule.code: expected a string or None, got {self.code!r}")
+        validate_code(code)
+        object.__setattr__(self, "code", code)
+        if not isinstance(self.data, Mapping):
+            raise TypeError(f"EventRule.data: expected a mapping, got {type(self.data).__name__}")
+        normalized = ensure_json_value(dict(self.data), where="EventRule.data")
+        if not isinstance(normalized, dict):
+            raise TypeError("EventRule.data: expected an object")
+        object.__setattr__(self, "data", MappingProxyType(normalized))
+
+
+class DefaultBenchmarkFlow:
+    """Stateless flow that applies explicit rules and assembles the pack report.
+
+    Args:
+        rules: Explicit termination rules in declaration order.  Empty means no
+            automatic termination.
+        events: Explicit event rules in declaration order.  Empty means no
+            automatic events.
+
+    Raises:
+        ValueError: A duplicate ``(monitor, value)`` termination rule is
+            declared, or a rule is malformed.
     """
 
     name = "default"
     stateful = False
 
+    def __init__(
+        self,
+        rules: Sequence[TerminationRule] = (),
+        *,
+        events: Sequence[EventRule] = (),
+    ) -> None:
+        """Validate and freeze the explicit rule declarations."""
+        checked_rules: list[TerminationRule] = []
+        seen: set[tuple[str, str]] = set()
+        for index, rule in enumerate(rules):
+            if not isinstance(rule, TerminationRule):
+                raise TypeError(
+                    f"DefaultBenchmarkFlow.rules[{index}]: expected a TerminationRule, "
+                    f"got {type(rule).__name__}"
+                )
+            key = (rule.monitor, rule.value)
+            if key in seen:
+                raise ValueError(
+                    "DefaultBenchmarkFlow.rules: duplicate "
+                    f"(monitor={rule.monitor!r}, value={rule.value!r}) rule; the later "
+                    "rule is dead policy"
+                )
+            seen.add(key)
+            checked_rules.append(rule)
+        checked_events: list[EventRule] = []
+        for index, rule in enumerate(events):
+            if not isinstance(rule, EventRule):
+                raise TypeError(
+                    f"DefaultBenchmarkFlow.events[{index}]: expected an EventRule, "
+                    f"got {type(rule).__name__}"
+                )
+            checked_events.append(rule)
+        self._rules: tuple[TerminationRule, ...] = tuple(checked_rules)
+        self._events: tuple[EventRule, ...] = tuple(checked_events)
+
+    @property
+    def rules(self) -> tuple[TerminationRule, ...]:
+        """The explicit termination rules in declaration order."""
+        return self._rules
+
+    @property
+    def events(self) -> tuple[EventRule, ...]:
+        """The explicit event rules in declaration order."""
+        return self._events
+
     def on_tick(self, tick: BenchmarkTick) -> FlowDecision:
-        """Forward the current monitor outputs for this tick."""
-        return _monitor_bridge_decision(tick)
+        """Apply the explicit event and termination rules to this tick's values."""
+        terminations: dict[int, Termination] = {}
+        if self._rules:
+            num_envs = tick.step.num_envs
+            for rule in self._rules:
+                mask = _rule_mask(tick, rule.monitor, rule.value, num_envs)
+                for env_id, active in enumerate(mask):
+                    if not active or env_id in terminations:
+                        continue
+                    terminations[env_id] = Termination(
+                        outcome=rule.outcome,
+                        code=rule.code,
+                        source=TerminationSource.CUSTOM,
+                        metrics={},
+                    )
+        events: list[Event] = []
+        if self._events:
+            num_envs = tick.step.num_envs
+            for event_rule in self._events:
+                mask = _rule_mask(tick, event_rule.monitor, event_rule.value, num_envs)
+                true_ids = tuple(env_id for env_id, active in enumerate(mask) if active)
+                if not true_ids:
+                    continue
+                assert event_rule.code is not None
+                events.append(
+                    Event(
+                        name=event_rule.name,
+                        code=event_rule.code,
+                        env_ids=true_ids,
+                        severity=event_rule.severity,
+                        data=event_rule.data,
+                    )
+                )
+        return FlowDecision(events=tuple(events), terminations=terminations)
 
     def on_episode_end(self, batch: EpisodeBatch) -> None:
-        """Observe the boundary; F2 has no episode evidence."""
+        """Observe the boundary; this release has no episode evidence."""
         del batch
 
     def on_run_end(self, run: FlowRun) -> Mapping[str, JsonValue]:
         """Assemble the current pack report from the run bundle."""
         return assemble_default_report(run)
+
+
+def _require_rule_name(value: object, where: str) -> str:
+    """Validate one rule name."""
+    if not isinstance(value, str) or not _RULE_NAME_PATTERN.fullmatch(value):
+        raise ValueError(f"{where}: expected a name matching [a-z][a-z0-9_]*, got {value!r}")
+    return value
+
+
+def _require_rule_outcome(value: object) -> EpisodeOutcome:
+    """Validate the outcome a flow rule may produce."""
+    if isinstance(value, EpisodeOutcome):
+        outcome = value
+    elif isinstance(value, str):
+        try:
+            outcome = EpisodeOutcome(value)
+        except ValueError as exc:
+            raise ValueError(
+                f"TerminationRule.outcome: unknown episode outcome {value!r}; "
+                f"allowed: {sorted(item.value for item in _MONITOR_OUTCOMES)}"
+            ) from exc
+    else:
+        raise TypeError(
+            f"TerminationRule.outcome: expected an EpisodeOutcome or str, got {value!r}"
+        )
+    if outcome not in _MONITOR_OUTCOMES:
+        raise ValueError(
+            f"TerminationRule.outcome: {outcome.value!r} is not a flow-owned terminal "
+            f"outcome; allowed: {sorted(item.value for item in _MONITOR_OUTCOMES)}"
+        )
+    return outcome
+
+
+def _rule_mask(tick: BenchmarkTick, monitor: str, value: str, num_envs: int) -> list[bool]:
+    """Return one boolean per env for a rule's monitor value."""
+    monitor_values = tick.monitor_values
+    if monitor not in monitor_values:
+        raise ValueError(
+            f"flow rule references monitor {monitor!r}, which is not present in this "
+            f"tick; declared monitors are {sorted(monitor_values)}"
+        )
+    values = monitor_values[monitor]
+    if value not in values:
+        raise ValueError(
+            f"flow rule references value {value!r} of monitor {monitor!r}, which is "
+            f"not present in this tick; available values are {sorted(values)}"
+        )
+    tensor = values[value]
+    if tensor.dtype is not torch.bool:
+        raise TypeError(
+            f"flow rule value {monitor}/{value}: expected a torch.bool tensor, "
+            f"got dtype {tensor.dtype}"
+        )
+    if tensor.ndim != 1 or tensor.shape[0] != num_envs:
+        raise ValueError(
+            f"flow rule value {monitor}/{value}: expected shape (num_envs={num_envs},), "
+            f"got {tuple(tensor.shape)}"
+        )
+    return [bool(item) for item in tensor.detach().to(device="cpu").tolist()]
 
 
 def assemble_default_report(run: FlowRun) -> Mapping[str, JsonValue]:

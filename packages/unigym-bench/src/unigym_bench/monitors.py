@@ -1,22 +1,21 @@
 """Monitor protocol, convenience base and the configured monitor helpers.
 
-A monitor is the stateful per-env unit of a benchmark task.  It observes ticks,
-publishes per-env level signals, emits one-shot events and requests per-env
-episode terminals.  This module owns the monitor contract, the compositional
-:class:`PredicateMonitor`, the specialized :class:`PhaseMonitor` and the
-configuration helpers that replace the retired typed monitor classes; it owns no
-engine, sink, report or scenario code.
+A monitor is the stateful per-env unit of a benchmark task.  It observes ticks
+and publishes per-env level values.  It produces no events and no terminals:
+those decisions belong to :class:`unigym_bench.flow.DefaultBenchmarkFlow`.  This
+module owns the monitor contract, the compositional :class:`PredicateMonitor`,
+the specialized :class:`PhaseMonitor` and the configuration helpers that replace
+the retired typed monitor classes; it owns no engine, sink, report or scenario
+code.
 
 Ownership boundaries:
 
-- A monitor decides when an event occurs.  Events are drained one-shot and the
-  engine does not deduplicate them in v1.  A predicate monitor emits on its
-  configured trigger.
-- A monitor requests terminals as core :class:`Termination` facts with
-  ``source=CUSTOM`` and a ``custom.<monitor>.<reason>`` code.  The engine owns
-  the first-terminal latch for an environment; a monitor keeps no competing
-  latch.
-- ``signals()`` returns fresh per-env level tensors with a leading dimension of
+- A monitor owns observation and trigger cadence only.  Its trigger collapses
+  into a boolean value; a flow rule consumes that value as-is.
+- A monitor never constructs an :class:`~unigym.core.episode_termination.Termination`.
+  The flow owns the ``custom.<monitor>.<reason>`` decision; the engine owns the
+  first-terminal latch for an environment.
+- ``values()`` returns fresh per-env level tensors with a leading dimension of
   ``num_envs``.  A monitor stores plain Python measurements, never tensors or
   views, so it cannot retain boundary data.
 - ``reset(env_ids)`` clears per-env measurement state (edges, streaks, phases).
@@ -41,16 +40,9 @@ from typing import Literal, Protocol, TypeAlias, TypeVar, cast, runtime_checkabl
 
 import torch
 from torch import Tensor
-from unigym.core.episode_termination import (
-    EpisodeOutcome,
-    Termination,
-    TerminationSource,
-    validate_code,
-)
 from unigym.evaluation import EnvStepContext
 
 from .conditions import Condition, ConditionError, parse_condition
-from .events import SEVERITIES, Event, Severity, termination_from_json
 from .json import JsonValue, ensure_json_value
 from .predicates import EmitSpec, TriggerKind, TriggerSpec
 from .sources import SourceError, SourceRef, SourceResolver
@@ -78,7 +70,7 @@ _CONDITION_OPS: Mapping[str, str] = {
     "<=": "lte",
 }
 
-_SNAPSHOT_SCHEMA = "unigym_bench.monitor/3"
+_SNAPSHOT_SCHEMA = "unigym_bench.monitor/4"
 _SNAPSHOT_KEYS = frozenset(
     {
         "schema",
@@ -88,14 +80,9 @@ _SNAPSHOT_KEYS = frozenset(
         "device",
         "config",
         "state",
-        "pending_events",
-        "pending_terminals",
     }
 )
 _COMPARISONS: frozenset[str] = frozenset({">", ">=", "<", "<="})
-_MONITOR_OUTCOMES: frozenset[EpisodeOutcome] = frozenset(
-    {EpisodeOutcome.SUCCESS, EpisodeOutcome.FAILURE, EpisodeOutcome.DEADLINE}
-)
 _NAME_PATTERN = re.compile(r"[a-z][a-z0-9_]*")
 
 _T = TypeVar("_T")
@@ -108,8 +95,6 @@ class _DecodedMonitorSnapshot:
     state: object
     num_envs: int | None
     device: torch.device | None
-    pending_events: tuple[Event, ...]
-    pending_terminals: dict[int, Termination]
 
 
 @runtime_checkable
@@ -121,14 +106,8 @@ class Monitor(Protocol):
     def on_tick(self, context: EnvStepContext) -> None:
         """Observe one tick."""
 
-    def signals(self) -> Mapping[str, Tensor]:
-        """Return fresh per-env level tensors keyed by local signal name."""
-
-    def drain_events(self) -> Sequence[Event]:
-        """Return and clear the occurrences since the previous drain."""
-
-    def drain_terminals(self) -> Mapping[int, Termination]:
-        """Return and clear the terminal requests since the previous drain."""
+    def values(self) -> Mapping[str, Tensor]:
+        """Return fresh per-env level tensors keyed by local value name."""
 
     def on_episode_end(self, env_ids: Sequence[int], context: EnvStepContext | None = None) -> None:
         """Observe the episode boundary for the due ``env_ids``."""
@@ -172,16 +151,8 @@ class BaseMonitor:
     def on_tick(self, context: EnvStepContext) -> None:
         """Observe one tick; the base monitor does nothing."""
 
-    def signals(self) -> Mapping[str, Tensor]:
-        """Return no signals."""
-        return {}
-
-    def drain_events(self) -> Sequence[Event]:
-        """Return no events."""
-        return ()
-
-    def drain_terminals(self) -> Mapping[int, Termination]:
-        """Return no terminals."""
+    def values(self) -> Mapping[str, Tensor]:
+        """Return no values."""
         return {}
 
     def on_episode_end(self, env_ids: Sequence[int], context: EnvStepContext | None = None) -> None:
@@ -205,26 +176,12 @@ class BaseMonitor:
 
 
 class _StatefulMonitor(BaseMonitor):
-    """Shared JSON state, drain and snapshot plumbing for built-in monitors."""
+    """Shared JSON state and snapshot plumbing for built-in monitors."""
 
     def __init__(self, name: str) -> None:
         super().__init__(name)
         self._num_envs: int | None = None
         self._device: torch.device | None = None
-        self._pending_events: list[Event] = []
-        self._pending_terminals: dict[int, Termination] = {}
-
-    def drain_events(self) -> Sequence[Event]:
-        """Return and clear the pending occurrences."""
-        events = tuple(self._pending_events)
-        self._pending_events.clear()
-        return events
-
-    def drain_terminals(self) -> Mapping[int, Termination]:
-        """Return and clear the pending terminal requests."""
-        terminals = dict(self._pending_terminals)
-        self._pending_terminals.clear()
-        return terminals
 
     def snapshot(self) -> JsonValue:
         """Return a JSON-safe, private copy of the monitor state."""
@@ -248,11 +205,6 @@ class _StatefulMonitor(BaseMonitor):
             "device": None if self._device is None else str(self._device),
             "config": config,
             "state": state,
-            "pending_events": [event.to_json() for event in self._pending_events],
-            "pending_terminals": {
-                str(env_id): termination.to_json()
-                for env_id, termination in self._pending_terminals.items()
-            },
         }
 
     def validate_restore(self, state: JsonValue) -> None:
@@ -275,8 +227,6 @@ class _StatefulMonitor(BaseMonitor):
         self._apply_state(decoded.state)
         self._num_envs = decoded.num_envs
         self._device = decoded.device
-        self._pending_events = list(decoded.pending_events)
-        self._pending_terminals = dict(decoded.pending_terminals)
 
     def _decode_snapshot(self, state: JsonValue) -> _DecodedMonitorSnapshot:
         """Decode one snapshot into private locals without mutation."""
@@ -312,45 +262,13 @@ class _StatefulMonitor(BaseMonitor):
         raw_state = payload["state"]
         if not isinstance(raw_state, dict):
             raise TypeError(f"{where}.state: expected an object, got {type(raw_state).__name__}")
-        raw_events = payload["pending_events"]
-        if not isinstance(raw_events, list):
-            raise TypeError(
-                f"{where}.pending_events: expected a list, " f"got {type(raw_events).__name__}"
-            )
-        events = tuple(Event.from_json(item) for item in raw_events)
-        raw_terminals = payload["pending_terminals"]
-        if not isinstance(raw_terminals, dict):
-            raise TypeError(
-                f"{where}.pending_terminals: expected an object, "
-                f"got {type(raw_terminals).__name__}"
-            )
-        terminals: dict[int, Termination] = {}
-        for key, item in raw_terminals.items():
-            env_id = _decode_env_key(key, f"{where}.pending_terminals")
-            terminals[env_id] = termination_from_json(item, f"{where}.pending_terminals[{key}]")
         target_num_envs = self._num_envs if num_envs is None else num_envs
         target_device = self._device if device is None else device
-        if target_num_envs is not None:
-            for env_id in terminals:
-                if env_id >= target_num_envs:
-                    raise ValueError(
-                        f"{where}.pending_terminals: env id {env_id} is outside "
-                        f"[0, num_envs={target_num_envs})"
-                    )
-            for event in events:
-                for env_id in event.env_ids:
-                    if env_id >= target_num_envs:
-                        raise ValueError(
-                            f"{where}.pending_events: env id {env_id} is outside "
-                            f"[0, num_envs={target_num_envs})"
-                        )
         decoded = self._decode_state(raw_state, target_num_envs)
         return _DecodedMonitorSnapshot(
             state=decoded,
             num_envs=target_num_envs,
             device=target_device,
-            pending_events=events,
-            pending_terminals=terminals,
         )
 
     def _bind_context(self, context: EnvStepContext) -> None:
@@ -383,43 +301,6 @@ class _StatefulMonitor(BaseMonitor):
             )
         return values
 
-    def _emit_event(
-        self,
-        *,
-        name: str,
-        env_id: int,
-        severity: Severity,
-        data: Mapping[str, JsonValue],
-    ) -> None:
-        """Queue one occurrence for ``env_id``."""
-        self._pending_events.append(
-            Event(
-                name=name,
-                code=f"task.{self._name}.{name}",
-                env_ids=(env_id,),
-                severity=severity,
-                data=data,
-            )
-        )
-
-    def _emit_terminal(
-        self,
-        env_id: int,
-        *,
-        outcome: EpisodeOutcome,
-        reason: str,
-        metrics: Mapping[str, float],
-    ) -> None:
-        """Queue one terminal request; the runner stamps step and time."""
-        code = f"custom.{self._name}.{reason}"
-        validate_code(code)
-        self._pending_terminals[env_id] = Termination(
-            outcome=outcome,
-            code=code,
-            source=TerminationSource.CUSTOM,
-            metrics=metrics,
-        )
-
     def _state_fields(self) -> Mapping[str, JsonValue]:
         """Return the built-in's private state as a JSON-safe copy."""
         raise NotImplementedError
@@ -449,21 +330,19 @@ def threshold_config(
     *,
     threshold: float,
     operator: Comparison = ">=",
-    terminal_outcome: EpisodeOutcome | str | None = None,
 ) -> PredicateMonitor:
     """Configure a threshold predicate: an edge-triggered comparison.
 
     The old ``ThresholdMonitor`` is now one :class:`PredicateMonitor`: a
-    single-source ``Comparison`` condition, an ``edge`` trigger and an emit
-    spec whose event name and terminal reason are unchanged.
+    single-source ``Comparison`` condition, an ``edge`` trigger and a value
+    named ``threshold_reached``.  A runner terminal is a flow decision, not a
+    monitor output.
 
     Args:
         name: Monitor name matching ``[a-z][a-z0-9_]*``.
         source: Per-env numeric source reference (``SourceRef`` or ``kind:key``).
         threshold: Finite comparison threshold.
         operator: One of ``>``, ``>=``, ``<`` or ``<=``.
-        terminal_outcome: Optional episode outcome for a per-env terminal on
-            each rising edge.
 
     Returns:
         A validated predicate monitor.
@@ -472,18 +351,11 @@ def threshold_config(
     ref = _coerce_source_ref(source, f"{where}.source")
     level = _require_finite_float(threshold, f"{where}.threshold")
     comparison = _require_comparison(operator, f"{where}.operator")
-    outcome = _require_outcome(terminal_outcome, f"{where}.terminal_outcome")
     return PredicateMonitor(
         name,
         _comparison_mapping(ref, comparison, level),
         TriggerSpec(kind="edge"),
-        EmitSpec(
-            value="threshold_reached",
-            event="threshold_reached",
-            severity="info",
-            terminal_reason=None if outcome is None else "threshold",
-            terminal_outcome=outcome,
-        ),
+        EmitSpec(value="threshold_reached"),
     )
 
 
@@ -494,12 +366,12 @@ def hold_config(
     threshold: float,
     hold_steps: int,
     operator: Comparison = ">=",
-    terminal_outcome: EpisodeOutcome | str | None = None,
 ) -> PredicateMonitor:
     """Configure a hold predicate: fire once after consecutive true ticks.
 
     The old ``HoldMonitor`` becomes a ``Comparison`` condition plus a ``hold``
-    trigger.  The terminal reason and event name are unchanged.
+    trigger and a value named ``hold_reached``.  A runner terminal is a flow
+    decision, not a monitor output.
 
     Args:
         name: Monitor name matching ``[a-z][a-z0-9_]*``.
@@ -507,8 +379,6 @@ def hold_config(
         threshold: Finite comparison threshold.
         hold_steps: Positive number of consecutive true evaluations.
         operator: One of ``>``, ``>=``, ``<`` or ``<=``.
-        terminal_outcome: Optional episode outcome for a per-env terminal on
-            the hold firing.
 
     Returns:
         A validated predicate monitor.
@@ -518,18 +388,11 @@ def hold_config(
     level = _require_finite_float(threshold, f"{where}.threshold")
     comparison = _require_comparison(operator, f"{where}.operator")
     steps = _require_positive_int(hold_steps, f"{where}.hold_steps")
-    outcome = _require_outcome(terminal_outcome, f"{where}.terminal_outcome")
     return PredicateMonitor(
         name,
         _comparison_mapping(ref, comparison, level),
         TriggerSpec(kind="hold", steps=steps),
-        EmitSpec(
-            value="hold_reached",
-            event="hold_reached",
-            severity="info",
-            terminal_reason=None if outcome is None else "hold",
-            terminal_outcome=outcome,
-        ),
+        EmitSpec(value="hold_reached"),
     )
 
 
@@ -539,23 +402,18 @@ def safety_config(
     *,
     threshold: float,
     operator: Comparison = ">=",
-    severity: Severity = "violation",
-    terminal_outcome: EpisodeOutcome | str | None = None,
 ) -> PredicateMonitor:
     """Configure a safety violation predicate: an edge-triggered comparison.
 
     The old ``SafetyMonitor`` becomes a ``Comparison`` condition, an ``edge``
-    trigger and an emit spec with the configured severity.  The event name and
-    terminal reason are unchanged.
+    trigger and a value named ``violation``.  A runner terminal is a flow
+    decision, not a monitor output.
 
     Args:
         name: Monitor name matching ``[a-z][a-z0-9_]*``.
         source: Per-env numeric source reference.
         threshold: Finite comparison threshold.
         operator: One of ``>``, ``>=``, ``<`` or ``<=``.
-        severity: Severity for the emitted violation event.
-        terminal_outcome: Optional episode outcome for a per-env terminal on
-            each rising edge.
 
     Returns:
         A validated predicate monitor.
@@ -564,51 +422,39 @@ def safety_config(
     ref = _coerce_source_ref(source, f"{where}.source")
     level = _require_finite_float(threshold, f"{where}.threshold")
     comparison = _require_comparison(operator, f"{where}.operator")
-    level_severity = _require_severity(severity, f"{where}.severity")
-    outcome = _require_outcome(terminal_outcome, f"{where}.terminal_outcome")
     return PredicateMonitor(
         name,
         _comparison_mapping(ref, comparison, level),
         TriggerSpec(kind="edge"),
-        EmitSpec(
-            value="violation",
-            event="violation",
-            severity=level_severity,
-            terminal_reason=None if outcome is None else "violation",
-            terminal_outcome=outcome,
-        ),
+        EmitSpec(value="violation"),
     )
 
 
 def event_counter_config(
     name: str,
     source: SourceRef | str,
-    *,
-    severity: Severity = "info",
 ) -> PredicateMonitor:
     """Configure a report-only occurrence counter: edge-triggered true values.
 
     The old ``EventCounterMonitor`` becomes an ``edge`` predicate over a
-    boolean-like source: a value greater than zero is true.  It emits no event
-    and no terminal.  The run report keeps the severity and the per-env firing
-    counts; the monitor publishes the per-tick rising-edge mask.
+    boolean-like source: a value greater than zero is true.  It publishes a
+    value named ``counted``; it emits no event and no terminal.  The run report
+    keeps the per-env firing counts.
 
     Args:
         name: Monitor name matching ``[a-z][a-z0-9_]*``.
         source: Per-env boolean or numeric source reference.
-        severity: Report metadata severity (never event-weighted).
 
     Returns:
         A validated predicate monitor.
     """
     where = f"event_counter_config({name!r})"
     ref = _coerce_source_ref(source, f"{where}.source")
-    level_severity = _require_severity(severity, f"{where}.severity")
     return PredicateMonitor(
         name,
         _comparison_mapping(ref, ">", 0.0),
         TriggerSpec(kind="edge"),
-        EmitSpec(value="counted", severity=level_severity),
+        EmitSpec(value="counted"),
     )
 
 
@@ -649,7 +495,6 @@ _PREDICATE_STATE_KEYS: frozenset[str] = frozenset(
         "episode_end_total",
         "episode_end_counts",
         "episodes",
-        "episode_terminals",
     }
 )
 
@@ -668,7 +513,6 @@ class _PredicateState:
     episode_end_total: int
     episode_end_counts: list[int]
     episodes: int
-    episode_terminals: dict[int, Termination]
 
 
 class PredicateMonitor(_StatefulMonitor):
@@ -677,16 +521,13 @@ class PredicateMonitor(_StatefulMonitor):
     The monitor resolves the condition at each evaluated boundary and stores
     only the per-env booleans, streaks, once flags and run counters.  It owns no
     view, tensor or borrowed boundary value.  ``on_tick`` publishes the trigger
-    firing mask.
+    firing mask as an observation.
 
-    Terminals follow the trigger cadence and are not latched here: the engine
-    owns first-terminal conflict accounting, so a repeated firing may request a
-    terminal again.  ``episode_end`` predicates are evaluated only by
-    :meth:`on_episode_end` with a final context.  Their terminal output is
-    report/scoring-only (OD-5) and is drained through
-    :meth:`drain_episode_terminals`, never through :meth:`drain_terminals`.
-    P15 consumes that separate face and records it without runner-drain
-    semantics.
+    Terminals and events are flow decisions, never monitor outputs.  A repeated
+    firing therefore produces a repeated true value; the flow applies its
+    first-match rule and the engine owns the first-terminal latch.
+    ``episode_end`` predicates are evaluated only by :meth:`on_episode_end`
+    with a final context and refresh the value for due rows.
     """
 
     kind = "predicate"
@@ -738,10 +579,9 @@ class PredicateMonitor(_StatefulMonitor):
         self._episode_end_total = 0
         self._episode_end_counts: list[int] = []
         self._episodes = 0
-        self._pending_episode_terminals: dict[int, Termination] = {}
 
     def on_tick(self, context: EnvStepContext) -> None:
-        """Evaluate the condition, advance the trigger and queue outputs.
+        """Evaluate the condition and advance the trigger.
 
         ``episode_end`` triggers bind the run shape but never evaluate the
         condition on a normal tick, so a final-only source can be absent here.
@@ -765,7 +605,7 @@ class PredicateMonitor(_StatefulMonitor):
         if any(fired):
             self._record_predicate_firing(fired)
 
-    def signals(self) -> Mapping[str, Tensor]:
+    def values(self) -> Mapping[str, Tensor]:
         """Return a fresh per-env boolean tensor of the current firing mask."""
         if self._device is None or not self._fired:
             return {}
@@ -777,10 +617,8 @@ class PredicateMonitor(_StatefulMonitor):
 
         Only an ``episode_end`` trigger with a supplied final context evaluates
         the condition.  Every other trigger only counts the boundary.  A fired
-        ``episode_end`` row refreshes its level bit, emits a report/scoring
-        event when configured and queues a report/scoring terminal in
-        :meth:`drain_episode_terminals` when configured; it never queues a
-        runner terminal.
+        ``episode_end`` row refreshes its value; it produces no event and no
+        terminal.
 
         Args:
             env_ids: The due environment ids.
@@ -807,8 +645,6 @@ class PredicateMonitor(_StatefulMonitor):
         self._ensure_predicate_state()
         if not ids:
             return
-        for env_id in ids:
-            self._pending_episode_terminals.pop(env_id, None)
         mask = self._condition.evaluate(context, self._resolver)
         current = _require_predicate_mask(mask, context, f"monitor {self.name!r}.condition")
         for env_id in ids:
@@ -820,32 +656,9 @@ class PredicateMonitor(_StatefulMonitor):
         for env_id in fired_ids:
             self._episode_end_counts[env_id] += 1
             self._episode_end_total += 1
-            self._queue_episode_terminal(env_id)
-        if self._emit.event is not None:
-            self._pending_events.append(
-                Event(
-                    name=self._emit.event,
-                    code=f"task.{self.name}.{self._emit.event}",
-                    env_ids=tuple(fired_ids),
-                    severity=self._emit.severity,
-                    data=self._predicate_event_data(),
-                )
-            )
-
-    def drain_episode_terminals(self) -> Mapping[int, Termination]:
-        """Return and clear report/scoring terminals from episode-end rows.
-
-        This face is separate from :meth:`drain_terminals`: the runner must
-        never drain it.  P15 records these facts in the final report without
-        runner-terminal semantics.  A later boundary for the same environment
-        replaces an undrained request for that environment.
-        """
-        terminals = dict(self._pending_episode_terminals)
-        self._pending_episode_terminals.clear()
-        return terminals
 
     def reset(self, env_ids: Sequence[int]) -> None:
-        """Clear per-env trigger state; run counters and pending drains persist."""
+        """Clear per-env trigger state; run counters persist."""
         for env_id in _validate_env_ids(env_ids, self._num_envs, "reset.env_ids"):
             if env_id < len(self._previous):
                 self._previous[env_id] = False
@@ -860,7 +673,6 @@ class PredicateMonitor(_StatefulMonitor):
 
     def report_view(self) -> Mapping[str, JsonValue]:
         """Return the JSON-safe config, fired counts and episode-end counts."""
-        outcome = self._emit.terminal_outcome
         return self._json_report(
             {
                 "name": self.name,
@@ -869,10 +681,6 @@ class PredicateMonitor(_StatefulMonitor):
                 "trigger": self._trigger.to_mapping(),
                 "emit": self._emit.to_mapping(),
                 "value": self._emit.value,
-                "event": self._emit.event,
-                "severity": self._emit.severity,
-                "terminal_reason": self._emit.terminal_reason,
-                "terminal_outcome": None if outcome is None else outcome.value,
                 "fired": self._fired_total,
                 "fired_counts": list(self._fired_counts),
                 "episode_end_fired": self._episode_end_total,
@@ -923,54 +731,12 @@ class PredicateMonitor(_StatefulMonitor):
         raise ValueError(f"monitor {self.name!r}: trigger {kind!r} cannot be evaluated on a tick")
 
     def _record_predicate_firing(self, fired: list[bool]) -> None:
-        """Count fired rows and queue this firing's events and terminals."""
-        fired_ids: list[int] = []
+        """Count fired rows."""
         for env_id, active in enumerate(fired):
             if not active:
                 continue
-            fired_ids.append(env_id)
             self._fired_counts[env_id] += 1
             self._fired_total += 1
-            if self._emit.terminal_outcome is not None:
-                assert self._emit.terminal_reason is not None
-                self._emit_terminal(
-                    env_id,
-                    outcome=self._emit.terminal_outcome,
-                    reason=self._emit.terminal_reason,
-                    metrics={},
-                )
-        if fired_ids and self._emit.event is not None:
-            self._pending_events.append(
-                Event(
-                    name=self._emit.event,
-                    code=f"task.{self.name}.{self._emit.event}",
-                    env_ids=tuple(fired_ids),
-                    severity=self._emit.severity,
-                    data=self._predicate_event_data(),
-                )
-            )
-
-    def _queue_episode_terminal(self, env_id: int) -> None:
-        """Queue one report/scoring terminal for a fired episode-end row."""
-        reason = self._emit.terminal_reason
-        outcome = self._emit.terminal_outcome
-        if reason is None or outcome is None:
-            return
-        code = f"custom.{self.name}.{reason}"
-        validate_code(code)
-        self._pending_episode_terminals[env_id] = Termination(
-            outcome=outcome,
-            code=code,
-            source=TerminationSource.CUSTOM,
-            metrics={},
-        )
-
-    def _predicate_event_data(self) -> Mapping[str, JsonValue]:
-        """Return the JSON-safe event detail payload."""
-        data: dict[str, JsonValue] = {"trigger": self._trigger.kind}
-        if self._trigger.steps is not None:
-            data["steps"] = self._trigger.steps
-        return data
 
     def _state_fields(self) -> Mapping[str, JsonValue]:
         return {
@@ -984,10 +750,6 @@ class PredicateMonitor(_StatefulMonitor):
             "episode_end_total": self._episode_end_total,
             "episode_end_counts": list(self._episode_end_counts),
             "episodes": self._episodes,
-            "episode_terminals": {
-                str(env_id): termination.to_json()
-                for env_id, termination in sorted(self._pending_episode_terminals.items())
-            },
         }
 
     def _config_fields(self) -> Mapping[str, JsonValue]:
@@ -1008,23 +770,6 @@ class PredicateMonitor(_StatefulMonitor):
                 f"{where}: expected keys {sorted(_PREDICATE_STATE_KEYS)}, "
                 f"missing {missing}, unknown {unknown}"
             )
-        raw_terminals = state["episode_terminals"]
-        if not isinstance(raw_terminals, dict):
-            raise TypeError(
-                f"{where}.episode_terminals: expected an object, "
-                f"got {type(raw_terminals).__name__}"
-            )
-        episode_terminals: dict[int, Termination] = {}
-        for key, item in raw_terminals.items():
-            env_id = _decode_env_key(key, f"{where}.episode_terminals")
-            if num_envs is not None and env_id >= num_envs:
-                raise ValueError(
-                    f"{where}.episode_terminals: env id {env_id} is outside "
-                    f"[0, num_envs={num_envs})"
-                )
-            episode_terminals[env_id] = termination_from_json(
-                item, f"{where}.episode_terminals[{key}]"
-            )
         return _PredicateState(
             previous=_decode_bool_list(state["previous"], f"{where}.previous", num_envs),
             streak=_decode_int_list(state["streak"], f"{where}.streak", num_envs),
@@ -1040,7 +785,6 @@ class PredicateMonitor(_StatefulMonitor):
                 state["episode_end_counts"], f"{where}.episode_end_counts", num_envs
             ),
             episodes=_decode_nonnegative_int(state["episodes"], f"{where}.episodes"),
-            episode_terminals=episode_terminals,
         )
 
     def _apply_state(self, decoded: object) -> None:
@@ -1059,13 +803,13 @@ class PredicateMonitor(_StatefulMonitor):
         self._episode_end_total = decoded.episode_end_total
         self._episode_end_counts = decoded.episode_end_counts
         self._episodes = decoded.episodes
-        self._pending_episode_terminals = decoded.episode_terminals
 
 
 @dataclass(frozen=True)
 class _PhaseState:
     phase: list[int | None]
     last_values: list[float | None]
+    changed: list[bool]
     transitions: int
     phase_ticks: list[int]
     episode_phases: list[int]
@@ -1077,10 +821,11 @@ class PhaseMonitor(_StatefulMonitor):
 
     ``boundaries`` is a strictly increasing list of finite values.  A level is
     in phase ``i`` when exactly ``i`` boundaries are less than or equal to it,
-    so ``[0.0, 1.0]`` yields phases ``0``, ``1`` and ``2``.  The signal
-    ``phase`` is an ``int64`` tensor and ``level`` the last value.  One
-    ``phase_changed`` event is emitted per environment on each transition;
-    the first observation after construction or reset initializes silently.
+    so ``[0.0, 1.0]`` yields phases ``0``, ``1`` and ``2``.  The values are
+    ``phase`` (``int64``), ``level`` (the last value) and ``changed`` (a boolean
+    transition mask).  The first observation after construction or reset
+    initializes silently, so ``changed`` is false there.  A flow event rule may
+    consume ``changed``; the monitor itself emits nothing.
 
     The level is resolved from the explicit ``source`` reference through a
     :class:`~unigym_bench.sources.SourceResolver` on each tick.  There is no
@@ -1107,34 +852,34 @@ class PhaseMonitor(_StatefulMonitor):
         )
         self._phase: list[int | None] = []
         self._last_values: list[float | None] = []
+        self._changed: list[bool] = []
         self._transitions = 0
         self._phase_ticks = [0] * (len(self._boundaries) + 1)
         self._episode_phases = [0] * (len(self._boundaries) + 1)
         self._episodes = 0
 
     def on_tick(self, context: EnvStepContext) -> None:
-        """Update phases and emit transitions."""
+        """Update phases and the transition mask."""
         self._bind_context(context)
         values = _read_phase_source(self._resolver, self._source, context, f"monitor {self.name!r}")
         self._phase = self._ensure_length(self._phase, None)
         self._last_values = self._ensure_length(self._last_values, None)
+        self._changed = self._ensure_length(self._changed, False)
+        changed: list[bool] = []
         for env_id, value in enumerate(values):
             phase = _phase_index(value, self._boundaries)
             previous = self._phase[env_id]
-            if previous is not None and previous != phase:
+            is_changed = previous is not None and previous != phase
+            if is_changed:
                 self._transitions += 1
-                self._emit_event(
-                    name="phase_changed",
-                    env_id=env_id,
-                    severity="info",
-                    data={"from": previous, "to": phase, "value": value},
-                )
+            changed.append(is_changed)
             self._phase[env_id] = phase
             self._phase_ticks[phase] += 1
         self._last_values = [float(value) for value in values]
+        self._changed = changed
 
-    def signals(self) -> Mapping[str, Tensor]:
-        """Return the current phase and level once every env is observed."""
+    def values(self) -> Mapping[str, Tensor]:
+        """Return the current phase, level and transition mask."""
         if self._device is None or not self._phase or any(p is None for p in self._phase):
             return {}
         if any(v is None for v in self._last_values):
@@ -1144,6 +889,7 @@ class PhaseMonitor(_StatefulMonitor):
                 [0.0 if v is None else v for v in self._last_values], torch.float32
             ),
             "phase": torch.tensor(self._phase, dtype=torch.int64, device=self._device),
+            "changed": torch.tensor(self._changed, dtype=torch.bool, device=self._device),
         }
 
     def on_episode_end(self, env_ids: Sequence[int], context: EnvStepContext | None = None) -> None:
@@ -1162,6 +908,8 @@ class PhaseMonitor(_StatefulMonitor):
             if env_id < len(self._phase):
                 self._phase[env_id] = None
                 self._last_values[env_id] = None
+            if env_id < len(self._changed):
+                self._changed[env_id] = False
 
     def report_view(self) -> Mapping[str, JsonValue]:
         """Return the run-scoped phase statistics."""
@@ -1193,6 +941,7 @@ class PhaseMonitor(_StatefulMonitor):
         return {
             "phase": list(self._phase),
             "last_values": list(self._last_values),
+            "changed": list(self._changed),
             "transitions": self._transitions,
             "phase_ticks": list(self._phase_ticks),
             "episode_phases": list(self._episode_phases),
@@ -1211,7 +960,15 @@ class PhaseMonitor(_StatefulMonitor):
         _require_state_keys(
             state,
             frozenset(
-                {"phase", "last_values", "transitions", "phase_ticks", "episode_phases", "episodes"}
+                {
+                    "phase",
+                    "last_values",
+                    "changed",
+                    "transitions",
+                    "phase_ticks",
+                    "episode_phases",
+                    "episodes",
+                }
             ),
             where,
         )
@@ -1223,6 +980,7 @@ class PhaseMonitor(_StatefulMonitor):
             last_values=_decode_optional_float_list(
                 state["last_values"], f"{where}.last_values", num_envs
             ),
+            changed=_decode_bool_list(state["changed"], f"{where}.changed", num_envs),
             transitions=_decode_nonnegative_int(state["transitions"], f"{where}.transitions"),
             phase_ticks=_decode_int_list(state["phase_ticks"], f"{where}.phase_ticks", phase_count),
             episode_phases=_decode_int_list(
@@ -1238,6 +996,7 @@ class PhaseMonitor(_StatefulMonitor):
             )
         self._phase = decoded.phase
         self._last_values = decoded.last_values
+        self._changed = decoded.changed
         self._transitions = decoded.transitions
         self._phase_ticks = decoded.phase_ticks
         self._episode_phases = decoded.episode_phases
@@ -1351,41 +1110,6 @@ def _require_comparison(value: object, where: str) -> Comparison:
     if value == "<":
         return "<"
     return "<="
-
-
-def _require_outcome(value: object, where: str) -> EpisodeOutcome | None:
-    if value is None:
-        return None
-    if isinstance(value, EpisodeOutcome):
-        outcome = value
-    elif isinstance(value, str):
-        try:
-            outcome = EpisodeOutcome(value)
-        except ValueError as exc:
-            raise ValueError(
-                f"{where}: unknown episode outcome {value!r}; "
-                f"allowed: {[item.value for item in EpisodeOutcome]}"
-            ) from exc
-    else:
-        raise TypeError(f"{where}: expected an EpisodeOutcome, str or None, got {value!r}")
-    if outcome not in _MONITOR_OUTCOMES:
-        raise ValueError(
-            f"{where}: terminal outcome {outcome.value!r} is not owned by a monitor; "
-            f"allowed: {sorted(item.value for item in _MONITOR_OUTCOMES)}"
-        )
-    return outcome
-
-
-def _require_severity(value: object, where: str) -> Severity:
-    if not isinstance(value, str) or value not in SEVERITIES:
-        raise ValueError(f"{where}: expected one of {sorted(SEVERITIES)}, got {value!r}")
-    if value == "info":
-        return "info"
-    if value == "warning":
-        return "warning"
-    if value == "violation":
-        return "violation"
-    return "fatal"
 
 
 def _require_boundaries(value: object, where: str) -> tuple[float, ...]:
@@ -1619,9 +1343,3 @@ def _decode_optional_phase_list(
         if phase is not None and phase >= phase_count:
             raise ValueError(f"{where}[{index}]: phase {phase} is outside [0, {phase_count})")
     return phases
-
-
-def _decode_env_key(key: str, where: str) -> int:
-    if not key.isdigit() or str(int(key)) != key:
-        raise ValueError(f"{where}: expected a non-negative integer key, got {key!r}")
-    return int(key)

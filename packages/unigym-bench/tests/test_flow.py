@@ -6,21 +6,23 @@ import pytest
 import torch
 from unigym.core.episode_termination import TerminationSource
 
+from unigym_bench.compose import compose_task
 from unigym_bench.engine import EngineStateError, StreamingEngine
 from unigym_bench.events import EpisodeSummary, Event
 from unigym_bench.flow import (
     BenchmarkTick,
     DefaultBenchmarkFlow,
     EpisodeBatch,
+    EventRule,
     FlowDecision,
     FlowRun,
+    TerminationRule,
     _MonitorTickOutput,
-    _monitor_bridge_decision,
     validate_flow,
 )
 from unigym_bench.report import REPORT_SCHEMA
 from unigym_bench.sink import BenchmarkSink
-from unigym_bench.specs import RetentionSpec
+from unigym_bench.specs import RetentionSpec, parse_task_document
 from _support import (
     CountingReportExtension,
     ScriptedMonitor,
@@ -28,6 +30,7 @@ from _support import (
     make_bundle,
     make_context,
     make_termination,
+    make_values,
 )
 
 _EVENT = Event(
@@ -124,16 +127,16 @@ class MissingCallbacksFlow:
 
 
 def _scripted_sink(
-    *flows: object, extension: CountingReportExtension | None = None
+    *flows: object,
+    extension: CountingReportExtension | None = None,
+    values: dict[str, torch.Tensor] | None = None,
 ) -> tuple[BenchmarkSink, StreamingEngine, ScriptedMonitor]:
     """Build a sink over one scripted monitor with optional explicit flow."""
     monitor = ScriptedMonitor(
         "contact",
         {
             0: TickScript(
-                signals={"level": torch.tensor([1.0])},
-                events=(_EVENT,),
-                terminals={0: make_termination("custom.contact.hit")},
+                values={"fired": torch.tensor([True])} if values is None else values,
             )
         },
     )
@@ -224,16 +227,11 @@ def test_benchmark_tick_freezes_outputs_and_shares_the_query_snapshot() -> None:
         tick.monitor_outputs[0].values["new"] = torch.tensor([1.0, 1.0])  # type: ignore[index]
 
 
-def test_flow_decision_accepts_a_mapping_and_keeps_ordered_requests() -> None:
+def test_flow_decision_accepts_one_terminal_per_env() -> None:
     first = make_termination("custom.first.reason")
-    second = make_termination("custom.second.reason")
 
     mapped = FlowDecision(terminations={0: first})
-    assert mapped.terminal_requests == ((0, first),)
-
-    ordered = FlowDecision.from_requests(requests=((0, first), (0, second)))
-    assert ordered.terminal_requests == ((0, first), (0, second))
-    assert dict(ordered.terminations) == {0: second}
+    assert dict(mapped.terminations) == {0: first}
     with pytest.raises(TypeError, match="stop"):
         FlowDecision(stop=1)  # type: ignore[arg-type]
 
@@ -263,34 +261,60 @@ def test_default_flow_report_is_identical_to_an_explicit_default_flow() -> None:
     assert _drive(implicit) == _drive(explicit)
 
 
-def test_default_flow_preserves_monitor_events_and_termination_conflicts() -> None:
-    first = ScriptedMonitor(
-        "first", {0: TickScript(terminals={0: make_termination("custom.first.reason")})}
-    )
-    second = ScriptedMonitor(
-        "second", {0: TickScript(terminals={0: make_termination("custom.second.reason")})}
+def test_monitor_value_alone_never_terminates() -> None:
+    sink, engine, _monitor = _scripted_sink(values={"fired": torch.tensor([True])})
+    bundle = make_bundle(num_envs=1, t=0)
+
+    sink.on_step(0, bundle)
+    assert sink.drain_terminations() == {}
+    sink.on_episode_end([0], bundle)
+    report = sink.on_run_end()["BenchmarkSink"]
+
+    assert engine.records[0].verdict == "core"
+    assert report["terminations"]["total"] == 0
+
+
+def test_default_flow_rules_create_old_codes_and_first_true_wins() -> None:
+    first = ScriptedMonitor("first", {0: TickScript(values={"fired": torch.tensor([True])})})
+    second = ScriptedMonitor("second", {0: TickScript(values={"fired": torch.tensor([True])})})
+    flow = DefaultBenchmarkFlow(
+        (
+            TerminationRule("first", "fired", "failure", "custom.first.hit"),
+            TerminationRule("second", "fired", "success", "custom.second.hit"),
+        )
     )
     engine = StreamingEngine([first, second], retention=RetentionSpec(retain_episodes=True))
-    sink = BenchmarkSink(engine=engine)
+    sink = BenchmarkSink(engine=engine, flow=flow)
     bundle = make_bundle(num_envs=1, t=0)
 
     sink.on_step(0, bundle)
     pending = sink.drain_terminations()
-    assert pending[0].code == "custom.first.reason"
-    assert dict(engine.conflicts) == {0: 1}
-    assert engine.conflict_count == 1
+    assert pending[0].code == "custom.first.hit"
+    assert engine.conflicts == {}
 
     sink.on_episode_end([0], bundle)
     report = sink.on_run_end()["BenchmarkSink"]
-    assert report["execution"]["terminal_conflicts"] == 1
+    assert report["execution"]["terminal_conflicts"] == 0
 
 
-def test_default_flow_journals_tick_events() -> None:
-    sink, engine, _monitor = _scripted_sink()
+def test_default_flow_with_no_rules_has_no_automatic_termination() -> None:
+    flow = DefaultBenchmarkFlow()
+
+    assert flow.rules == ()
+    assert flow.events == ()
+
+
+def test_default_flow_journals_explicit_tick_events() -> None:
+    flow = DefaultBenchmarkFlow(
+        events=(EventRule("contact", "fired", "contact", severity="warning"),)
+    )
+    sink, engine, _monitor = _scripted_sink(flow)
 
     _drive(sink)
 
-    assert engine.journal == (_EVENT,)
+    assert len(engine.journal) == 1
+    assert engine.journal[0].code == "task.contact.contact"
+    assert engine.journal[0].severity == "warning"
     assert engine.summary.event_count == 1
 
 
@@ -316,7 +340,7 @@ def test_custom_flow_decision_is_validated_before_mutating_the_engine() -> None:
 
 
 def test_engine_conductor_begins_and_applies_one_tick_at_a_time() -> None:
-    monitor = ScriptedMonitor("contact", {0: TickScript(signals={"level": torch.tensor([1.0])})})
+    monitor = ScriptedMonitor("contact", {0: TickScript(values={"level": torch.tensor([1.0])})})
     engine = StreamingEngine([monitor])
     bundle = make_bundle(num_envs=1, t=0)
 
@@ -324,7 +348,7 @@ def test_engine_conductor_begins_and_applies_one_tick_at_a_time() -> None:
     assert tick.query is tick.step.query
     with pytest.raises(EngineStateError, match="already active"):
         engine.begin_tick(bundle)
-    engine.apply_decision(tick, _monitor_bridge_decision(tick))
+    engine.apply_decision(tick, FlowDecision())
     next_tick = engine.begin_tick(bundle)
     assert next_tick is not tick
     engine.discard_tick(next_tick)
@@ -332,12 +356,16 @@ def test_engine_conductor_begins_and_applies_one_tick_at_a_time() -> None:
 
 def test_engine_conductor_episode_boundary_commits_a_record() -> None:
     sink_monitor = ScriptedMonitor(
-        "contact", {0: TickScript(terminals={0: make_termination("custom.contact.hit")})}
+        "contact", {0: TickScript(values={"fired": torch.tensor([True])})}
+    )
+    flow = DefaultBenchmarkFlow(
+        (TerminationRule("contact", "fired", "success", "custom.contact.hit"),)
     )
     engine = StreamingEngine([sink_monitor], retention=RetentionSpec(retain_episodes=True))
     bundle = make_bundle(num_envs=1, t=0)
 
-    engine.on_step(bundle)
+    tick = engine.begin_tick(bundle)
+    engine.apply_decision(tick, flow.on_tick(tick))
     batch = engine.begin_episode_end([0], bundle)
     assert batch is not None
     assert batch.due == (0,)
@@ -415,3 +443,83 @@ def test_flow_run_accepts_minimal_report_bundle() -> None:
     assert not hasattr(run, "monitors")
     assert dict(run.monitor_extensions) == {}
     assert dict(run.monitor_views) == {}
+
+
+def test_default_flow_rule_requires_a_boolean_value() -> None:
+    sink, _engine, _monitor = _scripted_sink(
+        DefaultBenchmarkFlow(
+            (TerminationRule("contact", "fired", "success", "custom.contact.hit"),)
+        ),
+        values={"fired": torch.tensor([1.0])},
+    )
+
+    with pytest.raises(TypeError, match="torch.bool"):
+        sink.on_step(0, make_bundle(num_envs=1, t=0))
+
+
+def test_default_flow_rejects_duplicate_rule_values() -> None:
+    with pytest.raises(ValueError, match="duplicate"):
+        DefaultBenchmarkFlow(
+            (
+                TerminationRule("contact", "fired", "success", "custom.contact.one"),
+                TerminationRule("contact", "fired", "failure", "custom.contact.two"),
+            )
+        )
+
+
+def test_composed_task_flow_wires_rules_and_terminates_at_runtime() -> None:
+    document = parse_task_document(
+        {
+            "schema": "unigym_extbench/3",
+            "name": "reach",
+            "monitors": {
+                "contact": {
+                    "builtin": "predicate",
+                    "when": {"source": "value:level", "op": "gte", "value": 0.5},
+                    "trigger": "edge",
+                    "emit": {"value": "hit"},
+                }
+            },
+            "flow": {
+                "termination_rules": [
+                    {
+                        "monitor": "contact",
+                        "value": "hit",
+                        "outcome": "failure",
+                        "code": "custom.contact.threshold",
+                    }
+                ],
+                "events": [
+                    {
+                        "monitor": "contact",
+                        "value": "hit",
+                        "name": "threshold_reached",
+                        "severity": "warning",
+                    }
+                ],
+            },
+        }
+    )
+
+    plan = compose_task(document)
+    assert isinstance(plan.flow, DefaultBenchmarkFlow)
+    assert plan.flow.rules == (
+        TerminationRule("contact", "hit", "failure", "custom.contact.threshold"),
+    )
+    assert plan.flow.events == (
+        EventRule("contact", "hit", "threshold_reached", severity="warning"),
+    )
+
+    engine = StreamingEngine(plan.monitors, retention=RetentionSpec(retain_episodes=True))
+    sink = BenchmarkSink(engine=engine, flow=plan.flow)
+    bundle = make_bundle(num_envs=1, t=0, values=make_values([1.0]))
+
+    sink.on_step(0, bundle)
+    pending = sink.drain_terminations()
+    assert pending[0].code == "custom.contact.threshold"
+    assert [event.code for event in engine.journal] == ["task.contact.threshold_reached"]
+
+    sink.on_episode_end([0], bundle)
+    report = sink.on_run_end()["BenchmarkSink"]
+    assert report["terminations"]["code"] == {"custom.contact.threshold": 1}
+    assert engine.records[0].verdict == "terminal"

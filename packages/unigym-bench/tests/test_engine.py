@@ -15,7 +15,7 @@ from unigym.core.episode_termination import (
 from unigym.values import StepValues, ValueStore
 
 from unigym_bench.engine import EngineStateError, StreamingEngine
-from unigym_bench.events import Event
+from unigym_bench.flow import DefaultBenchmarkFlow, EventRule, FlowDecision, TerminationRule
 from unigym_bench.monitors import PredicateMonitor, threshold_config
 from unigym_bench.specs import RetentionSpec
 from _support import (
@@ -27,23 +27,28 @@ from _support import (
 )
 
 
+def _apply_flow_tick(
+    engine: StreamingEngine, flow: DefaultBenchmarkFlow, bundle: dict[str, object]
+) -> None:
+    tick = engine.begin_tick(bundle)
+    engine.apply_decision(tick, flow.on_tick(tick))
+
+
 def test_multi_env_interleaving_latches_each_env_independently() -> None:
-    monitor = threshold_config(
-        "contact",
-        "value:level",
-        threshold=0.5,
-        terminal_outcome="success",
+    monitor = threshold_config("contact", "value:level", threshold=0.5)
+    flow = DefaultBenchmarkFlow(
+        (TerminationRule("contact", "threshold_reached", "success", "custom.contact.threshold"),)
     )
     engine = StreamingEngine([monitor], retention=RetentionSpec(retain_episodes=True))
 
-    engine.on_step(make_bundle(t=0, num_envs=2, values=make_values([1.0, 0.0])))
+    _apply_flow_tick(engine, flow, make_bundle(t=0, num_envs=2, values=make_values([1.0, 0.0])))
     first = engine.drain_terminations()
     assert set(first) == {0}
     assert first[0].code == "custom.contact.threshold"
     engine.on_episode_end([0], make_bundle(t=0, num_envs=2))
     engine.on_reset([0])
 
-    engine.on_step(make_bundle(t=1, num_envs=2, values=make_values([0.0, 1.0])))
+    _apply_flow_tick(engine, flow, make_bundle(t=1, num_envs=2, values=make_values([0.0, 1.0])))
     second = engine.drain_terminations()
     assert set(second) == {1}
     assert second[1].code == "custom.contact.threshold"
@@ -61,59 +66,46 @@ def test_multi_env_interleaving_latches_each_env_independently() -> None:
     assert engine.summary.episodes == 2
 
 
-def test_first_terminal_wins_and_later_requests_are_conflicts() -> None:
-    first = ScriptedMonitor(
-        "first",
-        {0: TickScript(terminals={0: make_termination("custom.first.reason")})},
-    )
-    second = ScriptedMonitor(
-        "second",
-        {0: TickScript(terminals={0: make_termination("custom.second.reason")})},
-    )
-    engine = StreamingEngine([first, second])
-
-    engine.on_step(make_bundle(num_envs=1, t=0))
-    pending = engine.drain_terminations()
-    assert set(pending) == {0}
-    assert pending[0].code == "custom.first.reason"
-    assert dict(engine.conflicts) == {0: 1}
-    assert engine.conflict_count == 1
-    assert engine.drain_terminations() == {}
-
-
 def test_late_terminal_for_open_latched_env_is_a_conflict() -> None:
     monitor = ScriptedMonitor(
         "late",
         {
-            0: TickScript(terminals={0: make_termination("custom.late.first")}),
-            1: TickScript(terminals={0: make_termination("custom.late.second")}),
+            0: TickScript(values={"fired": torch.tensor([True])}),
+            1: TickScript(values={"fired": torch.tensor([True])}),
         },
     )
+    flow = DefaultBenchmarkFlow((TerminationRule("late", "fired", "success", "custom.late.first"),))
     engine = StreamingEngine([monitor])
 
-    engine.on_step(make_bundle(num_envs=1, t=0))
-    assert set(engine.drain_terminations()) == {0}
-    engine.on_step(make_bundle(num_envs=1, t=1))
+    _apply_flow_tick(engine, flow, make_bundle(num_envs=1, t=0))
+    pending = engine.drain_terminations()
+    assert set(pending) == {0}
+    assert pending[0].code == "custom.late.first"
+    _apply_flow_tick(engine, flow, make_bundle(num_envs=1, t=1))
     assert engine.drain_terminations() == {}
     assert dict(engine.conflicts) == {0: 1}
+    assert engine.conflict_count == 1
 
 
 def test_terminal_for_closed_env_is_a_contract_error() -> None:
     monitor = ScriptedMonitor(
         "closed",
         {
-            0: TickScript(terminals={0: make_termination("custom.closed.first")}),
-            1: TickScript(terminals={0: make_termination("custom.closed.second")}),
+            0: TickScript(values={"fired": torch.tensor([True])}),
+            1: TickScript(values={"fired": torch.tensor([True])}),
         },
+    )
+    flow = DefaultBenchmarkFlow(
+        (TerminationRule("closed", "fired", "success", "custom.closed.first"),)
     )
     engine = StreamingEngine([monitor], retention=RetentionSpec(retain_episodes=True))
 
-    engine.on_step(make_bundle(num_envs=1, t=0))
+    _apply_flow_tick(engine, flow, make_bundle(num_envs=1, t=0))
     engine.drain_terminations()
     engine.on_episode_end([0], make_bundle(num_envs=1, t=0))
 
     with pytest.raises(EngineStateError, match="closed env 0"):
-        engine.on_step(make_bundle(num_envs=1, t=1))
+        _apply_flow_tick(engine, flow, make_bundle(num_envs=1, t=1))
     with pytest.raises(EngineStateError, match="already closed"):
         engine.on_episode_end([0], make_bundle(num_envs=1, t=1))
 
@@ -150,18 +142,14 @@ def test_reset_of_open_env_with_no_new_tick_reports_no_episode() -> None:
 
 
 def test_event_journal_cap_and_dropped_count() -> None:
-    script = {
-        tick: TickScript(
-            events=(Event(name="tick", code="task.cap.tick", env_ids=(0,)),),
-        )
-        for tick in range(3)
-    }
+    script = {tick: TickScript(values={"fired": torch.tensor([True])}) for tick in range(3)}
+    flow = DefaultBenchmarkFlow(events=(EventRule("cap", "fired", "tick", code="task.cap.tick"),))
     engine = StreamingEngine(
         [ScriptedMonitor("cap", script)],
         retention=RetentionSpec(max_events=2, retain_episodes=True),
     )
     for tick in range(3):
-        engine.on_step(make_bundle(num_envs=1, t=tick))
+        _apply_flow_tick(engine, flow, make_bundle(num_envs=1, t=tick))
 
     assert len(engine.journal) == 2
     assert engine.dropped_events == 1
@@ -175,11 +163,14 @@ def test_event_journal_cap_and_dropped_count() -> None:
 def test_event_log_disabled_counts_every_occurrence_as_dropped() -> None:
     monitor = ScriptedMonitor(
         "disabled",
-        {0: TickScript(events=(Event(name="tick", code="task.cap.tick", env_ids=(0,)),))},
+        {0: TickScript(values={"fired": torch.tensor([True])})},
+    )
+    flow = DefaultBenchmarkFlow(
+        events=(EventRule("disabled", "fired", "tick", code="task.cap.tick"),)
     )
     engine = StreamingEngine([monitor], retention=RetentionSpec(event_log=False))
 
-    engine.on_step(make_bundle(num_envs=1, t=0))
+    _apply_flow_tick(engine, flow, make_bundle(num_envs=1, t=0))
     assert engine.journal == ()
     assert engine.dropped_events == 1
 
@@ -189,7 +180,7 @@ def test_signal_publication_is_namespaced() -> None:
         "first",
         {
             0: TickScript(
-                signals={
+                values={
                     "level": torch.tensor([1.0, 2.0]),
                     "active": torch.tensor([True, False]),
                 }
@@ -198,7 +189,7 @@ def test_signal_publication_is_namespaced() -> None:
     )
     second = ScriptedMonitor(
         "second",
-        {0: TickScript(signals={"value": torch.tensor([3.0, 4.0])})},
+        {0: TickScript(values={"value": torch.tensor([3.0, 4.0])})},
     )
     store = ValueStore(num_envs=2, device="cpu")
     engine = StreamingEngine([first, second], publisher=store.publisher("sink"))
@@ -216,9 +207,9 @@ def test_values_are_not_published_for_a_closed_env_tick() -> None:
     monitor = ScriptedMonitor(
         "levels",
         {
-            0: TickScript(signals={"level": torch.tensor([1.0, 2.0])}),
-            1: TickScript(signals={"level": torch.tensor([3.0, 4.0])}),
-            2: TickScript(signals={"level": torch.tensor([5.0, 6.0])}),
+            0: TickScript(values={"level": torch.tensor([1.0, 2.0])}),
+            1: TickScript(values={"level": torch.tensor([3.0, 4.0])}),
+            2: TickScript(values={"level": torch.tensor([5.0, 6.0])}),
         },
     )
     store = ValueStore(num_envs=2, device="cpu")
@@ -244,13 +235,16 @@ def test_episode_end_reset_and_reopen_start_a_new_sequence() -> None:
     monitor = ScriptedMonitor(
         "reopen",
         {
-            0: TickScript(terminals={0: make_termination("custom.reopen.first")}),
-            1: TickScript(terminals={0: make_termination("custom.reopen.second")}),
+            0: TickScript(values={"fired": torch.tensor([True])}),
+            1: TickScript(values={"fired": torch.tensor([True])}),
         },
+    )
+    flow = DefaultBenchmarkFlow(
+        (TerminationRule("reopen", "fired", "success", "custom.reopen.first"),)
     )
     engine = StreamingEngine([monitor], retention=RetentionSpec(retain_episodes=True))
 
-    engine.on_step(make_bundle(num_envs=1, t=0))
+    _apply_flow_tick(engine, flow, make_bundle(num_envs=1, t=0))
     assert engine.drain_terminations()[0].code == "custom.reopen.first"
     engine.on_episode_end([0], make_bundle(num_envs=1, t=0))
     assert engine.open_envs == ()
@@ -259,8 +253,8 @@ def test_episode_end_reset_and_reopen_start_a_new_sequence() -> None:
 
     engine.on_reset([0])
     assert engine.open_envs == (0,)
-    engine.on_step(make_bundle(num_envs=1, t=1))
-    assert engine.drain_terminations()[0].code == "custom.reopen.second"
+    _apply_flow_tick(engine, flow, make_bundle(num_envs=1, t=1))
+    assert engine.drain_terminations()[0].code == "custom.reopen.first"
     engine.on_episode_end([0], make_bundle(num_envs=1, t=1))
 
     assert [(record.episode_seq, record.ticks, record.verdict) for record in engine.records] == [
@@ -291,15 +285,16 @@ def test_open_episodes_are_finalized_as_incomplete_at_run_end() -> None:
     monitor = ScriptedMonitor(
         "open",
         {
-            0: TickScript(terminals={0: make_termination("custom.open.first")}),
-            1: TickScript(),
+            0: TickScript(values={"fired": torch.tensor([True, False])}),
+            1: TickScript(values={"fired": torch.tensor([False, False])}),
         },
     )
+    flow = DefaultBenchmarkFlow((TerminationRule("open", "fired", "success", "custom.open.first"),))
     engine = StreamingEngine([monitor], retention=RetentionSpec(retain_episodes=True))
 
-    engine.on_step(make_bundle(num_envs=2, t=0))
+    _apply_flow_tick(engine, flow, make_bundle(num_envs=2, t=0))
     assert set(engine.drain_terminations()) == {0}
-    engine.on_step(make_bundle(num_envs=2, t=1))
+    _apply_flow_tick(engine, flow, make_bundle(num_envs=2, t=1))
 
     summary = engine.on_run_end()
     records = engine.records
@@ -335,31 +330,22 @@ def test_due_env_without_pack_terminal_uses_core_termination_verdict() -> None:
 
 
 def test_terminal_source_and_code_are_validated() -> None:
-    bad_source = ScriptedMonitor(
-        "bad_source",
-        {
-            0: TickScript(
-                terminals={
-                    0: make_termination("custom.bad.reason", source=TerminationSource.ENVIRONMENT)
-                }
-            )
-        },
-    )
+    engine = StreamingEngine([ScriptedMonitor("idle", {})])
+    tick = engine.begin_tick(make_bundle(num_envs=1, t=0))
+    bad_source = make_termination("custom.bad.reason", source=TerminationSource.ENVIRONMENT)
     with pytest.raises(ValueError, match="source must be custom"):
-        StreamingEngine([bad_source]).on_step(make_bundle(num_envs=1, t=0))
+        engine.apply_decision(tick, FlowDecision(terminations={0: bad_source}))
 
-    bad_code = ScriptedMonitor(
-        "bad_code",
-        {0: TickScript(terminals={0: make_termination("env.force_limit")})},
-    )
+    tick = engine.begin_tick(make_bundle(num_envs=1, t=1))
+    bad_code = make_termination("env.force_limit")
     with pytest.raises(ValueError, match="must start with 'custom.'"):
-        StreamingEngine([bad_code]).on_step(make_bundle(num_envs=1, t=0))
+        engine.apply_decision(tick, FlowDecision(terminations={0: bad_code}))
 
 
-def test_signal_shape_is_validated() -> None:
+def test_value_shape_is_validated() -> None:
     monitor = ScriptedMonitor(
-        "bad_signal",
-        {0: TickScript(signals={"level": torch.tensor([1.0, 2.0])})},
+        "bad_value",
+        {0: TickScript(values={"level": torch.tensor([1.0, 2.0])})},
     )
 
     with pytest.raises(ValueError, match="leading dimension num_envs=1"):
@@ -398,12 +384,6 @@ def _final_predicate() -> "PredicateMonitor":
         "end_pred",
         {"source": "value:flag", "op": "gt", "value": 0.0},
         "episode_end",
-        {
-            "event": "done",
-            "severity": "warning",
-            "terminal_reason": "score",
-            "terminal_outcome": "success",
-        },
     )
 
 
@@ -423,27 +403,27 @@ def test_episode_end_uses_final_step_values_and_publishes_final_levels() -> None
     )
 
     engine.on_step(bundle)
-    assert monitor.signals()["fired"].tolist() == [False]
+    assert monitor.values()["fired"].tolist() == [False]
     assert store.snapshot()["end_pred/fired"].tolist() == [False]
 
     engine.on_episode_end([0], bundle)
 
-    assert engine.records[0].event_counts == {"task.end_pred.done": 1}
-    assert engine.summary.event_count == 1
-    assert engine.summary.termination_code_counts == {"custom.end_pred.score": 1}
-    assert engine.summary.termination_outcome_counts == {"success": 1}
-    assert engine.summary.termination_source_counts == {"custom": 1}
+    assert engine.records[0].event_counts == {}
+    assert engine.summary.event_count == 0
+    assert engine.summary.termination_code_counts == {}
+    assert engine.summary.termination_outcome_counts == {}
     assert engine.drain_terminations() == {}
     assert engine.conflicts == {}
     assert store.snapshot()["end_pred/fired"].tolist() == [True]
 
 
-def test_final_scoring_terminal_does_not_enter_the_runner_latch_or_drain() -> None:
+def test_final_episode_value_never_enters_the_runner_latch_or_drain() -> None:
     tick = ScriptedMonitor(
         "tick",
-        {0: TickScript(terminals={0: make_termination("custom.tick.hit")})},
+        {0: TickScript(values={"fired": torch.tensor([True])})},
     )
     final = _final_predicate()
+    flow = DefaultBenchmarkFlow((TerminationRule("tick", "fired", "success", "custom.tick.hit"),))
     engine = StreamingEngine(
         [tick, final],
         retention=RetentionSpec(retain_episodes=True),
@@ -455,17 +435,14 @@ def test_final_scoring_terminal_does_not_enter_the_runner_latch_or_drain() -> No
         final_values=StepValues({"flag": torch.tensor([1.0])}),
     )
 
-    engine.on_step(bundle)
+    _apply_flow_tick(engine, flow, bundle)
     assert set(engine.drain_terminations()) == {0}
     engine.on_episode_end([0], bundle)
 
     assert engine.conflicts == {}
     assert engine.drain_terminations() == {}
-    assert engine.summary.termination_code_counts == {
-        "custom.end_pred.score": 1,
-        "custom.tick.hit": 1,
-    }
-    assert engine.records[0].event_counts == {"task.end_pred.done": 1}
+    assert engine.summary.termination_code_counts == {"custom.tick.hit": 1}
+    assert engine.records[0].event_counts == {}
 
 
 def test_episode_end_requires_the_final_step_context() -> None:
@@ -483,7 +460,6 @@ def test_on_step_reads_tick_values_not_the_final_step_values() -> None:
         "tick_pred",
         {"source": "value:flag", "op": "gt", "value": 0.0},
         "tick",
-        {"event": "hit"},
     )
     engine = StreamingEngine([monitor])
     bundle = make_bundle(

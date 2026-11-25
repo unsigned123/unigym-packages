@@ -60,7 +60,7 @@ never writes the core ``benchmark_report.json`` or any other core artifact.
 
 Rewind and early-stop hooks.  ``stop_when`` never stops.  The sink exposes the
 run's :class:`~unigym_bench.engine.StreamingEngine` as its core rewind provider
-(``name="unigym_bench"``, schema ``unigym_bench.rewind/4``); the engine owns all
+(``name="unigym_bench"``, schema ``unigym_bench.rewind/5``); the engine owns all
 checkpointable pack state, including stateful report extensions.  A snapshot is
 taken between completed ticks, so there is no provisional reset glue to save.
 The sampler cursor/RNG and the core ``values`` store are separate core
@@ -208,6 +208,7 @@ def make_sink(ctx: SinkContext) -> BenchmarkSink:
         monitors: Sequence[Monitor] = plan.monitors
         extensions: Sequence[ReportExtension] = plan.extensions
         retention = plan.retention
+        plan_flow: BenchmarkFlow | None = plan.flow
     else:
         monitors = ()
         if raw_monitor_factory is not None:
@@ -215,6 +216,7 @@ def make_sink(ctx: SinkContext) -> BenchmarkSink:
         extensions = ()
         if raw_extension_factory is not None:
             extensions = _resolve_extension_factory(raw_extension_factory)()
+        plan_flow = None
     monitor_extensions: Mapping[str, str] | None = None
     raw_monitor_extensions = options.get("monitor_extensions")
     if raw_monitor_extensions is not None:
@@ -258,11 +260,12 @@ def make_sink(ctx: SinkContext) -> BenchmarkSink:
         metadata=metadata,
         monitor_extensions=monitor_extensions,
         write_report=raw_write_report,
+        flow=plan_flow,
     )
 
 
 class BenchmarkSink:
-    """The pack's four-callback Sink plus the one-shot terminal drain.
+    """The pack's runner Sink plus the one-shot terminal drain.
 
     The sink is a thin lifecycle shell over a :class:`StreamingEngine`.  It
     never owns episode, latency, deadline or monitor/extension state of its own.
@@ -276,8 +279,8 @@ class BenchmarkSink:
             When supplied, ``retention``, ``publisher`` and ``extensions`` must
             be omitted because the engine already owns them.
         flow: Optional benchmark flow.  The default is a stateless
-            :class:`~unigym_bench.flow.DefaultBenchmarkFlow` that reproduces
-            the pack's existing monitor and report behavior.
+            :class:`~unigym_bench.flow.DefaultBenchmarkFlow` with no rules, so
+            monitor values never terminate an episode by themselves.
         retention: Explicit event/episode retention for a sink-built engine.
         publisher: Optional write-only value publisher for a sink-built engine.
         loop_mode: ``"pool"`` or ``"sink-steered"``.  A sink-steered sink needs
@@ -405,10 +408,10 @@ class BenchmarkSink:
     def on_step(self, t: int, bundle: dict[str, object]) -> None:
         """Begin a tick, ask the flow, and apply the validated decision.
 
-        ``begin_tick`` has already advanced episode tick counters and drained
-        monitor outputs before ``flow.on_tick`` runs.  If the callback raises,
-        the sink discards the pending tick snapshot and re-raises; monitor
-        queues and tick counters are not rolled back, so the run must abort
+        ``begin_tick`` has already advanced episode tick counters and read the
+        tick's monitor values before ``flow.on_tick`` runs.  If the callback
+        raises, the sink discards the pending tick snapshot and re-raises; tick
+        counters and observed values are not rolled back, so the run must abort
         rather than continue on partially observed state.
         """
         del t
@@ -432,11 +435,11 @@ class BenchmarkSink:
     def on_episode_end(self, env_ids: object, bundle: dict[str, object]) -> None:
         """Begin the boundary, ask the flow, then commit the episode end.
 
-        ``begin_episode_end`` has already evaluated monitors, drained final
-        events/terminals and built the final query snapshot before
+        ``begin_episode_end`` has already evaluated monitors, refreshed their
+        final values and built the final query snapshot before
         ``flow.on_episode_end`` runs.  If the callback raises, the sink discards
-        the pending boundary and re-raises; no rollback of the drained queues
-        is attempted, so the run must abort.
+        the pending boundary and re-raises; no rollback of observed values is
+        attempted, so the run must abort.
         """
         batch = self._engine.begin_episode_end(env_ids, bundle)
         if batch is None:

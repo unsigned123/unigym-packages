@@ -34,8 +34,10 @@ from .flow import (
     BenchmarkTick,
     DefaultBenchmarkFlow,
     EpisodeBatch,
+    EventRule,
     FlowDecision,
     FlowRun,
+    TerminationRule,
     validate_flow,
 )
 from .json import JsonValue, ensure_json_value
@@ -48,8 +50,10 @@ __all__ = [
     "ComposeError",
     "DefaultBenchmarkFlow",
     "EpisodeBatch",
+    "EventRule",
     "FlowDecision",
     "FlowRun",
+    "TerminationRule",
     "JsonValue",
     "REQUIRED_CORE_VERSION",
     "TaskPlan",

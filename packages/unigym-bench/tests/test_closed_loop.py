@@ -34,7 +34,7 @@ def _scenario_monitor(script: dict[int, TickScript]) -> ScriptedMonitor:
 
 def test_monitor_desired_command_is_applied_at_the_next_update() -> None:
     desired = _desired([[9.0, -1.0], [2.5, 3.5]])
-    monitor = _scenario_monitor({0: TickScript(signals={"desired_cmd": desired})})
+    monitor = _scenario_monitor({0: TickScript(values={"desired_cmd": desired})})
     store = ValueStore(num_envs=2, device="cpu")
     engine = StreamingEngine([monitor], publisher=store.publisher("sink"))
     sampler = _sampler()
@@ -52,7 +52,7 @@ def test_monitor_desired_command_is_applied_at_the_next_update() -> None:
 
 def test_applying_a_desired_command_leaves_cursor_dwell_and_rng_untouched() -> None:
     desired = _desired([[9.0, -1.0], [2.5, 3.5]])
-    monitor = _scenario_monitor({0: TickScript(signals={"desired_cmd": desired})})
+    monitor = _scenario_monitor({0: TickScript(values={"desired_cmd": desired})})
     store = ValueStore(num_envs=2, device="cpu")
     engine = StreamingEngine([monitor], publisher=store.publisher("sink"))
     sampler = _sampler()
@@ -75,21 +75,21 @@ def test_command_valid_false_holds_the_previous_command() -> None:
     third = _desired([[4.0, 4.5], [5.0, 5.5]])
     monitor = _scenario_monitor(
         {
-            0: TickScript(signals={"desired_cmd": first}),
+            0: TickScript(values={"desired_cmd": first}),
             1: TickScript(
-                signals={
+                values={
                     "desired_cmd": second,
                     "command_valid": torch.tensor([False, False]),
                 }
             ),
             2: TickScript(
-                signals={
+                values={
                     "desired_cmd": second,
                     "command_valid": torch.tensor([True, True]),
                 }
             ),
             3: TickScript(
-                signals={
+                values={
                     "desired_cmd": third,
                     "command_valid": torch.tensor([True, False]),
                 }
@@ -189,7 +189,7 @@ def test_closed_loop_has_two_policy_tick_latency() -> None:
         2: _desired([[9.0, 10.0], [11.0, 12.0]]),
     }
     monitor = _scenario_monitor(
-        {tick: TickScript(signals={"desired_cmd": value}) for tick, value in commands.items()}
+        {tick: TickScript(values={"desired_cmd": value}) for tick, value in commands.items()}
     )
     store = ValueStore(num_envs=2, device="cpu")
     engine = StreamingEngine([monitor], publisher=store.publisher("sink"))
@@ -217,8 +217,8 @@ def test_rewind_restores_sampler_buffer_and_values_store_together() -> None:
     second = _desired([[5.0, 6.0], [7.0, 8.0]])
     monitor = _scenario_monitor(
         {
-            0: TickScript(signals={"desired_cmd": first}),
-            1: TickScript(signals={"desired_cmd": second}),
+            0: TickScript(values={"desired_cmd": first}),
+            1: TickScript(values={"desired_cmd": second}),
         }
     )
     store = ValueStore(num_envs=2, device="cpu")
@@ -264,7 +264,7 @@ def test_update_reads_only_the_documented_closed_loop_values() -> None:
 
 def test_foreign_monitor_command_named_value_is_ignored() -> None:
     foreign = _desired([[42.0, 43.0], [44.0, 45.0]])
-    monitor = ScriptedMonitor("contact", {0: TickScript(signals={"desired_cmd": foreign})})
+    monitor = ScriptedMonitor("contact", {0: TickScript(values={"desired_cmd": foreign})})
     store = ValueStore(num_envs=2, device="cpu")
     engine = StreamingEngine([monitor], publisher=store.publisher("sink"))
     sampler = _sampler()

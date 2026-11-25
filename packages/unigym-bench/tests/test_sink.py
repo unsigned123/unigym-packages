@@ -18,7 +18,8 @@ from unigym.values import ValueStore
 
 import unigym_bench.sink as sink_module
 from unigym_bench.engine import StreamingEngine
-from unigym_bench.events import Event, EpisodeRecord
+from unigym_bench.events import EpisodeRecord
+from unigym_bench.flow import DefaultBenchmarkFlow, EventRule, TerminationRule
 from unigym_bench.json import ensure_json_value
 from unigym_bench.report import REPORT_FILENAME, REPORT_SCHEMA, RunMetadata
 from unigym_bench.sink import BenchmarkSink, make_sink
@@ -29,7 +30,6 @@ from _support import (
     TickScript,
     make_bundle,
     make_sink_context,
-    make_termination,
 )
 
 _FACTORY = "_support:make_threshold_monitors"
@@ -37,10 +37,11 @@ _FACTORY = "_support:make_threshold_monitors"
 
 def _engine_sink(
     monitor: ScriptedMonitor,
+    flow: DefaultBenchmarkFlow | None = None,
 ) -> tuple[BenchmarkSink, StreamingEngine]:
     """Build one sink over a real engine, retaining episode records."""
     engine = StreamingEngine([monitor], retention=RetentionSpec(retain_episodes=True))
-    return BenchmarkSink(engine=engine), engine
+    return BenchmarkSink(engine=engine, flow=flow), engine
 
 
 def test_make_sink_builds_from_a_real_context_and_monitor_factory() -> None:
@@ -258,9 +259,12 @@ def test_direct_construction_rejects_engine_and_monitor_conflicts() -> None:
 def test_sink_delegates_the_terminal_drain_and_reopens_on_reset() -> None:
     monitor = ScriptedMonitor(
         "contact",
-        {0: TickScript(terminals={0: make_termination("custom.contact.hit")})},
+        {0: TickScript(values={"fired": torch.tensor([True])})},
     )
-    sink, engine = _engine_sink(monitor)
+    flow = DefaultBenchmarkFlow(
+        (TerminationRule("contact", "fired", "success", "custom.contact.hit"),)
+    )
+    sink, engine = _engine_sink(monitor, flow)
     bundle = make_bundle(num_envs=1, t=0)
 
     sink.on_step(0, bundle)
@@ -290,9 +294,12 @@ def test_on_reset_before_the_first_tick_is_a_safe_noop() -> None:
 def test_on_run_end_immediately_after_reset_skips_the_zero_tick_reopened_env() -> None:
     monitor = ScriptedMonitor(
         "contact",
-        {0: TickScript(terminals={0: make_termination("custom.contact.hit")})},
+        {0: TickScript(values={"fired": torch.tensor([True])})},
     )
-    sink, engine = _engine_sink(monitor)
+    flow = DefaultBenchmarkFlow(
+        (TerminationRule("contact", "fired", "success", "custom.contact.hit"),)
+    )
+    sink, engine = _engine_sink(monitor, flow)
     bundle = make_bundle(num_envs=1, t=0)
 
     sink.on_step(0, bundle)
@@ -327,11 +334,14 @@ def test_reopened_episode_captures_new_command_and_reset_facts() -> None:
     monitor = ScriptedMonitor(
         "reopen",
         {
-            0: TickScript(terminals={0: make_termination("custom.reopen.first")}),
-            1: TickScript(terminals={0: make_termination("custom.reopen.second")}),
+            0: TickScript(values={"fired": torch.tensor([True])}),
+            1: TickScript(values={"fired": torch.tensor([True])}),
         },
     )
-    sink, engine = _engine_sink(monitor)
+    flow = DefaultBenchmarkFlow(
+        (TerminationRule("reopen", "fired", "success", "custom.reopen.first"),)
+    )
+    sink, engine = _engine_sink(monitor, flow)
     first = make_bundle(
         num_envs=1,
         t=0,
@@ -363,9 +373,10 @@ def test_reopened_episode_captures_new_command_and_reset_facts() -> None:
 def test_episode_record_captures_start_command_reset_facts_and_canonical_terminal() -> None:
     monitor = ScriptedMonitor(
         "hit",
-        {0: TickScript(terminals={0: make_termination("custom.hit.first")})},
+        {0: TickScript(values={"fired": torch.tensor([True])})},
     )
-    sink, engine = _engine_sink(monitor)
+    flow = DefaultBenchmarkFlow((TerminationRule("hit", "fired", "success", "custom.hit.first"),))
+    sink, engine = _engine_sink(monitor, flow)
     reset_state = {0: {"reset_index": 0, "reset_valid": True, "reset_reason": "initial"}}
     bundle = make_bundle(
         num_envs=1,
@@ -405,12 +416,13 @@ def test_episode_record_captures_start_command_reset_facts_and_canonical_termina
     assert record.rewound is False
 
 
-def test_record_keeps_the_monitor_request_when_no_canonical_stamp_is_available() -> None:
+def test_record_keeps_the_flow_request_when_no_canonical_stamp_is_available() -> None:
     monitor = ScriptedMonitor(
         "raw",
-        {0: TickScript(terminals={0: make_termination("custom.raw.first")})},
+        {0: TickScript(values={"fired": torch.tensor([True])})},
     )
-    sink, engine = _engine_sink(monitor)
+    flow = DefaultBenchmarkFlow((TerminationRule("raw", "fired", "success", "custom.raw.first"),))
+    sink, engine = _engine_sink(monitor, flow)
     bundle = make_bundle(num_envs=1, t=0)
 
     sink.on_step(0, bundle)
@@ -427,9 +439,12 @@ def test_record_keeps_the_monitor_request_when_no_canonical_stamp_is_available()
 def test_record_collects_episode_event_summaries() -> None:
     monitor = ScriptedMonitor(
         "events",
-        {0: TickScript(events=(Event(name="hit", code="task.events.hit", env_ids=(0,)),))},
+        {0: TickScript(values={"fired": torch.tensor([True])})},
     )
-    sink, engine = _engine_sink(monitor)
+    flow = DefaultBenchmarkFlow(
+        events=(EventRule("events", "fired", "hit", code="task.events.hit"),)
+    )
+    sink, engine = _engine_sink(monitor, flow)
     bundle = make_bundle(num_envs=1, t=0)
 
     sink.on_step(0, bundle)
@@ -583,7 +598,7 @@ def test_episode_record_rejects_non_json_reset_facts() -> None:
 def _write_task_document(
     tmp_path,
     *,
-    schema: str = "unigym_extbench/2",
+    schema: str = "unigym_extbench/3",
     extensions: str = "",
     scenario: str = "scenario:\n  command_pool: [[0.0], [1.0]]\n",
     retention: str = "retention:\n  retain_episodes: true\n  max_events: 3\n",
@@ -605,7 +620,7 @@ monitors:
       value: 0.5
     trigger: edge
     emit:
-      event: contact
+      value: contact
 {extension_line}{extensions}{retention}{scenario}"""
     path.write_text(text, encoding="utf-8")
     return path
@@ -684,12 +699,13 @@ def test_make_sink_rejects_bad_task_document_paths(task_document: object, fragme
 
 
 def test_make_sink_rejects_the_old_schema_in_a_task_document(tmp_path) -> None:
-    path = _write_task_document(tmp_path, schema="unigym_extbench/1")
+    path = _write_task_document(tmp_path, schema="unigym_extbench/2")
 
-    with pytest.raises(ConfigError, match="expected 'unigym_extbench/2'") as excinfo:
+    with pytest.raises(ConfigError, match="retired") as excinfo:
         make_sink(make_sink_context(options={"task_document": str(path)}))
 
     assert "task_document" in str(excinfo.value)
+    assert "unigym_extbench/3" in str(excinfo.value)
 
 
 def test_make_sink_rejects_duplicate_yaml_keys_in_a_task_document(tmp_path) -> None:

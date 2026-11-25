@@ -128,3 +128,23 @@ def test_core_contract_requires_each_value_surface(
     with pytest.raises(RuntimeError) as excinfo:
         compat.assert_core_contract()
     assert f"unigym.values.{attribute}" in str(excinfo.value)
+
+
+def test_pack_production_has_no_monitor_drain_surface() -> None:
+    """F3 removed monitor event/terminal drains from every production module."""
+    package = Path(unigym_bench.__file__).resolve().parent
+    forbidden = (
+        "def drain_events",
+        "def drain_terminals",
+        "def drain_episode_terminals",
+        ".drain_events(",
+        ".drain_terminals(",
+        ".drain_episode_terminals(",
+    )
+    offenders: list[str] = []
+    for path in sorted(package.glob("*.py")):
+        text = path.read_text(encoding="utf-8")
+        for fragment in forbidden:
+            if fragment in text:
+                offenders.append(f"{path.name}: {fragment}")
+    assert offenders == []

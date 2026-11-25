@@ -7,6 +7,7 @@ import json
 import pytest
 
 from unigym_bench.engine import REWIND_PROVIDER_NAME, REWIND_SCHEMA, StreamingEngine
+from unigym_bench.flow import DefaultBenchmarkFlow, EventRule, TerminationRule
 from unigym_bench.json import ensure_json_value
 from unigym_bench.monitors import PredicateMonitor, threshold_config
 from unigym_bench.sink import BenchmarkSink
@@ -25,13 +26,28 @@ def _sink(
         name,
         "value:level",
         threshold=threshold,
-        terminal_outcome=terminal_outcome,
+    )
+    rules = (
+        ()
+        if terminal_outcome is None
+        else (
+            TerminationRule(
+                name,
+                "threshold_reached",
+                terminal_outcome,
+                f"custom.{name}.threshold",
+            ),
+        )
+    )
+    flow = DefaultBenchmarkFlow(
+        rules,
+        events=(EventRule(name, "threshold_reached", "threshold_reached"),),
     )
     engine = StreamingEngine(
         [monitor],
         retention=RetentionSpec(retain_episodes=True) if retention is None else retention,
     )
-    return BenchmarkSink(engine=engine), engine, monitor
+    return BenchmarkSink(engine=engine, flow=flow), engine, monitor
 
 
 def _bundle(t: int, row: list[float]) -> dict[str, object]:
@@ -60,8 +76,8 @@ def test_provider_identity_and_payload_is_json_safe_and_private() -> None:
     assert provider.name == REWIND_PROVIDER_NAME == "unigym_bench"
     state = provider.rewind_state()
 
-    assert state["schema"] == REWIND_SCHEMA == "unigym_bench.rewind/4"
-    assert state["monitors"]["contact"]["schema"] == "unigym_bench.monitor/3"
+    assert state["schema"] == REWIND_SCHEMA == "unigym_bench.rewind/5"
+    assert state["monitors"]["contact"]["schema"] == "unigym_bench.monitor/4"
     assert set(state) == {"schema", "engine", "monitors"}
     assert ensure_json_value(state) == state
     assert json.loads(json.dumps(state)) == state
@@ -191,7 +207,7 @@ def test_monitor_snapshot_config_mismatch_is_rejected_atomically() -> None:
     target_sink = BenchmarkSink(engine=target)
     target_sink.on_step(0, _bundle(0, [1.0]))
     assert stable.report_view()["fired"] == 1
-    assert len(target.journal) == 2
+    assert target.journal == ()
 
     with pytest.raises(ValueError, match="config does not match"):
         target_sink.rewind_provider.validate_rewind_state(snapshot)
@@ -199,10 +215,10 @@ def test_monitor_snapshot_config_mismatch_is_rejected_atomically() -> None:
         target_sink.rewind_provider.apply_rewind_state(snapshot)
 
     assert stable.report_view()["fired"] == 1
-    assert len(target.journal) == 2
+    assert target.journal == ()
     assert target.records == ()
     assert target.open_envs == (0,)
-    assert target.summary.event_count == 2
+    assert target.summary.event_count == 0
 
 
 def test_rewind_after_due_episode_marks_replayed_open_episode_rewound() -> None:
@@ -251,15 +267,15 @@ def test_old_rewind_and_monitor_schemas_are_rejected() -> None:
     state = sink.rewind_provider.rewind_state()
 
     old_rewind = json.loads(json.dumps(state))
-    old_rewind["schema"] = "unigym_bench.rewind/3"
-    with pytest.raises(ValueError, match=r"expected 'unigym_bench.rewind/4'"):
+    old_rewind["schema"] = "unigym_bench.rewind/4"
+    with pytest.raises(ValueError, match=r"expected 'unigym_bench.rewind/5'"):
         engine.validate_rewind_state(old_rewind)
-    with pytest.raises(ValueError, match=r"expected 'unigym_bench.rewind/4'"):
+    with pytest.raises(ValueError, match=r"expected 'unigym_bench.rewind/5'"):
         engine.apply_rewind_state(old_rewind)
 
     old_monitor = json.loads(json.dumps(state))
-    old_monitor["monitors"]["contact"]["schema"] = "unigym_bench.monitor/2"
-    with pytest.raises(ValueError, match=r"expected schema 'unigym_bench.monitor/3'"):
+    old_monitor["monitors"]["contact"]["schema"] = "unigym_bench.monitor/3"
+    with pytest.raises(ValueError, match=r"expected schema 'unigym_bench.monitor/4'"):
         engine.validate_rewind_state(old_monitor)
-    with pytest.raises(ValueError, match=r"expected schema 'unigym_bench.monitor/3'"):
+    with pytest.raises(ValueError, match=r"expected schema 'unigym_bench.monitor/4'"):
         engine.apply_rewind_state(old_monitor)

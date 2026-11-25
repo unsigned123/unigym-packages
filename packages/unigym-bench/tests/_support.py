@@ -26,7 +26,6 @@ from unigym.run.spec import build_spec
 from unigym.values import StepValues, ValueView
 from unigym_bench.context import BenchmarkStepContext
 from unigym_bench.engine import StreamingEngine
-from unigym_bench.events import Event
 from unigym_bench.json import JsonValue
 from unigym_bench.monitors import BaseMonitor, Monitor, threshold_config
 from unigym_bench.report import ScenarioCoverageExtension
@@ -286,22 +285,18 @@ def make_termination(
 
 @dataclass(frozen=True)
 class TickScript:
-    """One tick's scripted monitor outputs."""
+    """One tick's scripted monitor values."""
 
-    signals: Mapping[str, torch.Tensor] = field(default_factory=dict)
-    events: tuple[Event, ...] = ()
-    terminals: Mapping[int, Termination] = field(default_factory=dict)
+    values: Mapping[str, torch.Tensor] = field(default_factory=dict)
 
 
 class ScriptedMonitor(BaseMonitor):
-    """Test monitor that emits exactly the outputs scripted for each tick."""
+    """Test monitor that publishes exactly the values scripted for each tick."""
 
     def __init__(self, name: str, script: Mapping[int, TickScript]) -> None:
         super().__init__(name)
         self._script = dict(script)
-        self._signals: dict[str, torch.Tensor] = {}
-        self._events: list[Event] = []
-        self._terminals: dict[int, Termination] = {}
+        self._values: dict[str, torch.Tensor] = {}
         self.episode_ends: list[tuple[int, ...]] = []
         self.final_contexts: list[EnvStepContext | None] = []
         self.resets: list[tuple[int, ...]] = []
@@ -309,24 +304,12 @@ class ScriptedMonitor(BaseMonitor):
     def on_tick(self, context: EnvStepContext) -> None:
         step = self._script.get(context.t)
         if step is None:
-            self._signals = {}
+            self._values = {}
             return
-        self._signals = {name: value.to(context.device) for name, value in step.signals.items()}
-        self._events = list(step.events)
-        self._terminals = dict(step.terminals)
+        self._values = {name: value.to(context.device) for name, value in step.values.items()}
 
-    def signals(self) -> Mapping[str, torch.Tensor]:
-        return dict(self._signals)
-
-    def drain_events(self) -> Sequence[Event]:
-        events = tuple(self._events)
-        self._events.clear()
-        return events
-
-    def drain_terminals(self) -> Mapping[int, Termination]:
-        terminals = dict(self._terminals)
-        self._terminals.clear()
-        return terminals
+    def values(self) -> Mapping[str, torch.Tensor]:
+        return dict(self._values)
 
     def on_episode_end(self, env_ids: Sequence[int], context: EnvStepContext | None = None) -> None:
         self.episode_ends.append(tuple(env_ids))
@@ -418,7 +401,6 @@ def make_threshold_monitors() -> tuple[Monitor, ...]:
             "contact",
             "value:level",
             threshold=0.5,
-            terminal_outcome="success",
         ),
     )
 

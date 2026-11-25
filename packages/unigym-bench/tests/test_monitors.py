@@ -16,12 +16,6 @@ import torch
 
 import unigym_bench
 from _support import make_context, make_value_context, make_values
-from unigym.core.episode_termination import (
-    EpisodeOutcome,
-    Termination,
-    TerminationExtension,
-    TerminationSource,
-)
 from unigym.evaluation import EnvStepContext
 from unigym_bench.conditions import ConditionError
 from unigym_bench.events import EpisodeRecord, EpisodeSummary, Event
@@ -53,10 +47,8 @@ def _assert_roundtrip(monitor: object, clone: object, frames: Sequence[EnvStepCo
     assert ensure_json_value(snapshot) == snapshot
     clone.restore(snapshot)
     assert clone.snapshot() == snapshot
-    assert list(monitor.drain_events()) == list(clone.drain_events())
-    assert dict(monitor.drain_terminals()) == dict(clone.drain_terminals())
-    left = monitor.signals()
-    right = clone.signals()
+    left = monitor.values()
+    right = clone.values()
     assert set(left) == set(right)
     for key in left:
         assert torch.equal(left[key], right[key])
@@ -97,9 +89,7 @@ def test_base_monitor_defaults() -> None:
     assert isinstance(monitor, Monitor)
     assert not isinstance(monitor, RewindableMonitor)
     assert monitor.name == "base_monitor"
-    assert dict(monitor.signals()) == {}
-    assert tuple(monitor.drain_events()) == ()
-    assert dict(monitor.drain_terminals()) == {}
+    assert dict(monitor.values()) == {}
 
     frame = make_context()
     monitor.on_tick(frame)
@@ -143,71 +133,57 @@ def test_configuration_helpers_return_predicate_monitors() -> None:
         assert report["kind"] == "predicate"
 
 
-def test_threshold_configuration_parity_and_report_mapping() -> None:
+def test_threshold_configuration_value_and_report_mapping() -> None:
     rows = [[0.0, 0.0], [1.0, 0.0], [1.0, 0.0], [0.0, 1.0]]
     monitor = threshold_config(
         "contact",
         SourceRef.parse("value:level"),
         threshold=0.5,
-        terminal_outcome="failure",
     )
 
-    events_per_tick = []
-    terminals_per_tick = []
+    fired_per_tick = []
     for t, row in enumerate(rows):
         monitor.on_tick(_row_context(row, t=t))
-        events = monitor.drain_events()
-        events_per_tick.append([event.env_ids for event in events])
-        terminals_per_tick.append(len(monitor.drain_terminals()))
+        fired_per_tick.append(monitor.values()["threshold_reached"].tolist())
 
-    assert events_per_tick == [[], [(0,)], [], [(1,)]]
-    assert terminals_per_tick == [0, 1, 0, 1]
+    assert fired_per_tick == [
+        [False, False],
+        [True, False],
+        [False, False],
+        [False, True],
+    ]
 
     report = monitor.report_view()
     assert report["condition"] == {"source": "value:level", "op": "gte", "value": 0.5}
     assert report["trigger"] == {"kind": "edge"}
-    assert report["event"] == "threshold_reached"
-    assert report["terminal_reason"] == "threshold"
-    assert report["terminal_outcome"] == "failure"
+    assert report["emit"] == {"value": "threshold_reached"}
+    assert report["value"] == "threshold_reached"
+    assert "event" not in report
+    assert "terminal_reason" not in report
+    assert "terminal_outcome" not in report
     assert report["fired"] == 2
     assert report["fired_counts"] == [1, 1]
     assert report["episodes"] == 0
 
     monitor.reset([0])
     monitor.on_tick(_row_context([1.0, 0.0], t=4))
-    assert [event.env_ids for event in monitor.drain_events()] == [(0,)]
+    assert monitor.values()["threshold_reached"].tolist() == [True, False]
     assert monitor.report_view()["fired"] == 3
     assert monitor.report_view()["fired_counts"] == [2, 1]
 
 
-def test_threshold_event_and_terminal_keep_old_code_and_outcome() -> None:
-    monitor = threshold_config(
-        "contact",
-        "value:level",
-        threshold=0.5,
-        operator=">",
-        terminal_outcome="failure",
-    )
+def test_threshold_value_alone_never_produces_a_terminal() -> None:
+    monitor = threshold_config("contact", "value:level", threshold=0.5, operator=">")
 
     monitor.on_tick(_row_context([1.0], dtype=torch.float32))
-    events = monitor.drain_events()
-    assert len(events) == 1
-    assert events[0].name == "threshold_reached"
-    assert events[0].code == "task.contact.threshold_reached"
-    assert events[0].severity == "info"
-    assert events[0].env_ids == (0,)
-    assert events[0].data == {"trigger": "edge"}
-
-    terminals = monitor.drain_terminals()
-    assert set(terminals) == {0}
-    terminal = terminals[0]
-    assert terminal.outcome is EpisodeOutcome.FAILURE
-    assert terminal.source is TerminationSource.CUSTOM
-    assert terminal.code == "custom.contact.threshold"
-    assert terminal.metrics == {}
+    assert monitor.values()["threshold_reached"].tolist() == [True]
+    assert not any(
+        callable(getattr(monitor, name, None))
+        for name in ("drain_events", "drain_terminals", "drain_episode_terminals")
+    )
 
     monitor.on_tick(_row_context([1.0], t=1))
-    assert tuple(monitor.drain_terminals()) == ()
+    assert monitor.values()["threshold_reached"].tolist() == [False]
 
 
 @pytest.mark.parametrize(
@@ -229,7 +205,7 @@ def test_threshold_configuration_validates_inputs() -> None:
         threshold_config("bad", "value:level", threshold=True)
     with pytest.raises(ValueError):
         threshold_config("bad", "value:level", threshold=0.0, operator="=")  # type: ignore[arg-type]
-    with pytest.raises(ValueError):
+    with pytest.raises(TypeError):
         threshold_config("bad", "value:level", threshold=0.0, terminal_outcome="engine")
     with pytest.raises(ValueError):
         threshold_config("bad", "level", threshold=0.0)
@@ -254,37 +230,32 @@ def test_monitor_rejects_changed_num_envs() -> None:
         monitor.on_tick(_row_context([0.0], t=1))
 
 
-def test_hold_configuration_parity_and_rearm() -> None:
+def test_hold_configuration_value_and_rearm() -> None:
     rows = [[1.0], [1.0], [0.0], [1.0], [1.0], [1.0]]
     monitor = hold_config(
         "hold",
         "value:level",
         threshold=0.5,
         hold_steps=2,
-        terminal_outcome="success",
     )
 
-    event_counts = []
-    terminal_counts = []
+    fired_per_tick = []
     for t, row in enumerate(rows):
         monitor.on_tick(_row_context(row, t=t))
-        event_counts.append(len(monitor.drain_events()))
-        terminal_counts.append(len(monitor.drain_terminals()))
+        fired_per_tick.append(bool(monitor.values()["hold_reached"][0]))
 
-    assert event_counts == [0, 1, 0, 0, 1, 0]
-    assert terminal_counts == [0, 1, 0, 0, 1, 0]
+    assert fired_per_tick == [False, True, False, False, True, False]
     report = monitor.report_view()
     assert report["trigger"] == {"kind": "hold", "steps": 2}
-    assert report["event"] == "hold_reached"
-    assert report["terminal_reason"] == "hold"
+    assert report["emit"] == {"value": "hold_reached"}
     assert report["fired"] == 2
     assert report["fired_counts"] == [2]
 
     monitor.reset([0])
     monitor.on_tick(_row_context([1.0], t=6))
-    assert len(monitor.drain_events()) == 0
+    assert monitor.values()["hold_reached"].tolist() == [False]
     monitor.on_tick(_row_context([1.0], t=7))
-    assert len(monitor.drain_events()) == 1
+    assert monitor.values()["hold_reached"].tolist() == [True]
 
 
 def test_hold_validates_hold_steps() -> None:
@@ -293,48 +264,35 @@ def test_hold_validates_hold_steps() -> None:
             hold_config("bad", "value:level", threshold=0.0, hold_steps=value)
 
 
-def test_safety_configuration_parity() -> None:
+def test_safety_configuration_value() -> None:
     values = [0.9, 1.0, 0.1, 0.9]
     monitor = safety_config(
         "safety",
         "value:level",
         threshold=0.8,
         operator=">",
-        severity="fatal",
-        terminal_outcome="failure",
     )
 
-    events_per_tick = []
-    terminals_per_tick = []
+    fired_per_tick = []
     for t, value in enumerate(values):
         monitor.on_tick(_row_context([value], t=t))
-        events = monitor.drain_events()
-        events_per_tick.append(len(events))
-        if events:
-            assert all(event.severity == "fatal" for event in events)
-            assert all(event.code == "task.safety.violation" for event in events)
-        terminals_per_tick.append(len(monitor.drain_terminals()))
+        fired_per_tick.append(bool(monitor.values()["violation"][0]))
 
-    assert events_per_tick == [1, 0, 0, 1]
-    assert terminals_per_tick == [1, 0, 0, 1]
+    assert fired_per_tick == [True, False, False, True]
     report = monitor.report_view()
-    assert report["severity"] == "fatal"
-    assert report["event"] == "violation"
-    assert report["terminal_reason"] == "violation"
+    assert report["emit"] == {"value": "violation"}
     assert report["fired"] == 2
     assert report["fired_counts"] == [2]
 
     monitor.reset([0])
     monitor.on_tick(_row_context([0.9], t=4))
-    assert len(monitor.drain_events()) == 1
+    assert monitor.values()["violation"].tolist() == [True]
 
 
-def test_event_counter_configuration_parity_and_report_only() -> None:
-    state = {"row": [False, False]}
-    monitor = event_counter_config("occurrences", "value:flag", severity="warning")
+def test_event_counter_configuration_and_report_only() -> None:
+    monitor = event_counter_config("occurrences", "value:flag")
 
     def tick(row: list[bool], t: int) -> None:
-        state["row"] = row
         monitor.on_tick(_row_context(row, t=t, dtype=torch.bool, name="flag"))
 
     tick([False, False], 0)
@@ -343,13 +301,9 @@ def test_event_counter_configuration_parity_and_report_only() -> None:
     tick([False, True], 3)
     tick([True, True], 4)
 
-    assert monitor.signals()["counted"].tolist() == [True, False]
-    assert tuple(monitor.drain_events()) == ()
-    assert dict(monitor.drain_terminals()) == {}
+    assert monitor.values()["counted"].tolist() == [True, False]
     report = monitor.report_view()
-    assert report["severity"] == "warning"
-    assert report["event"] is None
-    assert report["terminal_outcome"] is None
+    assert report["emit"] == {"value": "counted"}
     assert report["fired"] == 4
     assert report["fired_counts"] == [2, 2]
 
@@ -358,29 +312,30 @@ def test_event_counter_configuration_parity_and_report_only() -> None:
     report = monitor.report_view()
     assert report["fired"] == 5
     assert report["fired_counts"] == [3, 2]
-    assert monitor.signals()["counted"].tolist() == [True, False]
+    assert monitor.values()["counted"].tolist() == [True, False]
 
 
-def test_event_counter_rejects_bad_severity() -> None:
-    with pytest.raises(ValueError):
-        event_counter_config("bad", "value:flag", severity="critical")  # type: ignore[arg-type]
+def test_event_counter_rejects_removed_event_arguments() -> None:
+    with pytest.raises(TypeError):
+        event_counter_config("bad", "value:flag", severity="critical")  # type: ignore[call-arg]
 
 
 def test_phase_tracks_transitions_and_initializes_silently() -> None:
-    values = [-1.0, 0.5, 2.0, 0.5, -2.0]
+    levels = [-1.0, 0.5, 2.0, 0.5, -2.0]
     monitor = PhaseMonitor("phase", SourceRef.parse("value:level"), boundaries=[0.0, 1.0])
 
-    events_per_tick = []
+    changed_per_tick = []
     phases = []
-    for t, value in enumerate(values):
+    for t, value in enumerate(levels):
         monitor.on_tick(_row_context([value], t=t))
-        events_per_tick.append(len(monitor.drain_events()))
-        phases.append(int(monitor.signals()["phase"][0]))
+        changed_per_tick.append(bool(monitor.values()["changed"][0]))
+        phases.append(int(monitor.values()["phase"][0]))
 
-    assert events_per_tick == [0, 1, 1, 1, 1]
+    assert changed_per_tick == [False, True, True, True, True]
     assert phases == [0, 1, 2, 1, 0]
-    assert monitor.signals()["phase"].dtype == torch.int64
-    assert monitor.signals()["level"].dtype == torch.float32
+    assert monitor.values()["phase"].dtype == torch.int64
+    assert monitor.values()["level"].dtype == torch.float32
+    assert monitor.values()["changed"].dtype == torch.bool
 
     report = monitor.report_view()
     assert report["source"] == "value:level"
@@ -389,7 +344,7 @@ def test_phase_tracks_transitions_and_initializes_silently() -> None:
 
     monitor.reset([0])
     monitor.on_tick(_row_context([-1.0], t=0))
-    assert tuple(monitor.drain_events()) == ()
+    assert monitor.values()["changed"].tolist() == [False]
 
 
 def test_phase_names_episode_counts_and_snapshot() -> None:
@@ -586,24 +541,16 @@ def test_step_context_is_not_retained() -> None:
 
 def test_predicate_snapshot_restore_roundtrip() -> None:
     frames = [_row_context([1.0])]
-    original = threshold_config(
-        "threshold_rt", "value:level", threshold=0.5, terminal_outcome="failure"
-    )
-    clone = threshold_config(
-        "threshold_rt", "value:level", threshold=0.5, terminal_outcome="failure"
-    )
+    original = threshold_config("threshold_rt", "value:level", threshold=0.5)
+    clone = threshold_config("threshold_rt", "value:level", threshold=0.5)
 
     _assert_roundtrip(original, clone, frames)
 
 
 def test_hold_snapshot_restore_roundtrip() -> None:
     frames = [_row_context([1.0])]
-    original = hold_config(
-        "hold_rt", "value:level", threshold=0.5, hold_steps=1, terminal_outcome="success"
-    )
-    clone = hold_config(
-        "hold_rt", "value:level", threshold=0.5, hold_steps=1, terminal_outcome="success"
-    )
+    original = hold_config("hold_rt", "value:level", threshold=0.5, hold_steps=1)
+    clone = hold_config("hold_rt", "value:level", threshold=0.5, hold_steps=1)
 
     _assert_roundtrip(original, clone, frames)
 
@@ -626,14 +573,14 @@ def test_phase_snapshot_restore_roundtrip() -> None:
 
 def test_safety_snapshot_restore_roundtrip() -> None:
     frames = [_row_context([1.0])]
-    original = safety_config("safety_rt", "value:level", threshold=0.5, terminal_outcome="failure")
-    clone = safety_config("safety_rt", "value:level", threshold=0.5, terminal_outcome="failure")
+    original = safety_config("safety_rt", "value:level", threshold=0.5)
+    clone = safety_config("safety_rt", "value:level", threshold=0.5)
 
     _assert_roundtrip(original, clone, frames)
 
 
 def test_snapshot_and_restore_use_private_copies() -> None:
-    monitor = threshold_config("copies", "value:level", threshold=0.5, terminal_outcome="failure")
+    monitor = threshold_config("copies", "value:level", threshold=0.5)
     monitor.on_tick(_row_context([1.0]))
 
     snapshot = monitor.snapshot()
@@ -645,7 +592,7 @@ def test_snapshot_and_restore_use_private_copies() -> None:
     fired[0] = False
     assert monitor.snapshot() == baseline
 
-    clone = threshold_config("copies", "value:level", threshold=0.5, terminal_outcome="failure")
+    clone = threshold_config("copies", "value:level", threshold=0.5)
     clone.restore(baseline)
     restored = clone.snapshot()
     baseline["state"]["fired"][0] = False
@@ -736,9 +683,9 @@ def test_failed_restore_leaves_monitor_unchanged_and_usable() -> None:
     assert fresh_snapshot["device"] is None
 
     monitor.on_tick(_row_context([1.0], t=1))
-    assert len(monitor.drain_events()) == 1
+    assert monitor.values()["threshold_reached"].tolist() == [True]
     fresh.on_tick(_row_context([1.0], t=1))
-    assert len(fresh.drain_events()) == 1
+    assert fresh.values()["threshold_reached"].tolist() == [True]
 
 
 def test_on_episode_end_validates_env_ids() -> None:
@@ -753,58 +700,28 @@ def test_on_episode_end_validates_env_ids() -> None:
     assert monitor.report_view()["episodes"] == 1
 
 
-def test_restore_rejects_out_of_range_pending_drains() -> None:
-    source = threshold_config("bounds", "value:level", threshold=0.0, terminal_outcome="failure")
-    source.on_tick(_row_context([1.0]))
-    snapshot = source.snapshot()
+def test_monitor_snapshot_schema_is_four_and_rejects_old_shapes() -> None:
+    monitor = threshold_config("bounds", "value:level", threshold=0.0)
+    monitor.on_tick(_row_context([1.0]))
+    snapshot = monitor.snapshot()
+    assert snapshot["schema"] == "unigym_bench.monitor/4"
+    assert set(snapshot) == {"schema", "name", "kind", "num_envs", "device", "config", "state"}
 
-    bad_terminal = ensure_json_value(snapshot)
-    terminals = bad_terminal["pending_terminals"]
-    assert isinstance(terminals, dict)
-    terminals["9"] = terminals["0"]
-    clone = threshold_config("bounds", "value:level", threshold=0.0, terminal_outcome="failure")
-    with pytest.raises(ValueError, match="outside"):
-        clone.restore(bad_terminal)
+    old = ensure_json_value(snapshot)
+    old["schema"] = "unigym_bench.monitor/3"
+    clone = threshold_config("bounds", "value:level", threshold=0.0)
+    with pytest.raises(ValueError, match="expected schema 'unigym_bench.monitor/4'"):
+        clone.restore(old)
 
-    bad_event = ensure_json_value(snapshot)
-    bad_event["pending_events"] = [
-        {
-            "name": "off_grid",
-            "code": "task.bounds.off_grid",
-            "env_ids": [9],
-            "severity": "info",
-            "data": {},
-        }
-    ]
-    with pytest.raises(ValueError, match="outside"):
-        clone.restore(bad_event)
+    pending = ensure_json_value(snapshot)
+    pending["pending_terminals"] = {}
+    with pytest.raises(ValueError, match="unknown"):
+        clone.restore(pending)
 
-
-def test_terminal_snapshot_roundtrips_negative_priority_and_extensions() -> None:
-    monitor = threshold_config("term_rt", "value:level", threshold=1.0)
-    monitor.on_tick(_row_context([0.0]))
-    termination = Termination(
-        outcome=EpisodeOutcome.FAILURE,
-        code="custom.term_rt.external",
-        source=TerminationSource.CUSTOM,
-        step_index=3,
-        time_s=0.25,
-        metrics={"value": 1.0},
-        extensions={
-            "extra": TerminationExtension(namespace="extra", schema_version=1, data={"note": "ok"})
-        },
-        priority=-2,
-    )
-    snapshot = ensure_json_value(monitor.snapshot())
-    snapshot["pending_terminals"] = {"0": termination.to_json()}
-
-    clone = threshold_config("term_rt", "value:level", threshold=1.0)
-    clone.restore(snapshot)
-    restored = clone.drain_terminals()[0]
-
-    assert restored == termination
-    assert restored.priority == -2
-    assert restored.extensions["extra"].data == {"note": "ok"}
+    pending_event = ensure_json_value(snapshot)
+    pending_event["pending_events"] = []
+    with pytest.raises(ValueError, match="unknown"):
+        clone.restore(pending_event)
 
 
 def test_event_validation_and_json_roundtrip() -> None:
@@ -877,3 +794,14 @@ def test_monitors_fresh_import_has_no_retired_names_or_core_benchmark_scaffoldin
 
     assert result.returncode == 0, result.stderr or result.stdout
     assert result.stdout.strip() == "ok"
+
+
+def test_engine_rejects_a_monitor_with_a_retired_drain_face() -> None:
+    from unigym_bench.engine import StreamingEngine
+
+    class LegacyMonitor(BaseMonitor):
+        def drain_events(self) -> tuple[()]:
+            return ()
+
+    with pytest.raises(TypeError, match="retired event/terminal drain"):
+        StreamingEngine([LegacyMonitor("legacy")])

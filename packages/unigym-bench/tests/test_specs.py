@@ -92,12 +92,7 @@ def test_parse_full_document() -> None:
                     "builtin": "predicate",
                     "when": {"source": "value:force", "op": "gte", "value": 0.5},
                     "trigger": {"kind": "hold", "steps": 3},
-                    "emit": {
-                        "event": "contact",
-                        "severity": "warning",
-                        "terminal_reason": "hit",
-                        "terminal_outcome": "failure",
-                    },
+                    "emit": {"value": "contact"},
                     "report_extension": "contact_report",
                 },
                 "custom": {"module": "my_pkg.monitors:make", "params": {}},
@@ -114,6 +109,24 @@ def test_parse_full_document() -> None:
                 "command_pool": [[0.1, 0.2], [0.3, 0.4]],
                 "plan": [1, 0, 1],
             },
+            "flow": {
+                "termination_rules": [
+                    {
+                        "monitor": "contact",
+                        "value": "contact",
+                        "outcome": "failure",
+                        "code": "custom.contact.hit",
+                    }
+                ],
+                "events": [
+                    {
+                        "monitor": "contact",
+                        "value": "contact",
+                        "name": "contact",
+                        "severity": "warning",
+                    }
+                ],
+            },
         }
     )
 
@@ -126,7 +139,9 @@ def test_parse_full_document() -> None:
     assert contact.when["value"] == 0.5
     assert contact.trigger["kind"] == "hold"
     assert contact.trigger["steps"] == 3
-    assert contact.emit["terminal_outcome"] == "failure"
+    assert contact.emit == {"value": "contact"}
+    assert document.task.flow.termination_rules[0].code == "custom.contact.hit"
+    assert document.task.flow.events[0].severity == "warning"
     assert document.task.extensions["contact_report"].params["bins"] == (1, 2)
     assert document.scenario == ScenarioSpec(command_pool=((0.1, 0.2), (0.3, 0.4)), plan=(1, 0, 1))
 
@@ -726,22 +741,25 @@ def test_programmatic_task_document_schema_is_closed() -> None:
     assert TaskDocument(task=task, schema=SCHEMA).schema == SCHEMA
     with pytest.raises(SpecError) as excinfo:
         TaskDocument(task=task, schema="other/1")
-    assert "expected 'unigym_extbench/2'" in str(excinfo.value)
+    assert "expected 'unigym_extbench/3'" in str(excinfo.value)
     with pytest.raises(SpecError) as excinfo:
-        TaskDocument(task=task, schema="unigym_extbench/1")
-    assert "expected 'unigym_extbench/2'" in str(excinfo.value)
+        TaskDocument(task=task, schema="unigym_extbench/2")
+    assert "retired" in str(excinfo.value)
 
 
-def test_schema_is_two_and_rejects_the_old_explicit_schema() -> None:
-    assert SCHEMA == "unigym_extbench/2"
+def test_schema_is_three_and_rejects_old_explicit_schemas() -> None:
+    assert SCHEMA == "unigym_extbench/3"
     assert parse_task_document(_document()).schema is None
     assert parse_task_document(_document(schema=SCHEMA)).schema == SCHEMA
 
-    with pytest.raises(SpecError) as excinfo:
-        parse_task_document(_document(schema="unigym_extbench/1"))
-
-    assert "task document.schema" in str(excinfo.value)
-    assert "unigym_extbench/2" in str(excinfo.value)
+    for old in ("unigym_extbench/1", "unigym_extbench/2"):
+        with pytest.raises(SpecError) as excinfo:
+            parse_task_document(_document(schema=old))
+        message = str(excinfo.value)
+        assert "task document.schema" in message
+        assert "retired" in message
+        assert "unigym_extbench/3" in message
+        assert "flow.termination_rules" in message
 
 
 def test_predicate_fields_are_frozen_and_validate_trigger_emit() -> None:
@@ -757,7 +775,7 @@ def test_predicate_fields_are_frozen_and_validate_trigger_emit() -> None:
                         ]
                     },
                     "trigger": {"kind": "hold", "steps": 2},
-                    "emit": {"event": "held", "severity": "warning"},
+                    "emit": {"value": "held"},
                 }
             }
         )
@@ -766,7 +784,7 @@ def test_predicate_fields_are_frozen_and_validate_trigger_emit() -> None:
     monitor = document.task.monitors["contact"]
     assert isinstance(monitor.when, MappingProxyType)
     assert monitor.trigger == {"kind": "hold", "steps": 2}
-    assert monitor.emit == {"event": "held", "severity": "warning"}
+    assert monitor.emit == {"value": "held"}
     with pytest.raises(TypeError):
         monitor.when["all"] = ()
 
@@ -905,3 +923,69 @@ def test_query_source_is_accepted_by_the_spec_and_deferred_to_composition() -> N
     )
 
     assert document.task.monitors["m"].when["source"] == "query:height"
+
+
+def test_old_monitor_emit_keys_are_rejected_with_the_flow_migration() -> None:
+    document = _document(
+        monitors={
+            "m": {
+                "builtin": "predicate",
+                "when": {"source": "value:x", "op": "gt", "value": 0.0},
+                "trigger": "edge",
+                "emit": {"event": "hit", "terminal_outcome": "failure"},
+            }
+        }
+    )
+
+    with pytest.raises(SpecError, match="monitor emit has moved"):
+        parse_task_document(document)
+
+
+def test_flow_section_owns_termination_rules_and_events() -> None:
+    document = parse_task_document(
+        _document(
+            flow={
+                "termination_rules": [
+                    {
+                        "monitor": "grasp",
+                        "value": "fired",
+                        "outcome": "failure",
+                        "code": "custom.grasp.fired",
+                    }
+                ],
+                "events": [
+                    {
+                        "monitor": "grasp",
+                        "value": "fired",
+                        "name": "contact",
+                        "severity": "warning",
+                        "data": {"axis": "z"},
+                    }
+                ],
+            }
+        )
+    )
+
+    assert document.task.flow.termination_rules[0].outcome == "failure"
+    assert document.task.flow.events[0].data == {"axis": "z"}
+    with pytest.raises(SpecError, match="duplicate"):
+        parse_task_document(
+            _document(
+                flow={
+                    "termination_rules": [
+                        {
+                            "monitor": "grasp",
+                            "value": "fired",
+                            "outcome": "failure",
+                            "code": "custom.grasp.one",
+                        },
+                        {
+                            "monitor": "grasp",
+                            "value": "fired",
+                            "outcome": "success",
+                            "code": "custom.grasp.two",
+                        },
+                    ]
+                }
+            )
+        )

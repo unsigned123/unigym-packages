@@ -1,10 +1,14 @@
 """Predicate configuration specs shared by the monitor and task composition.
 
-A predicate is one condition tree plus a trigger cadence and an emit
-configuration.  This module owns the two frozen, JSON-safe configuration
-objects; :class:`unigym_bench.monitors.PredicateMonitor` owns the stateful
-runtime.  Keeping the specs separate lets the task-document composer parse and
-fingerprint a predicate without importing the monitor implementation.
+A predicate is one condition tree plus a trigger cadence and a monitor-local
+value name.  This module owns the two frozen, JSON-safe configuration objects;
+:class:`unigym_bench.monitors.PredicateMonitor` owns the stateful runtime.
+Keeping the specs separate lets the task-document composer parse and fingerprint
+a predicate without importing the monitor implementation.
+
+A monitor publishes observations only.  Events, severities and terminals are
+decisions owned by the benchmark flow; the task document expresses them in its
+``flow`` section.
 
 Trigger semantics (v1, per environment):
 
@@ -21,9 +25,8 @@ Trigger semantics (v1, per environment):
     silent until the episode resets.
 ``episode_end``
     Never fires on a normal tick.  At the episode boundary it inspects the
-    supplied final context and fires only for due rows.  Per OD-5 its terminal
-    output is report/scoring-only and is drained separately from the runner
-    terminal face.
+    supplied final context and updates the value only for due rows.  A value is
+    an observation; it never schedules a runner terminal.
 
 ``level`` and the reserved temporal operators (``always``, ``never``,
 ``fraction_true``, ``hold_until_end``) are rejected with a teaching error.
@@ -38,9 +41,6 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal, TypeAlias, cast
 
-from unigym.core.episode_termination import EpisodeOutcome
-
-from .events import SEVERITIES, Severity
 from .json import JsonValue
 
 __all__ = [
@@ -61,13 +61,11 @@ _RESERVED_TEMPORAL: tuple[str, ...] = (
     "fraction_true",
     "hold_until_end",
 )
-_MONITOR_OUTCOMES: frozenset[EpisodeOutcome] = frozenset(
-    {EpisodeOutcome.SUCCESS, EpisodeOutcome.FAILURE, EpisodeOutcome.DEADLINE}
-)
 
 _TRIGGER_KEYS: frozenset[str] = frozenset({"kind", "steps"})
-_EMIT_KEYS: frozenset[str] = frozenset(
-    {"value", "event", "severity", "terminal_reason", "terminal_outcome"}
+_EMIT_KEYS: frozenset[str] = frozenset({"value"})
+_LEGACY_EMIT_KEYS: frozenset[str] = frozenset(
+    {"event", "severity", "terminal_reason", "terminal_outcome"}
 )
 _NAME_PATTERN = re.compile(r"[a-z][a-z0-9_]*")
 
@@ -175,49 +173,29 @@ class TriggerSpec:
 
 @dataclass(frozen=True, slots=True)
 class EmitSpec:
-    """Local value name and optional event/terminal outputs for one monitor.
+    """Local value name for one monitor.
+
+    A monitor publishes observations only.  Events, severities and terminals
+    are decisions owned by the benchmark flow, not by the monitor; the task
+    document expresses them in its ``flow`` section.
 
     Args:
-        value: Local level value name published by ``signals()``.  Defaults to
+        value: Local level value name published by ``values()``.  Defaults to
             ``fired``.
-        event: Optional monitor-local occurrence name.  The emitted event code is
-            ``task.<monitor>.<event>``.
-        severity: Severity for the emitted event.
-        terminal_reason: Optional stable reason used in
-            ``custom.<monitor>.<reason>``.
-        terminal_outcome: Optional :class:`EpisodeOutcome`.  It must be supplied
-            together with ``terminal_reason``.
     """
 
     value: str = "fired"
-    event: str | None = None
-    severity: Severity = "info"
-    terminal_reason: str | None = None
-    terminal_outcome: EpisodeOutcome | str | None = None
 
     def __post_init__(self) -> None:
-        """Validate names, severity and the terminal pair."""
+        """Validate the local value name."""
         _require_name(self.value, "EmitSpec.value")
-        if self.event is not None:
-            _require_name(self.event, "EmitSpec.event")
-        object.__setattr__(self, "severity", _require_severity(self.severity, "EmitSpec.severity"))
-        if self.terminal_reason is not None:
-            _require_name(self.terminal_reason, "EmitSpec.terminal_reason")
-        outcome = _require_outcome(self.terminal_outcome, "EmitSpec.terminal_outcome")
-        object.__setattr__(self, "terminal_outcome", outcome)
-        if (self.terminal_reason is None) != (outcome is None):
-            raise ValueError(
-                "EmitSpec terminal_reason and terminal_outcome must be supplied "
-                "together; write both to request a terminal or neither to skip it"
-            )
 
     @classmethod
     def from_mapping(cls, mapping: object) -> EmitSpec:
         """Build an emit spec from its closed JSON-safe mapping.
 
         Args:
-            mapping: A mapping with any of ``value``, ``event``, ``severity``,
-                ``terminal_reason`` and ``terminal_outcome``.
+            mapping: A mapping with the optional ``value`` key.
 
         Returns:
             The validated emit spec.
@@ -228,35 +206,25 @@ class EmitSpec:
         """
         if not isinstance(mapping, Mapping):
             raise TypeError(f"emit mapping must be an object, got {type(mapping).__name__}")
+        legacy = sorted(repr(key) for key in mapping if key in _LEGACY_EMIT_KEYS)
+        if legacy:
+            raise ValueError(
+                "monitor emit has moved: use flow.termination_rules / flow.events; "
+                "monitors publish values only (remove "
+                f"{legacy} from emit)"
+            )
         unknown = sorted(repr(key) for key in mapping if key not in _EMIT_KEYS)
         if unknown:
             raise ValueError(
                 f"emit mapping has unknown keys {unknown}; expected keys " f"{sorted(_EMIT_KEYS)}"
             )
         value = mapping.get("value", "fired")
-        event = mapping.get("event")
-        severity = mapping.get("severity", "info")
-        reason = mapping.get("terminal_reason")
-        outcome = mapping.get("terminal_outcome")
         # The constructor owns the field-level validation.
-        return cls(
-            value=cast(str, value),
-            event=cast(str | None, event),
-            severity=cast(Severity, severity),
-            terminal_reason=cast(str | None, reason),
-            terminal_outcome=cast(EpisodeOutcome | str | None, outcome),
-        )
+        return cls(value=cast(str, value))
 
     def to_mapping(self) -> dict[str, JsonValue]:
         """Return the closed, JSON-safe config form."""
-        outcome = self.terminal_outcome
-        return {
-            "value": self.value,
-            "event": self.event,
-            "severity": self.severity,
-            "terminal_reason": self.terminal_reason,
-            "terminal_outcome": None if outcome is None else outcome.value,
-        }
+        return {"value": self.value}
 
 
 def _require_name(value: object, where: str) -> str:
@@ -273,40 +241,3 @@ def _require_positive_int(value: object, where: str) -> int:
     if value < 1:
         raise ValueError(f"{where}: expected an int >= 1, got {value}")
     return value
-
-
-def _require_severity(value: object, where: str) -> Severity:
-    """Validate one event severity."""
-    if not isinstance(value, str) or value not in SEVERITIES:
-        raise ValueError(f"{where}: expected one of {sorted(SEVERITIES)}, got {value!r}")
-    if value == "info":
-        return "info"
-    if value == "warning":
-        return "warning"
-    if value == "violation":
-        return "violation"
-    return "fatal"
-
-
-def _require_outcome(value: object, where: str) -> EpisodeOutcome | None:
-    """Validate a monitor-owned terminal outcome."""
-    if value is None:
-        return None
-    if isinstance(value, EpisodeOutcome):
-        outcome = value
-    elif isinstance(value, str):
-        try:
-            outcome = EpisodeOutcome(value)
-        except ValueError as exc:
-            raise ValueError(
-                f"{where}: unknown episode outcome {value!r}; "
-                f"allowed: {[item.value for item in EpisodeOutcome]}"
-            ) from exc
-    else:
-        raise TypeError(f"{where}: expected an EpisodeOutcome, str or None, got {value!r}")
-    if outcome not in _MONITOR_OUTCOMES:
-        raise ValueError(
-            f"{where}: terminal outcome {outcome.value!r} is not owned by a monitor; "
-            f"allowed: {sorted(item.value for item in _MONITOR_OUTCOMES)}"
-        )
-    return outcome

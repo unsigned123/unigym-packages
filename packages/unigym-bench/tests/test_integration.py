@@ -29,8 +29,7 @@ from unigym.core.episode_termination import (
 from unigym.run.sink import SinkSpec
 from unigym.runner.external import ExternalRunner
 
-from unigym_bench.events import Event
-from unigym_bench.flow import DefaultBenchmarkFlow
+from unigym_bench.flow import DefaultBenchmarkFlow, EventRule, TerminationRule
 from unigym_bench.report import REPORT_FILENAME, REPORT_SCHEMA
 from unigym_bench.sink import BenchmarkSink
 from unigym_bench.specs import RetentionSpec
@@ -39,7 +38,6 @@ from _support import (
     ScriptedMonitor,
     TickScript,
     make_bundle,
-    make_termination,
 )
 from _tiny_arm import end_episode, make_run, zero_actions
 
@@ -320,19 +318,33 @@ def test_zero_episode_fake_sink_report_is_honest() -> None:
 
 def test_multi_env_fake_conformance_keeps_episode_facts_per_env() -> None:
     """A two-env fake run reports per-env counts and first-terminal verdicts."""
-    terminal = make_termination("custom.task.hit")
     monitor = ScriptedMonitor(
         "task",
         {
             0: TickScript(
-                signals={"live": torch.tensor([1.0, 2.0])},
-                events=(Event(name="hit", code="task.record.hit", env_ids=(0,)),),
-                terminals={0: terminal},
+                values={
+                    "live": torch.tensor([1.0, 2.0]),
+                    "fired": torch.tensor([True, False]),
+                    "event": torch.tensor([True, False]),
+                },
             ),
-            1: TickScript(terminals={1: terminal}),
+            1: TickScript(
+                values={
+                    "fired": torch.tensor([False, True]),
+                    "event": torch.tensor([False, False]),
+                },
+            ),
         },
     )
-    sink = BenchmarkSink([monitor], retention=RetentionSpec(retain_episodes=True))
+    flow = DefaultBenchmarkFlow(
+        (TerminationRule("task", "fired", "success", "custom.task.hit"),),
+        events=(EventRule("task", "event", "hit", code="task.record.hit"),),
+    )
+    sink = BenchmarkSink(
+        [monitor],
+        retention=RetentionSpec(retain_episodes=True),
+        flow=flow,
+    )
 
     for t in range(2):
         sink.on_step(t, make_bundle(t=t, num_envs=2))

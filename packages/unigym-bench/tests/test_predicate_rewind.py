@@ -37,12 +37,7 @@ def _monitor(trigger: TriggerSpec | None = None) -> PredicateMonitor:
         "pred",
         _condition(),
         TriggerSpec("edge") if trigger is None else trigger,
-        EmitSpec(
-            event="crossed",
-            severity="warning",
-            terminal_reason="crossed",
-            terminal_outcome="failure",
-        ),
+        EmitSpec(value="fired"),
     )
 
 
@@ -52,26 +47,19 @@ def _snapshot(monitor: PredicateMonitor) -> dict[str, object]:
     return state  # type: ignore[return-value]
 
 
-def test_snapshot_roundtrip_restores_state_pending_outputs_and_signals() -> None:
+def test_snapshot_roundtrip_restores_state_and_values() -> None:
     source = _monitor()
     source.on_tick(_context([1.0, 0.0]))
     snapshot = _snapshot(source)
     assert json.loads(json.dumps(snapshot)) == snapshot
-    assert set(snapshot["pending_terminals"]) == {"0"}
-    assert len(snapshot["pending_events"]) == 1
+    assert set(snapshot) == {"schema", "name", "kind", "num_envs", "device", "config", "state"}
 
     clone = _monitor()
     clone.restore(snapshot)
 
     assert clone.snapshot() == snapshot
     assert clone.report_view() == source.report_view()
-    assert clone.signals()["fired"].tolist() == source.signals()["fired"].tolist()
-    assert [event.to_json() for event in clone.drain_events()] == [
-        event.to_json() for event in source.drain_events()
-    ]
-    assert {key: value.to_json() for key, value in clone.drain_terminals().items()} == {
-        key: value.to_json() for key, value in source.drain_terminals().items()
-    }
+    assert clone.values()["fired"].tolist() == source.values()["fired"].tolist()
 
 
 def test_snapshot_carries_episode_end_counts() -> None:
@@ -80,7 +68,7 @@ def test_snapshot_carries_episode_end_counts() -> None:
     source.on_episode_end([0, 1], _context([1.0, 0.0]))
     snapshot = _snapshot(source)
     assert snapshot["state"]["episode_end_counts"] == [1, 0]
-    assert set(snapshot["state"]["episode_terminals"]) == {"0"}
+    assert "episode_terminals" not in snapshot["state"]
 
     clone = _monitor(TriggerSpec("episode_end"))
     clone.restore(snapshot)
@@ -88,10 +76,6 @@ def test_snapshot_carries_episode_end_counts() -> None:
     assert clone.snapshot() == snapshot
     assert clone.report_view()["episode_end_fired"] == 1
     assert clone.report_view()["episodes"] == 2
-    assert dict(clone.drain_terminals()) == {}
-    assert {key: value.to_json() for key, value in clone.drain_episode_terminals().items()} == {
-        key: value.to_json() for key, value in source.drain_episode_terminals().items()
-    }
 
 
 def test_refused_restore_is_zero_change_for_config_and_state() -> None:
@@ -102,12 +86,12 @@ def test_refused_restore_is_zero_change_for_config_and_state() -> None:
     target = _monitor(TriggerSpec("hold", steps=2))
     target.on_tick(_context([1.0, 0.0]))
     before = target.snapshot()
-    assert target.signals()["fired"].tolist() == [False, False]
+    assert target.values()["fired"].tolist() == [False, False]
 
     with pytest.raises(ValueError, match="config does not match"):
         target.restore(snapshot)
     assert target.snapshot() == before
-    assert target.signals()["fired"].tolist() == [False, False]
+    assert target.values()["fired"].tolist() == [False, False]
 
     twin = _monitor()
     twin.on_tick(_context([0.0, 1.0]))
@@ -133,38 +117,32 @@ def test_validate_restore_does_not_mutate() -> None:
     assert target.snapshot() == before
 
 
-def test_reset_rearms_terminal_and_edge_after_restore() -> None:
+def test_reset_rearms_the_edge_after_restore() -> None:
     source = _monitor()
     source.on_tick(_context([1.0]))
     snapshot = _snapshot(source)
 
     clone = _monitor()
     clone.restore(snapshot)
-    assert sorted(clone.drain_terminals()) == [0]
+    assert clone.values()["fired"].tolist() == [True]
 
     clone.reset([0])
     clone.on_tick(_context([0.0]))
-    assert clone.drain_terminals() == {}
+    assert clone.values()["fired"].tolist() == [False]
     clone.on_tick(_context([1.0]))
-
-    rearmed = clone.drain_terminals()
-    assert sorted(rearmed) == [0]
-    assert rearmed[0].code == "custom.pred.crossed"
-    events = clone.drain_events()
-    assert len(events) == 2
-    assert events[-1].env_ids == (0,)
+    assert clone.values()["fired"].tolist() == [True]
 
 
 def test_reset_clears_level_but_keeps_run_counters() -> None:
     monitor = _monitor(TriggerSpec("once"))
     monitor.on_tick(_context([1.0, 1.0]))
-    assert monitor.signals()["fired"].tolist() == [True, True]
+    assert monitor.values()["fired"].tolist() == [True, True]
     assert monitor.report_view()["fired_counts"] == [1, 1]
 
     monitor.reset([0, 1])
 
-    assert monitor.signals()["fired"].tolist() == [False, False]
+    assert monitor.values()["fired"].tolist() == [False, False]
     assert monitor.report_view()["fired_counts"] == [1, 1]
     monitor.on_tick(_context([1.0, 0.0]))
-    assert monitor.signals()["fired"].tolist() == [True, False]
+    assert monitor.values()["fired"].tolist() == [True, False]
     assert monitor.report_view()["fired_counts"] == [2, 1]

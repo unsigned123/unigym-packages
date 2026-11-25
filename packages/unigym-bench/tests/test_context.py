@@ -10,16 +10,10 @@ import pytest
 import torch
 
 import unigym_bench
-from unigym.core.episode_termination import (
-    EpisodeOutcome,
-    Termination,
-    TerminationSource,
-)
 from unigym.evaluation import EnvStepContext, EnvView
 from unigym.values import StepValues
 from unigym_bench.context import BenchmarkStepContext
 from unigym_bench.engine import EngineStateError, StreamingEngine
-from unigym_bench.events import Event
 from unigym_bench.query import TickQuery
 
 
@@ -30,8 +24,6 @@ def _view(num_envs: int = 2) -> EnvView:
 def _context(
     num_envs: int = 2,
     *,
-    events: object = (),
-    terminals: object = None,
     query: object = None,
 ) -> BenchmarkStepContext:
     return BenchmarkStepContext(
@@ -42,21 +34,7 @@ def _context(
         time_s=None,
         cmd=None,
         reset_state={},
-        events=events,  # type: ignore[arg-type]
-        terminals={} if terminals is None else terminals,  # type: ignore[arg-type]
         query=query,  # type: ignore[arg-type]
-    )
-
-
-def _event(env_id: int = 0) -> Event:
-    return Event(name="hit", code="task.contact.hit", env_ids=(env_id,))
-
-
-def _termination() -> Termination:
-    return Termination(
-        outcome=EpisodeOutcome.SUCCESS,
-        code="custom.test.reason",
-        source=TerminationSource.CUSTOM,
     )
 
 
@@ -65,8 +43,6 @@ def test_subclass_construction_and_defaults() -> None:
 
     assert isinstance(context, EnvStepContext)
     assert isinstance(context, BenchmarkStepContext)
-    assert context.events == ()
-    assert dict(context.terminals) == {}
     assert context.query is None
     assert context.num_envs == 2
     assert context.t == 0
@@ -81,66 +57,14 @@ def test_frozen_and_slots() -> None:
     assert hasattr(BenchmarkStepContext, "__slots__")
 
 
-def test_events_are_copied_to_an_immutable_tuple() -> None:
-    event = _event()
-    source = [event]
-    context = _context(events=source)
-
-    assert context.events == (event,)
-    assert isinstance(context.events, tuple)
-    source.append(_event(1))
-    assert context.events == (event,)
-
-    with pytest.raises(TypeError, match="events\\[1\\]"):
-        _context(events=(event, object()))
-    with pytest.raises(TypeError, match="events must be a sequence"):
-        _context(events="not events")
-
-
-def test_terminals_are_copied_to_a_read_only_mapping() -> None:
-    termination = _termination()
-    source = {0: termination}
-    context = _context(terminals=source)
-
-    assert dict(context.terminals) == {0: termination}
-    assert context.terminals is not source
-    source[1] = termination
-    assert dict(context.terminals) == {0: termination}
-
-    with pytest.raises(TypeError):
-        context.terminals[1] = termination  # type: ignore[index]
-
-
-def test_terminals_validate_env_id_range_and_types() -> None:
-    termination = _termination()
-
-    with pytest.raises(ValueError, match="outside"):
-        _context(terminals={2: termination})
-    with pytest.raises(ValueError, match="outside"):
-        _context(terminals={-1: termination})
-    with pytest.raises(TypeError, match="int env ids"):
-        _context(terminals={True: termination})
-    with pytest.raises(TypeError, match="int env ids"):
-        _context(terminals={"0": termination})
-    with pytest.raises(TypeError, match="must be a Termination"):
-        _context(terminals={0: object()})
-    with pytest.raises(TypeError, match="must be a mapping"):
-        _context(terminals=[termination])
-
-
-def test_replace_preserves_pack_fields() -> None:
-    event = _event()
-    termination = _termination()
-    context = _context(events=(event,), terminals={0: termination})
+def test_replace_preserves_the_pack_query_field() -> None:
+    context = _context()
 
     replaced = replace(context, t=3)
 
     assert replaced is not context
     assert replaced.t == 3
-    assert replaced.events == (event,)
-    assert dict(replaced.terminals) == {0: termination}
-    assert replace(context, events=()).events == ()
-    assert dict(replace(context, terminals={1: termination}).terminals) == {1: termination}
+    assert replaced.query is None
 
 
 def test_query_field_requires_a_tick_query_or_none() -> None:
@@ -171,8 +95,6 @@ def test_from_env_step_wraps_without_a_bundle() -> None:
     assert context.t == step.t
     assert context.step_index is step.step_index
     assert dict(context.reset_state) == dict(step.reset_state)
-    assert context.events == ()
-    assert dict(context.terminals) == {}
     assert context.query is None
 
     with pytest.raises(TypeError, match="expected an EnvStepContext"):

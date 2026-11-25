@@ -7,15 +7,13 @@ every dropped occurrence is still counted in the run report.
 
 from __future__ import annotations
 
+import torch
+
 from unigym_bench.engine import StreamingEngine
-from unigym_bench.events import Event
+from unigym_bench.flow import DefaultBenchmarkFlow, EventRule
 from unigym_bench.sink import BenchmarkSink
 from unigym_bench.specs import RetentionSpec
 from _support import ScriptedMonitor, TickScript, make_bundle
-
-
-def _event(name: str = "tick") -> Event:
-    return Event(name=name, code=f"task.record.{name}", env_ids=(0,))
 
 
 def _sink_with_events(
@@ -23,10 +21,16 @@ def _sink_with_events(
 ) -> tuple[BenchmarkSink, StreamingEngine]:
     monitor = ScriptedMonitor(
         "task",
-        {t: TickScript(events=(_event("a"), _event("b"))) for t in range(ticks)},
+        {t: TickScript(values={"fired": torch.tensor([True, True])}) for t in range(ticks)},
+    )
+    flow = DefaultBenchmarkFlow(
+        events=(
+            EventRule("task", "fired", "a", code="task.record.a"),
+            EventRule("task", "fired", "b", code="task.record.b"),
+        )
     )
     engine = StreamingEngine([monitor], retention=retention)
-    return BenchmarkSink(engine=engine), engine
+    return BenchmarkSink(engine=engine, flow=flow), engine
 
 
 def test_event_journal_is_bounded_and_dropped_events_are_reported() -> None:

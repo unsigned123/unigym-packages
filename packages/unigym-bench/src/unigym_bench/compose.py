@@ -1,11 +1,12 @@
 """Compose a validated task document into live pack components.
 
 The composition boundary is the only place where an authoring document becomes
-live monitors, report extensions and a retention policy.  It owns the closed
-builtin registry, module/factory resolution, duplicate-name checks and the
-scenario-derived coverage extension.  It never accepts YAML callables: a
-document factory is an API-only Python callable, and a ``module`` reference is
-a syntax-checked import path imported only here.
+live monitors, report extensions, a retention policy and the task flow.  It owns
+the closed builtin registry, module/factory resolution, duplicate-name checks,
+the scenario-derived coverage extension and the explicit flow rule conversion.
+It never accepts YAML callables: a document factory is an API-only Python
+callable, and a ``module`` reference is a syntax-checked import path imported
+only here.
 
 The closed registries are intentionally small:
 
@@ -44,6 +45,7 @@ from types import MappingProxyType
 from typing import cast
 
 from .conditions import ConditionError, parse_condition
+from .flow import DefaultBenchmarkFlow, EventRule, TerminationRule
 from .monitors import Monitor, PhaseMonitor, PredicateMonitor
 from .predicates import EmitSpec, TriggerSpec
 from .report import ReportExtension, ScenarioCoverageExtension, validate_report_extensions
@@ -51,6 +53,7 @@ from .scenario import Scenario
 from .sources import SourceError, SourceRef, SourceUnavailableError
 from .specs import (
     ExtensionSpec,
+    FlowSpec,
     MonitorSpec,
     RetentionSpec,
     ScenarioSpec,
@@ -96,6 +99,7 @@ class TaskPlan:
     retention: RetentionSpec
     scenario: ScenarioSpec | None
     monitor_extensions: Mapping[str, str]
+    flow: DefaultBenchmarkFlow
 
 
 def compose_task(document: TaskDocument) -> TaskPlan:
@@ -149,13 +153,43 @@ def compose_task(document: TaskDocument) -> TaskPlan:
                 f"name from {sorted(extension_names)}, got {reference!r}"
             )
         monitor_extensions[spec.name] = reference
+    flow = _compose_flow(document.task.flow)
     return TaskPlan(
         monitors=monitors,
         extensions=extensions,
         retention=document.task.retention,
         scenario=document.scenario,
         monitor_extensions=MappingProxyType(dict(sorted(monitor_extensions.items()))),
+        flow=flow,
     )
+
+
+def _compose_flow(spec: FlowSpec) -> DefaultBenchmarkFlow:
+    """Convert the document flow section into the live default flow."""
+    rules = tuple(
+        TerminationRule(
+            monitor=rule.monitor,
+            value=rule.value,
+            outcome=rule.outcome,
+            code=rule.code,
+        )
+        for rule in spec.termination_rules
+    )
+    events = tuple(
+        EventRule(
+            monitor=rule.monitor,
+            value=rule.value,
+            name=rule.name,
+            severity=rule.severity,
+            code=rule.code,
+            data=rule.data,
+        )
+        for rule in spec.events
+    )
+    try:
+        return DefaultBenchmarkFlow(rules, events=events)
+    except (TypeError, ValueError) as exc:
+        raise ComposeError(f"flow: {exc}") from exc
 
 
 def _compose_monitor(spec: MonitorSpec) -> Monitor:

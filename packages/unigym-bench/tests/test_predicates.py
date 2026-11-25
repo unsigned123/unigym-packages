@@ -61,7 +61,7 @@ def _ref(source: str) -> SourceRef:
 
 def _fired(monitor: PredicateMonitor, context: EnvStepContext) -> list[bool]:
     monitor.on_tick(context)
-    return monitor.signals()["fired"].tolist()
+    return monitor.values()["fired"].tolist()
 
 
 def test_record_source_condition_fires() -> None:

@@ -6,7 +6,7 @@ declaration order and owns the consequences:
 
 - per-env open flags and the first-terminal latch;
 - a run-scoped event journal with an explicit retention cap and dropped count;
-- pending ``env_id -> Termination`` drains for the core runner;
+- pending ``env_id -> Termination`` facts for the core runner drain;
 - per-env episode sequence, episode-tick counts and finalized
   :class:`~unigym_bench.events.EpisodeRecord` values, including the
   JSON-safe start command and reset facts captured on the episode's first tick.
@@ -26,7 +26,8 @@ Lifecycle (delegated by the sink)::
     runner end   -> engine.run_summary()
 
 The legacy ``engine.on_step`` and ``engine.on_episode_end`` entry points keep
-their behavior by beginning and committing with the monitor bridge decision.
+their value-observation behavior by beginning and committing without a flow
+decision; monitors publish observations only.
 
 The core runner owns the episode boundary and calls the sink's reset-aware
 ``on_reset`` capability after every real reset chain.  The engine never infers
@@ -41,11 +42,9 @@ open.
 
 Episode-end finalization consumes ``bundle["final_step"]``: the core runner's
 post-``on_step`` boundary snapshot.  Monitors evaluate their ``episode_end``
-predicates against that final context, and their final events and separate
-report/scoring terminals are drained here.  Those terminals are counted in the
-run aggregate and report but never enter the runner ``_pending`` drain or the
-first-terminal latch; the episode record is built only after final events have
-been accounted for.
+predicates against that final context and refresh their observed values.  The
+engine produces no event or terminal from a monitor; the flow owns those
+decisions on ticks.
 """
 
 from __future__ import annotations
@@ -82,7 +81,6 @@ from .flow import (
     EpisodeBatch,
     FlowDecision,
     _MonitorTickOutput,
-    _monitor_bridge_decision,
 )
 from .json import JsonValue, ensure_json_value
 from .monitors import Monitor
@@ -94,10 +92,11 @@ if TYPE_CHECKING:
     from unigym.values import ValuePublisher
 
 #: Checkpoint payload key and schema owned by the pack's rewind provider.
-#: Schema 4 pairs the value/context boundary with monitor snapshot schema 3;
-#: it rejects schema 3 and older payloads.
+#: Schema 5 pairs the value/context boundary with monitor snapshot schema 4.
+#: Monitor snapshots contain only construction config and observed state, so
+#: schema 4 and older rewind payloads are rejected rather than silently upgraded.
 REWIND_PROVIDER_NAME = "unigym_bench"
-REWIND_SCHEMA = "unigym_bench.rewind/4"
+REWIND_SCHEMA = "unigym_bench.rewind/5"
 
 __all__ = [
     "EngineStateError",
@@ -206,8 +205,6 @@ class _ActiveEpisode:
     bundle: Mapping[str, object]
     due: tuple[int, ...]
     final_values: tuple[tuple[Monitor, dict[str, Tensor]], ...]
-    final_events: tuple[tuple[Monitor, tuple[Event, ...]], ...]
-    final_terminals: tuple[Termination, ...]
     query: TickQuery | None
     owns_query: bool
 
@@ -254,6 +251,7 @@ class StreamingEngine:
             name = _require_monitor_name(monitor.name)
             if name in names:
                 raise ValueError(f"engine monitors: duplicate monitor name {name!r}")
+            _reject_legacy_monitor_drains(monitor)
             names.add(name)
             checked.append(monitor)
         checked_extensions = validate_report_extensions(extensions)
@@ -361,12 +359,12 @@ class StreamingEngine:
 
     @property
     def conflicts(self) -> Mapping[int, int]:
-        """Per-env count of late terminal requests for an already-latched env."""
+        """Per-env count of later flow terminations for an already-latched env."""
         return MappingProxyType(dict(self._conflicts))
 
     @property
     def conflict_count(self) -> int:
-        """Total late terminal requests counted across the run."""
+        """Total later flow terminations counted across the run."""
         return self._conflict_total
 
     @property
@@ -484,9 +482,9 @@ class StreamingEngine:
         read-only ``validate_restore`` capability when present.  The live state
         of every rewindable monitor and extension is captured before anything is
         touched so an unexpected restore failure rolls all of them back; engine
-        fields are assigned only after every restore succeeded.  The F2 stop
-        flag is transient and is cleared on a successful restore instead of
-        being checkpointed; F5 formalizes stop persistence.
+        fields are assigned only after every restore succeeded.  The stop flag
+        is transient and is cleared on a successful restore instead of being
+        checkpointed; a later card formalizes stop persistence.
         """
         decoded = self._decode_rewind_state(state)
         monitor_rollback: dict[str, JsonValue] = {}
@@ -534,10 +532,11 @@ class StreamingEngine:
     # Runner-facing lifecycle
     # ------------------------------------------------------------------ #
     def on_step(self, bundle: Mapping[str, object]) -> None:
-        """Consume one pre-reset engine step through the flow conductor.
+        """Consume one pre-reset engine step without a flow decision.
 
-        This legacy entry point keeps the engine-only API behavior identical:
-        it begins a tick, forwards the monitor bridge decision and applies it.
+        This legacy entry point observes monitor values only.  A caller that
+        wants events or terminals drives :meth:`begin_tick`,
+        ``flow.on_tick`` and :meth:`apply_decision` through the sink.
 
         Args:
             bundle: The core runner bundle.  Only its ``step`` entry is read;
@@ -546,19 +545,13 @@ class StreamingEngine:
                 :class:`~unigym_bench.context.BenchmarkStepContext`.
 
         Raises:
-            EngineStateError: The run has ended, ``bundle["step"]`` is missing,
-                or a monitor requested a terminal for a closed environment.
+            EngineStateError: The run has ended or ``bundle["step"]`` is missing.
             TypeError: ``bundle["step"]`` has the wrong type, or a monitor
-                output or value violates the contract.
-            ValueError: A shape, device, source or code is invalid.
+                value violates the contract.
+            ValueError: A shape or device is invalid.
         """
         tick = self.begin_tick(bundle)
-        try:
-            decision = _monitor_bridge_decision(tick)
-        except BaseException:
-            self.discard_tick(tick)
-            raise
-        self.apply_decision(tick, decision)
+        self.apply_decision(tick, FlowDecision())
 
     def begin_tick(self, bundle: Mapping[str, object]) -> BenchmarkTick:
         """Drive the monitors and return one validated, immutable tick.
@@ -568,7 +561,7 @@ class StreamingEngine:
         ``on_tick``.  Every monitor output is validated before the tick is
         returned; only the per-episode tick counters and the episode-start
         capture are updated here.  A later flow exception does not roll those
-        updates or the drained monitor queues back.
+        updates or the observed monitor values back.
         """
         self._require_running()
         if self._active_tick is not None:
@@ -582,9 +575,7 @@ class StreamingEngine:
 
         tick_query: TickQuery | None = None
         owns_query = False
-        collected: list[
-            tuple[Monitor, dict[str, Tensor], tuple[Event, ...], dict[int, Termination]]
-        ] = []
+        collected: list[tuple[Monitor, dict[str, Tensor]]] = []
         try:
             context, tick_query, owns_query = self._attach_tick_query(context)
 
@@ -600,39 +591,14 @@ class StreamingEngine:
                 monitor.on_tick(context)
 
             for monitor in self._monitors:
-                collected.append(
-                    (
-                        monitor,
-                        self._collect_values(monitor, context),
-                        self._collect_events(monitor),
-                        self._collect_terminals(monitor, num_envs),
-                    )
-                )
-
-            # Validate every occurrence before returning the tick so a bad
-            # output cannot be half-applied by a later decision.
-            for monitor, _, events, terminals in collected:
-                for event in events:
-                    self._validate_event_envs(monitor, event)
-                for env_id in terminals:
-                    if not self._open[env_id]:
-                        raise EngineStateError(
-                            f"monitor {monitor.name!r}: terminal for closed env {env_id}; "
-                            f"open envs are {list(self.open_envs)}"
-                        )
+                collected.append((monitor, self._collect_values(monitor, context)))
         except BaseException:
             if owns_query and tick_query is not None:
                 tick_query.close()
             raise
 
         outputs = tuple(
-            _MonitorTickOutput(
-                monitor=monitor.name,
-                values=values,
-                events=events,
-                terminations=terminations,
-            )
-            for monitor, values, events, terminations in collected
+            _MonitorTickOutput(monitor=monitor.name, values=values) for monitor, values in collected
         )
         tick = BenchmarkTick(step=context, monitor_outputs=outputs)
         self._active_tick = _ActiveTick(tick=tick, query=tick_query, owns_query=owns_query)
@@ -642,7 +608,8 @@ class StreamingEngine:
         """Validate one flow decision and apply it to the run state.
 
         The tick's monitor values are published regardless of the decision;
-        the flow controls only the events, terminal requests and stop flag.
+        the flow controls only the events, flow-authored terminations and stop
+        flag.
         """
         state = self._active_tick
         if state is None or state.tick is not tick:
@@ -662,7 +629,7 @@ class StreamingEngine:
                         self._publisher.publish(f"{output.monitor}/{local_name}", value)
             for event in decision.events:
                 self._record_event(event)
-            for env_id, termination in decision.terminal_requests:
+            for env_id, termination in decision.terminations.items():
                 self._accept_terminal(env_id, termination)
             if decision.stop:
                 self._stop_requested = True
@@ -703,7 +670,7 @@ class StreamingEngine:
                         f"flow decision.events[{index}]: env {env_id} is closed; "
                         f"open envs are {list(self.open_envs)}"
                     )
-        for env_id, termination in decision.terminal_requests:
+        for env_id, termination in decision.terminations.items():
             if env_id >= num_envs:
                 raise ValueError(
                     f"flow decision.terminations: env id {env_id} is outside "
@@ -760,12 +727,11 @@ class StreamingEngine:
     def begin_episode_end(self, due: object, bundle: Mapping[str, object]) -> EpisodeBatch | None:
         """Evaluate the final monitor boundary and return an immutable batch.
 
-        Monitor values, final events and report/scoring terminals are validated
-        here.  The batch keeps the final query snapshot open until
-        :meth:`commit_episode_end` or :meth:`discard_episode_end`; no run
-        aggregate, record or reset is mutated here.  The final event/terminal
-        queues are consumed at this boundary, so a later flow exception does not
-        restore them.
+        Final monitor values are validated here.  Monitors produce no events or
+        terminals, so this boundary only refreshes observations.  The batch
+        keeps the final query snapshot open until :meth:`commit_episode_end` or
+        :meth:`discard_episode_end`; no run aggregate, record or reset is
+        mutated here.
 
         Returns:
             The episode batch, or ``None`` when ``due`` is empty (the existing
@@ -813,27 +779,12 @@ class StreamingEngine:
             for monitor in self._monitors:
                 monitor.on_episode_end(due_ids, final_context)
 
-            # Read and validate the post-evaluation levels before draining
-            # outputs, so a malformed value cannot consume events/terminals on a
-            # failed boundary.  Publication still happens only at commit.
+            # Read and validate the post-evaluation levels.  Publication still
+            # happens only at commit.
             final_values = [
                 (monitor, self._collect_values(monitor, final_context))
                 for monitor in self._monitors
             ]
-
-            final_events = [(monitor, self._collect_events(monitor)) for monitor in self._monitors]
-            final_terminals: list[Termination] = []
-            for monitor in self._monitors:
-                drain = getattr(monitor, "drain_episode_terminals", None)
-                if callable(drain):
-                    final_terminals.extend(
-                        self._collect_episode_terminals(monitor, due_ids).values()
-                    )
-
-            # Validate every final occurrence before returning the batch.
-            for monitor, events in final_events:
-                for event in events:
-                    self._validate_final_event_envs(monitor, event, due_ids)
         except BaseException:
             if owns_final_query and final_query is not None:
                 final_query.close()
@@ -851,8 +802,6 @@ class StreamingEngine:
             bundle=bundle,
             due=due_ids,
             final_values=tuple(final_values),
-            final_events=tuple(final_events),
-            final_terminals=tuple(final_terminals),
             query=final_query,
             owns_query=owns_final_query,
         )
@@ -865,7 +814,7 @@ class StreamingEngine:
     ) -> tuple[int, ...]:
         """Apply a begun episode boundary and finalize its due records.
 
-        F2 accepts only ``evidence=None``; episode evidence is a later card.
+        This release accepts only ``evidence=None``; episode evidence is a later card.
         """
         state = self._active_episode
         if state is None or state.batch is not batch:
@@ -873,8 +822,8 @@ class StreamingEngine:
         try:
             if evidence is not None:
                 raise NotImplementedError(
-                    "engine episode evidence is not supported in F2; a flow must "
-                    "return None from on_episode_end"
+                    "engine episode evidence is not supported in this release; a "
+                    "flow must return None from on_episode_end"
                 )
             due_ids = state.due
             bundle = state.bundle
@@ -886,17 +835,6 @@ class StreamingEngine:
                 for monitor, values in state.final_values:
                     for local_name, value in values.items():
                         self._publisher.publish(f"{monitor.name}/{local_name}", value)
-
-            # Account for final occurrences before records are built so their
-            # per-episode event counts are complete.
-            for _, events in state.final_events:
-                for event in events:
-                    self._record_event(event)
-
-            # Episode-end terminals are report/scoring facts only: count them in
-            # the run aggregate, never in the runner drain or first-terminal latch.
-            for termination in state.final_terminals:
-                self._count_termination(termination)
 
             records = [
                 EpisodeRecord(
@@ -1068,9 +1006,9 @@ class StreamingEngine:
         restored timeline's first step.  The mark rides the episode until it
         finalizes: a due record keeps its natural verdict plus ``rewound=True``;
         an episode still open at run end is reported with verdict ``rewound``.
-        The F2 stop flag is cleared here too: a forked branch must not inherit
-        a stop request from the abandoned timeline.  F5 formalizes stop
-        persistence as part of the flow rewind contract.
+        The transient stop flag is cleared here too: a forked branch must not
+        inherit a stop request from the abandoned timeline.  A later card
+        formalizes stop persistence as part of the flow rewind contract.
         """
         del info
         self._stop_requested = False
@@ -1474,161 +1412,41 @@ class StreamingEngine:
 
     def _collect_values(self, monitor: Monitor, context: BenchmarkStepContext) -> dict[str, Tensor]:
         """Validate one monitor's fresh per-env level tensors."""
-        signals = monitor.signals()
-        if not isinstance(signals, Mapping):
+        values = monitor.values()
+        if not isinstance(values, Mapping):
             raise TypeError(
-                f"monitor {monitor.name!r}.signals: expected a mapping, "
-                f"got {type(signals).__name__}"
+                f"monitor {monitor.name!r}.values: expected a mapping, "
+                f"got {type(values).__name__}"
             )
         checked: dict[str, Tensor] = {}
-        for local_name, value in signals.items():
+        for local_name, value in values.items():
             if not isinstance(local_name, str) or not local_name:
                 raise TypeError(
-                    f"monitor {monitor.name!r}.signals: names must be non-empty "
+                    f"monitor {monitor.name!r}.values: names must be non-empty "
                     f"strings, got {local_name!r}"
                 )
             if "/" in local_name:
                 raise ValueError(
-                    f"monitor {monitor.name!r}.signals: name {local_name!r} must not "
+                    f"monitor {monitor.name!r}.values: name {local_name!r} must not "
                     "contain '/'; the engine owns the '<monitor>/<local>' namespace"
                 )
             if not isinstance(value, Tensor):
                 raise TypeError(
-                    f"monitor {monitor.name!r}.signals[{local_name!r}]: expected a "
+                    f"monitor {monitor.name!r}.values[{local_name!r}]: expected a "
                     f"tensor, got {type(value).__name__}"
                 )
             if value.ndim < 1 or value.shape[0] != context.num_envs:
                 raise ValueError(
-                    f"monitor {monitor.name!r}.signals[{local_name!r}]: expected leading "
+                    f"monitor {monitor.name!r}.values[{local_name!r}]: expected leading "
                     f"dimension num_envs={context.num_envs}, got shape {tuple(value.shape)}"
                 )
             if value.device != context.device:
                 raise ValueError(
-                    f"monitor {monitor.name!r}.signals[{local_name!r}]: device "
+                    f"monitor {monitor.name!r}.values[{local_name!r}]: device "
                     f"{value.device} does not match context device {context.device}"
                 )
             checked[local_name] = value
         return checked
-
-    def _collect_events(self, monitor: Monitor) -> tuple[Event, ...]:
-        """Drain and validate one monitor's occurrences."""
-        drained = monitor.drain_events()
-        if isinstance(drained, (str, bytes, bytearray)) or not isinstance(drained, Sequence):
-            raise TypeError(
-                f"monitor {monitor.name!r}.drain_events: expected a sequence, "
-                f"got {type(drained).__name__}"
-            )
-        events: list[Event] = []
-        for event in drained:
-            if not isinstance(event, Event):
-                raise TypeError(
-                    f"monitor {monitor.name!r}.drain_events: expected Event values, "
-                    f"got {type(event).__name__}"
-                )
-            events.append(event)
-        return tuple(events)
-
-    def _collect_terminals(self, monitor: Monitor, num_envs: int) -> dict[int, Termination]:
-        """Drain and validate one monitor's terminal requests."""
-        drained = monitor.drain_terminals()
-        if not isinstance(drained, Mapping):
-            raise TypeError(
-                f"monitor {monitor.name!r}.drain_terminals: expected a mapping, "
-                f"got {type(drained).__name__}"
-            )
-        terminals: dict[int, Termination] = {}
-        for key, value in drained.items():
-            env_id = _require_env_id(key, num_envs, f"monitor {monitor.name!r}.terminals")
-            if not isinstance(value, Termination):
-                raise TypeError(
-                    f"monitor {monitor.name!r}.terminals[{env_id}]: expected a "
-                    f"Termination, got {type(value).__name__}"
-                )
-            if value.source is not TerminationSource.CUSTOM:
-                raise ValueError(
-                    f"monitor {monitor.name!r}.terminals[{env_id}]: source must be "
-                    f"custom, got {value.source.value!r}"
-                )
-            if not value.code.startswith("custom."):
-                raise ValueError(
-                    f"monitor {monitor.name!r}.terminals[{env_id}]: code must start "
-                    f"with 'custom.', got {value.code!r}"
-                )
-            validate_code(value.code)
-            terminals[env_id] = value
-        return terminals
-
-    def _collect_episode_terminals(
-        self, monitor: Monitor, due_ids: tuple[int, ...]
-    ) -> dict[int, Termination]:
-        """Drain and validate one monitor's report/scoring terminals.
-
-        These facts are not runner terminal requests: they must name a due env
-        and never enter the pending drain or the first-terminal latch.
-        """
-        drained = monitor.drain_episode_terminals()  # type: ignore[attr-defined]
-        if not isinstance(drained, Mapping):
-            raise TypeError(
-                f"monitor {monitor.name!r}.drain_episode_terminals: expected a mapping, "
-                f"got {type(drained).__name__}"
-            )
-        due = set(due_ids)
-        terminals: dict[int, Termination] = {}
-        for key, value in drained.items():
-            env_id = _require_env_id(
-                key, self._require_bound(), f"monitor {monitor.name!r}.episode_terminals"
-            )
-            if env_id not in due:
-                raise EngineStateError(
-                    f"monitor {monitor.name!r}.episode_terminals[{env_id}]: env is not due "
-                    f"at this boundary; due envs are {list(due_ids)}"
-                )
-            if not isinstance(value, Termination):
-                raise TypeError(
-                    f"monitor {monitor.name!r}.episode_terminals[{env_id}]: expected a "
-                    f"Termination, got {type(value).__name__}"
-                )
-            if value.source is not TerminationSource.CUSTOM:
-                raise ValueError(
-                    f"monitor {monitor.name!r}.episode_terminals[{env_id}]: source must be "
-                    f"custom, got {value.source.value!r}"
-                )
-            if not value.code.startswith("custom."):
-                raise ValueError(
-                    f"monitor {monitor.name!r}.episode_terminals[{env_id}]: code must start "
-                    f"with 'custom.', got {value.code!r}"
-                )
-            validate_code(value.code)
-            terminals[env_id] = value
-        return terminals
-
-    def _validate_final_event_envs(
-        self, monitor: Monitor, event: Event, due_ids: tuple[int, ...]
-    ) -> None:
-        """Reject a final occurrence that names a non-due or closed environment."""
-        due = set(due_ids)
-        for env_id in event.env_ids:
-            if env_id not in due:
-                raise EngineStateError(
-                    f"monitor {monitor.name!r}.events[{event.name!r}]: env {env_id} "
-                    f"is not due at this boundary; due envs are {list(due_ids)}"
-                )
-        self._validate_event_envs(monitor, event)
-
-    def _validate_event_envs(self, monitor: Monitor, event: Event) -> None:
-        """Reject an occurrence that names a closed or unknown environment."""
-        num_envs = self._require_bound()
-        for env_id in event.env_ids:
-            if env_id >= num_envs:
-                raise ValueError(
-                    f"monitor {monitor.name!r}.events[{event.name!r}]: env id {env_id} "
-                    f"is outside [0, num_envs={num_envs})"
-                )
-            if not self._open[env_id]:
-                raise EngineStateError(
-                    f"monitor {monitor.name!r}.events[{event.name!r}]: env {env_id} "
-                    f"is closed; open envs are {list(self.open_envs)}"
-                )
 
     def _record_event(self, event: Event) -> None:
         """Append one occurrence to the capped journal and episode counters."""
@@ -1694,6 +1512,25 @@ class StreamingEngine:
         if self._num_envs is None:
             raise EngineStateError("engine: internal run shape is not bound")
         return self._num_envs
+
+
+def _reject_legacy_monitor_drains(monitor: Monitor) -> None:
+    """Reject a monitor that still exposes a retired event/terminal drain face.
+
+    Ignoring the extra methods would silently drop the monitor's outputs, so the
+    engine fails fast and names the replacement flow section instead.
+    """
+    legacy = [
+        method
+        for method in ("drain_events", "drain_terminals", "drain_episode_terminals")
+        if callable(getattr(monitor, method, None))
+    ]
+    if legacy:
+        raise TypeError(
+            f"monitor {monitor.name!r}: retired event/terminal drain face "
+            f"{legacy} is not supported; monitors publish values only and the "
+            "task flow owns flow.termination_rules / flow.events"
+        )
 
 
 def _require_monitor_name(name: object) -> str:
