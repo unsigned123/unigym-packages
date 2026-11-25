@@ -1,0 +1,47 @@
+{
+  "schema": "unigym_bench.frozen_builtin_facts/1",
+  "captured_from_core": "60fb049",
+  "captured_from_pack": "99aef0c",
+  "config": {
+    "backend": "mujoco",
+    "fixture": "tiny_arm",
+    "steps": 2,
+    "episode_length_s": 0.04,
+    "task": {
+      "name": "stand",
+      "articulation": "tiny",
+      "height_range": [-10.0, 10.0]
+    },
+    "min_episodes": 1,
+    "max_steps": 2
+  },
+  "builtin": {
+    "episodes_total": 1,
+    "steps_total": 2,
+    "terminal_code_counts": {
+      "runtime.episode_horizon": 1
+    },
+    "terminal_outcome_counts": {
+      "deadline": 1
+    },
+    "terminal_source_counts": {
+      "runtime": 1
+    }
+  },
+  "pack": {
+    "episodes_count": 1,
+    "total_ticks": 2,
+    "terminations": {
+      "code": {
+        "runtime.episode_horizon": 1
+      },
+      "outcome": {
+        "deadline": 1
+      },
+      "source": {
+        "runtime": 1
+      },
+      "total": 1
+    }
+  }
+}
