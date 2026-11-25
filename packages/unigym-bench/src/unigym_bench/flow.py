@@ -54,6 +54,7 @@ __all__ = [
     "EventRule",
     "FlowDecision",
     "FlowRun",
+    "FlowSequence",
     "RewindableFlow",
     "TerminationRule",
     "validate_flow",
@@ -755,6 +756,266 @@ class DefaultBenchmarkFlow:
             report_monitor_views=self._report_monitor_views,
             report_extensions=self._report_extensions,
         )
+
+
+class FlowSequence:
+    """Composite flow with one terminal owner and one report owner.
+
+    The sequence runs its children in declaration order on one immutable
+    :class:`BenchmarkTick`.  Each child keeps its own policy ownership:
+
+    - Every child may journal events; events concatenate in flow order.
+    - Only ``terminal_owner`` may return non-empty
+      :attr:`FlowDecision.terminations` or request ``stop``.  Those decisions
+      from another child are contract errors rather than silently dropped
+      policy, because dropping them would hide a mis-scoped benchmark rule.
+      Every other child is limited to events and episode evidence.
+    - Only ``report_owner`` may return the run report.  A non-owner report is a
+      contract error for the same reason.
+    - Every child observes :meth:`BenchmarkFlow.on_episode_end`; returned
+      evidence is namespaced by the child's flow name.  Duplicate flow names are
+      impossible by construction, so two children may use the same local
+      evidence key without collision: the report keeps both under their
+      respective namespaces.
+
+    ``stateful`` is true when any child is stateful.  The checkpoint is a map
+    keyed by child flow name that contains only the stateful children.
+    ``restore`` pre-flights every child (including an optional
+    ``validate_restore``) before touching live state and rolls every child back
+    when an unexpected restore failure occurs.  Rollback is best-effort: it
+    assumes each child's restore also succeeds for valid state.  If a broken
+    child's restore fails during rollback too, that error propagates and full
+    atomicity is not guaranteed; the engine then aborts the rewind.
+
+    Args:
+        flows: Child flows in execution order.  Names must be unique, non-empty
+            strings.
+        terminal_owner: Name of the only child allowed to terminate.
+        report_owner: Name of the only child allowed to return the run report.
+        name: The sequence's own flow name.  It must be non-empty and unique
+            when this sequence is itself a child of another sequence.
+
+    Raises:
+        TypeError: ``flows`` is not an iterable of valid flows, a name or owner
+            is not a non-empty string, or a child misdeclares its checkpoint
+            face.
+        ValueError: ``flows`` is empty, two children share a name, or an owner
+            does not name a declared child.
+    """
+
+    name: str
+    stateful: bool
+
+    def __init__(
+        self,
+        flows: Iterable[BenchmarkFlow],
+        *,
+        terminal_owner: str,
+        report_owner: str,
+        name: str = "sequence",
+    ) -> None:
+        """Validate the child flows, their names and both owners."""
+        if not isinstance(name, str) or not name:
+            raise TypeError(f"FlowSequence.name: expected a non-empty string, got {name!r}")
+        if isinstance(flows, (str, bytes, bytearray)):
+            raise TypeError(
+                "FlowSequence.flows: expected an iterable of BenchmarkFlow, "
+                f"got {type(flows).__name__}"
+            )
+        try:
+            materialized = tuple(flows)
+        except TypeError as exc:
+            raise TypeError(
+                "FlowSequence.flows: expected an iterable of BenchmarkFlow, "
+                f"got {type(flows).__name__}"
+            ) from exc
+        if not materialized:
+            raise ValueError("FlowSequence.flows: expected at least one child flow")
+        checked: list[BenchmarkFlow] = []
+        for index, flow in enumerate(materialized):
+            try:
+                checked.append(validate_flow(flow))
+            except TypeError as exc:
+                raise TypeError(f"FlowSequence.flows[{index}]: {exc}") from exc
+        declared = tuple(flow.name for flow in checked)
+        duplicates = sorted({child for child in declared if declared.count(child) > 1})
+        if duplicates:
+            raise ValueError(
+                "FlowSequence.flows: duplicate child flow names "
+                f"{duplicates}; every child must have a unique name"
+            )
+        self.name = name
+        self._flows: tuple[BenchmarkFlow, ...] = tuple(checked)
+        self._terminal_owner = _require_sequence_owner(
+            terminal_owner, "FlowSequence.terminal_owner", declared
+        )
+        self._report_owner = _require_sequence_owner(
+            report_owner, "FlowSequence.report_owner", declared
+        )
+        self._stateful_flows: tuple[BenchmarkFlow, ...] = tuple(
+            flow for flow in self._flows if flow.stateful
+        )
+        self.stateful = bool(self._stateful_flows)
+        if self.stateful:
+            # validate_flow rejects a flow that declares stateful=False while
+            # implementing the checkpoint face, so a stateless sequence must not
+            # advertise it.  Bind the face only when there is state to save.
+            self.snapshot = self._snapshot_state
+            self.restore = self._restore_state
+            self.validate_restore = self._validate_restore_state
+
+    @property
+    def flows(self) -> tuple[BenchmarkFlow, ...]:
+        """Child flows in declaration order."""
+        return self._flows
+
+    @property
+    def terminal_owner(self) -> str:
+        """Name of the only child allowed to terminate."""
+        return self._terminal_owner
+
+    @property
+    def report_owner(self) -> str:
+        """Name of the only child allowed to return the run report."""
+        return self._report_owner
+
+    def on_tick(self, tick: BenchmarkTick) -> FlowDecision:
+        """Run every child on the same immutable tick in declaration order."""
+        events: list[Event] = []
+        terminations: dict[int, Termination] = {}
+        stop = False
+        for flow in self._flows:
+            callback = getattr(flow, "on_tick", None)
+            if callback is None:
+                continue
+            decision = callback(tick)
+            if not isinstance(decision, FlowDecision):
+                raise TypeError(
+                    f"FlowSequence child {flow.name!r}.on_tick: expected a "
+                    f"FlowDecision, got {type(decision).__name__}"
+                )
+            if decision.terminations and flow.name != self._terminal_owner:
+                raise ValueError(
+                    f"FlowSequence {self.name!r}: child {flow.name!r} returned "
+                    f"terminations for env ids {sorted(decision.terminations)} but "
+                    f"only the terminal owner {self._terminal_owner!r} may terminate; "
+                    "move the decision into the terminal owner"
+                )
+            if decision.stop and flow.name != self._terminal_owner:
+                raise ValueError(
+                    f"FlowSequence {self.name!r}: child {flow.name!r} requested a run "
+                    f"stop but only the terminal owner {self._terminal_owner!r} may "
+                    "stop the run; non-owner children contribute events and evidence only"
+                )
+            terminations.update(decision.terminations)
+            events.extend(decision.events)
+            stop = stop or decision.stop
+        return FlowDecision(events=tuple(events), terminations=terminations, stop=stop)
+
+    def on_episode_end(self, batch: EpisodeBatch) -> EpisodeEvidence | None:
+        """Observe the boundary in every child and namespace returned evidence."""
+        rows: dict[int, dict[str, JsonValue]] = {}
+        for flow in self._flows:
+            result = flow.on_episode_end(batch)
+            if result is None:
+                continue
+            if not isinstance(result, EpisodeEvidence):
+                raise TypeError(
+                    f"FlowSequence child {flow.name!r}.on_episode_end: expected "
+                    f"EpisodeEvidence or None, got {type(result).__name__}"
+                )
+            for env_id, payload in result.evidence.items():
+                if not payload:
+                    continue
+                rows.setdefault(env_id, {})[flow.name] = dict(payload)
+        if not rows:
+            return None
+        return EpisodeEvidence(rows)
+
+    def on_run_end(self, run: FlowRun) -> Mapping[str, JsonValue] | None:
+        """Collect the run report from the sole report owner."""
+        report: Mapping[str, JsonValue] | None = None
+        for flow in self._flows:
+            result = flow.on_run_end(run)
+            if result is None:
+                continue
+            if flow.name != self._report_owner:
+                raise ValueError(
+                    f"FlowSequence {self.name!r}: child {flow.name!r} returned a "
+                    f"run report but only the report owner {self._report_owner!r} "
+                    "may produce it; delegate the report to the report owner"
+                )
+            normalized = ensure_json_value(result, where=f"FlowSequence child {flow.name!r} report")
+            if not isinstance(normalized, dict):
+                raise TypeError(
+                    f"FlowSequence child {flow.name!r}.on_run_end: expected a "
+                    f"mapping report, got {type(normalized).__name__}"
+                )
+            report = normalized
+        return report
+
+    def _snapshot_state(self) -> dict[str, JsonValue]:
+        """Return one JSON-safe snapshot per stateful child, keyed by flow name."""
+        snapshots: dict[str, JsonValue] = {}
+        for flow in self._stateful_flows:
+            snapshots[flow.name] = ensure_json_value(
+                flow.snapshot(), where=f"FlowSequence child {flow.name!r} snapshot"
+            )
+        return snapshots
+
+    def _validate_restore_state(self, state: JsonValue) -> None:
+        """Pre-flight a checkpoint without mutating any child."""
+        self._decode_state(state)
+
+    def _restore_state(self, state: JsonValue) -> None:
+        """Restore every stateful child atomically, rolling all back on failure."""
+        payloads = self._decode_state(state)
+        rollback = self._snapshot_state()
+        try:
+            for flow in self._stateful_flows:
+                flow.restore(payloads[flow.name])
+        except Exception:
+            for flow in self._stateful_flows:
+                flow.restore(rollback[flow.name])
+            raise
+
+    def _decode_state(self, state: JsonValue) -> dict[str, JsonValue]:
+        """Validate and normalize one checkpoint for every stateful child."""
+        if not isinstance(state, Mapping):
+            raise TypeError(
+                f"FlowSequence {self.name!r} state: expected an object, "
+                f"got {type(state).__name__}"
+            )
+        declared = tuple(flow.name for flow in self._stateful_flows)
+        if set(state) != set(declared):
+            raise ValueError(
+                f"FlowSequence {self.name!r} state: child flow names "
+                f"{sorted(map(repr, state))} do not match the live stateful "
+                f"children {sorted(declared)}"
+            )
+        payloads: dict[str, JsonValue] = {}
+        for flow in self._stateful_flows:
+            payload = ensure_json_value(
+                state[flow.name],
+                where=f"FlowSequence {self.name!r} child {flow.name!r} state",
+            )
+            validate = getattr(flow, "validate_restore", None)
+            if callable(validate):
+                validate(payload)
+            payloads[flow.name] = payload
+        return payloads
+
+
+def _require_sequence_owner(value: object, where: str, declared: tuple[str, ...]) -> str:
+    """Validate one sequence owner name against the declared child flows."""
+    if not isinstance(value, str) or not value:
+        raise TypeError(f"{where}: expected a non-empty child flow name, got {value!r}")
+    if value not in declared:
+        raise ValueError(
+            f"{where}: {value!r} is not a declared child flow; declared flows are "
+            f"{list(declared)}"
+        )
+    return value
 
 
 def _require_rule_name(value: object, where: str) -> str:

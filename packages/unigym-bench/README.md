@@ -235,6 +235,34 @@ tick/boundary and closes its query snapshot, but it does not restore tick
 counters or already-observed values. The exception propagates and the run must
 abort; it must not silently continue on partially observed state.
 
+### FlowSequence composition
+
+`FlowSequence(flows=(...), terminal_owner="...", report_owner="...",
+name="sequence")` composes existing flows into one `BenchmarkFlow` without an
+engine-owned flow list. Every child must have a unique non-empty `name`, and
+both owner names must name a declared child. The rules are fail-fast:
+
+- children run in declaration order on the same immutable `BenchmarkTick`;
+  a child without `on_tick` is skipped;
+- events concatenate in child order; only `terminal_owner` may return non-empty
+  `FlowDecision.terminations` or request `stop`. A non-owner terminal or stop
+  request is a teaching error, not a silently dropped decision;
+- only `report_owner` may return a run report; a non-`None` report from another
+  child is a teaching error;
+- every child receives `on_episode_end`. Evidence is namespaced by flow name as
+  `{flow_name: {...}}`. Duplicate child names are impossible, so different
+  children may reuse the same local evidence key; both survive under their
+  respective namespaces.
+
+`FlowSequence.stateful` is true when any child is stateful; its checkpoint is a
+`{flow_name: child_state}` map containing only stateful children. Restore
+pre-flights every child (including an optional `validate_restore`) and rolls all
+children back on an unexpected restore failure. Rollback is best-effort: a
+child whose restore also fails cannot be rolled back, and the engine aborts the
+rewind. A stateless sequence adds no `flow` checkpoint key. The composite exists
+by explicit owner request; the plan's "wait for a concrete second-flow user"
+F6 gate is waived for this release.
+
 ### F3/F4 report and episode-end semantics
 
 The report schema is `external_benchmark_report/3`. Because monitors no longer
