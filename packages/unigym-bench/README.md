@@ -160,7 +160,8 @@ Changed contracts:
   A reset of a finalized env reopens it; a core reset of an already-open env
   restarts it in place (per-episode ticks/events/command/reset facts cleared,
   `monitor.reset` notified) without fabricating an episode record; a pre-start
-  reset-all is a no-op because the engine binds on the first tick. `on_step_end`
+  reset-all leaves the engine unbound (a no-op) but still notifies the flow.
+  `on_step_end`
   no longer infers a reset. The `reset_after_episode` constructor argument and
   the `runner.auto_reset: false` rejection are removed because the sink now
   observes resets directly. With `runner.auto_reset: false`, episodes must
@@ -246,7 +247,8 @@ the engine. Monitors are observation-only; the flow is the only event/terminal
 decision owner for ticks. The stable seam is:
 
 - `BenchmarkFlow`: `name`, `stateful`, optional `on_tick(tick)`, required
-  `on_episode_end(batch)` and `on_run_end(run)`;
+  `on_episode_end(batch)` and `on_run_end(run)`, and optional
+  `on_reset(env_ids)`;
 - `BenchmarkTick`: the tick's step context and per-monitor observed values;
 - `FlowDecision`: flow-authored events, per-env terminations and a run-stop
   flag;
@@ -264,6 +266,19 @@ is valid and applies no tick policy. A `stateful=True` flow must implement
 callable `snapshot()`/`restore()`; its policy state joins the single
 `unigym_bench` rewind payload under an optional `flow` block. A stateless flow
 must not implement those methods and adds no checkpoint key.
+
+`on_reset(env_ids)` is optional: it is not a `BenchmarkFlow` protocol member
+(mirroring optional `on_tick`), so a flow without it still satisfies
+`isinstance(flow, BenchmarkFlow)`. `validate_flow` accepts a flow without it and
+rejects a non-callable attribute. The core calls
+`BenchmarkSink.on_reset(env_ids)` after every real reset chain (pre-start
+reset-all, tick auto-reset, explicit `runner.reset` and
+`terminate(..., reset=True)`; never for `reset=False` and never replayed on
+rewind). The sink first applies the engine reset when bound, then notifies the
+flow; a pre-start reset leaves the engine unbound but still notifies the flow,
+and a flow exception propagates after the engine reset has run. `on_reset`
+produces no event, evidence, terminal or report. A stateful flow that keeps
+reset-driven state includes it in `snapshot()` so rewind stays correct.
 
 `DefaultBenchmarkFlow` semantics are intentionally small:
 
@@ -312,6 +327,9 @@ both owner names must name a declared child. The rules are fail-fast:
   `{flow_name: {...}}`. Duplicate child names are impossible, so different
   children may reuse the same local evidence key; both survive under their
   respective namespaces.
+- every child with an `on_reset` callback receives the reset in declaration
+  order; a child without it is skipped. Reset observation is not limited to the
+  terminal or report owner; a child exception stops later children.
 
 `FlowSequence.stateful` is true when any child is stateful; its checkpoint is a
 `{flow_name: child_state}` map containing only stateful children. Restore

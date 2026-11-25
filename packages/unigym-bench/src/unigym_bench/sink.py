@@ -48,11 +48,11 @@ runner then runs a real reset chain, it calls the sink's
 :class:`~unigym.sink.ResetAwareSink` ``on_reset`` capability (tick auto-reset,
 ``runner.reset`` and ``terminate(..., reset=True)``).  A reset of a finalized
 env reopens it; a core reset of an already-open env restarts it in place and
-fabricates no episode record; a pre-start reset-all is a no-op because the
-engine binds on the first tick.  The sink never infers a reset from
-``on_step_end`` and never owns an episode horizon, so a pack run must end
-episodes with ``runner.terminate(...)`` or a pack sink terminal rather than a
-core clock.
+fabricates no episode record; a pre-start reset-all leaves the engine unbound
+but still notifies the flow so it can clear pre-run state.  The sink never
+infers a reset from ``on_step_end`` and never owns an episode horizon, so a
+pack run must end episodes with ``runner.terminate(...)`` or a pack sink
+terminal rather than a core clock.
 
 Report.  ``on_run_end`` finalizes the engine, lets the flow drive report
 extensions and returns the pack report under :data:`SUMMARY_KEY`.  The sink
@@ -469,14 +469,19 @@ class BenchmarkSink:
 
         The core calls this after every real reset chain (pre-start reset-all,
         tick auto-reset, explicit ``reset`` and ``terminate(..., reset=True)``).
-        A pre-start reset happens before the first tick binds the engine, so it
-        is a safe no-op: the first ``on_step`` binds the later run shape.  After
-        binding, the engine reopens finalized envs and restarts open envs in
-        place without fabricating an episode record.
+        A pre-start reset happens before the first tick binds the engine, so the
+        engine side is a safe no-op: the first ``on_step`` binds the later run
+        shape.  The flow is still notified so a state machine can clear pre-run
+        state.  After binding, the engine reopens finalized envs and restarts
+        open envs in place without fabricating an episode record, then the flow
+        observes the same ids.  ``reset=False`` is never delivered by the core,
+        and a flow exception propagates after the engine has applied the reset.
         """
-        if self._engine.num_envs is None:
-            return
-        self._engine.on_reset(env_ids)
+        if self._engine.num_envs is not None:
+            self._engine.on_reset(env_ids)
+        on_reset = getattr(self._flow, "on_reset", None)
+        if callable(on_reset):
+            on_reset(env_ids)
 
     def on_run_end(self) -> dict[str, object]:
         """Finalize the run, let the flow own the report and return it.

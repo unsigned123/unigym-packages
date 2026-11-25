@@ -26,10 +26,12 @@ from unigym.run.spec import build_spec
 from unigym.values import StepValues, ValueView
 from unigym_bench.context import BenchmarkStepContext
 from unigym_bench.engine import StreamingEngine
+from unigym_bench.flow import BenchmarkTick, EpisodeBatch, FlowDecision, FlowRun
 from unigym_bench.json import JsonValue
 from unigym_bench.monitors import BaseMonitor, Monitor, threshold_config
-from unigym_bench.report import ScenarioCoverageExtension
+from unigym_bench.report import RunMetadata, ScenarioCoverageExtension
 from unigym_bench.sink import BenchmarkSink, make_sink
+from unigym_bench.version import __version__
 
 
 def make_view(num_envs: int = 2, *, device: str | torch.device = "cpu") -> EnvView:
@@ -567,6 +569,81 @@ class BundleRecordingSink:
 def make_observed_sink(ctx: SinkContext) -> BundleRecordingSink:
     """Importable real-run sink factory wrapping ``make_sink``."""
     return BundleRecordingSink(make_sink(ctx))
+
+
+class ResetProbeFlow:
+    """Stateless flow that records real reset notifications for integration tests."""
+
+    name = "reset_probe"
+    stateful = False
+
+    def __init__(self, terminate_at_tick: int | None = None) -> None:
+        self.resets: list[tuple[int, ...]] = []
+        self.ticks = 0
+        self._terminate_at_tick = terminate_at_tick
+
+    def on_tick(self, tick: BenchmarkTick) -> FlowDecision:
+        """Terminate env 0 on the configured tick; otherwise no policy."""
+        del tick
+        self.ticks += 1
+        if self._terminate_at_tick is not None and self.ticks == self._terminate_at_tick:
+            return FlowDecision(
+                terminations={
+                    0: Termination(
+                        outcome=EpisodeOutcome.SUCCESS,
+                        code="custom.probe.reset_tick",
+                        source=TerminationSource.CUSTOM,
+                    )
+                }
+            )
+        return FlowDecision()
+
+    def on_reset(self, env_ids: Sequence[int]) -> None:
+        """Record the reset ids in call order."""
+        self.resets.append(tuple(int(env_id) for env_id in env_ids))
+
+    def on_episode_end(self, batch: EpisodeBatch) -> None:
+        """Observe nothing."""
+        del batch
+
+    def on_run_end(self, run: FlowRun) -> None:
+        """Delegate the report to the sink's default fallback."""
+        del run
+
+
+class ResetProbeSink(BundleRecordingSink):
+    """Observed sink that also exposes the probe flow for assertions."""
+
+    def __init__(self, inner: BenchmarkSink, flow: ResetProbeFlow) -> None:
+        super().__init__(inner)
+        self.flow = flow
+
+
+def make_reset_probe_sink(ctx: SinkContext) -> ResetProbeSink:
+    """Importable real-run sink factory with a reset-observing probe flow."""
+    options = ctx.options
+    terminate_at = options.get("probe_terminate_at_tick")
+    flow = ResetProbeFlow(terminate_at_tick=terminate_at if isinstance(terminate_at, int) else None)
+    metadata = RunMetadata(
+        run_identity=ctx.run_identity,
+        run_name=ctx.spec.run_name,
+        task_name=ctx.spec.run_name,
+        out_dir=ctx.out_dir,
+        seed=ctx.seed,
+        num_envs=ctx.num_envs,
+        policy_dt=ctx.policy_dt,
+        loop_mode="pool",
+        pack_version=__version__,
+    )
+    inner = BenchmarkSink(
+        make_integration_monitors(),
+        publisher=ctx.values,
+        extensions=make_coverage_extensions(),
+        metadata=metadata,
+        write_report=bool(options.get("write_report", False)),
+        flow=flow,
+    )
+    return ResetProbeSink(inner, flow)
 
 
 class StaticReportExtension:

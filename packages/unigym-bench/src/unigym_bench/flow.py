@@ -440,8 +440,11 @@ class FlowRun:
 class BenchmarkFlow(Protocol):
     """Policy seam for a benchmark run.
 
-    ``on_tick`` is optional: a flow that only observes episode boundaries or
-    run end may omit it entirely.  Validation is performed by
+    ``on_tick`` and ``on_reset`` are optional: a flow that only observes
+    episode boundaries or run end may omit ``on_tick``, and a flow that keeps no
+    reset-driven state may omit ``on_reset``.  Because those callbacks are not
+    protocol members, a flow without them still satisfies
+    ``isinstance(flow, BenchmarkFlow)``.  Validation is performed by
     :func:`validate_flow`, not by ``isinstance`` alone.
     """
 
@@ -486,7 +489,8 @@ def validate_flow(value: object) -> BenchmarkFlow:
     Raises:
         TypeError: A required attribute or callback is missing or malformed,
             or the ``stateful`` declaration disagrees with the snapshot/restore
-            capability.
+            capability.  ``on_tick`` and ``on_reset`` are optional; when present
+            they must be callable.
     """
     name = getattr(value, "name", None)
     if not isinstance(name, str) or not name:
@@ -513,6 +517,9 @@ def validate_flow(value: object) -> BenchmarkFlow:
     on_tick = getattr(value, "on_tick", None)
     if on_tick is not None and not callable(on_tick):
         raise TypeError(f"benchmark flow {name!r}.on_tick: expected a callable or absent")
+    on_reset = getattr(value, "on_reset", None)
+    if on_reset is not None and not callable(on_reset):
+        raise TypeError(f"benchmark flow {name!r}.on_reset: expected a callable or absent")
     for callback in ("on_episode_end", "on_run_end"):
         if not callable(getattr(value, callback, None)):
             raise TypeError(f"benchmark flow {name!r}: missing callable {callback}()")
@@ -749,6 +756,10 @@ class DefaultBenchmarkFlow:
             extension.on_env_end(batch.due, batch.records)
         return None
 
+    def on_reset(self, env_ids: Sequence[int]) -> None:
+        """Observe a reset without changing default stateless behavior."""
+        del env_ids
+
     def on_run_end(self, run: FlowRun) -> Mapping[str, JsonValue]:
         """Assemble the current pack report from the selected views/extensions."""
         return assemble_default_report(
@@ -931,6 +942,19 @@ class FlowSequence:
         if not rows:
             return None
         return EpisodeEvidence(rows)
+
+    def on_reset(self, env_ids: Sequence[int]) -> None:
+        """Forward the reset to every child with an ``on_reset`` callback.
+
+        Children run in declaration order and are all notified; reset
+        observation is not restricted to the terminal or report owner.  A
+        child exception propagates immediately and later children are not
+        called.
+        """
+        for flow in self._flows:
+            callback = getattr(flow, "on_reset", None)
+            if callable(callback):
+                callback(env_ids)
 
     def on_run_end(self, run: FlowRun) -> Mapping[str, JsonValue] | None:
         """Collect the run report from the sole report owner."""

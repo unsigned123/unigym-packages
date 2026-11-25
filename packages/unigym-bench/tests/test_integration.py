@@ -35,6 +35,7 @@ from unigym_bench.sink import BenchmarkSink
 from unigym_bench.specs import RetentionSpec
 from _support import (
     BundleRecordingSink,
+    ResetProbeSink,
     ScriptedMonitor,
     TickScript,
     make_bundle,
@@ -59,6 +60,24 @@ def _make_run(tmp_path: Path, *, steps: int) -> Run:
             },
         ),
     )
+
+
+def _make_probe_run(tmp_path: Path, *, steps: int, terminate_at_tick: int | None = None) -> Run:
+    options: dict[str, object] = {"write_report": True}
+    if terminate_at_tick is not None:
+        options["probe_terminate_at_tick"] = terminate_at_tick
+    return make_run(
+        tmp_path,
+        steps=steps,
+        sink=SinkSpec(factory="_support:make_reset_probe_sink", options=options),
+    )
+
+
+def _probe_sink(instance: RunInstance) -> ResetProbeSink:
+    for node in _walk_sinks(getattr(instance, "sink", None)):
+        if isinstance(node, ResetProbeSink):
+            return node
+    raise AssertionError("the reset probe sink is not mounted in the run tree")
 
 
 def _step(runner: ExternalRunner, count: int) -> None:
@@ -224,6 +243,64 @@ def test_pre_start_runner_reset_is_a_safe_noop(
     report = _find_pack_report(summary)
     assert report["episodes"]["count"] == 1
     assert report["episodes"]["total_ticks"] == 2
+
+
+def test_real_tiny_arm_flow_observes_pre_start_explicit_and_terminate_resets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The probe flow sees every real reset chain and not reset=False."""
+    monkeypatch.chdir(tmp_path)
+    run = _make_probe_run(tmp_path, steps=20)
+    try:
+        instance = run.build()
+        probe = _probe_sink(instance)
+        runner = run.runner("external", action_fn=zero_actions)
+
+        runner.reset()
+        assert probe.flow.resets == [(0,)]
+
+        _step(runner, 2)
+        end_episode(runner, reset=True)
+        assert probe.flow.resets == [(0,), (0,)]
+
+        _step(runner, 2)
+        end_episode(runner, reset=False)
+        assert probe.flow.resets == [(0,), (0,)]
+
+        runner.reset([0])
+        assert probe.flow.resets == [(0,), (0,), (0,)]
+
+        summary = runner.run(stop_when=lambda: True)
+    finally:
+        run.close()
+
+    report = _find_pack_report(summary)
+    assert report["episodes"]["count"] == 2
+    assert report["episodes"]["total_ticks"] == 4
+    assert report["episodes"]["by_env_counts"] == {"0": 2}
+
+
+def test_real_tiny_arm_flow_observes_tick_auto_reset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A sink terminal on a tick auto-resets and notifies the flow once."""
+    monkeypatch.chdir(tmp_path)
+    run = _make_probe_run(tmp_path, steps=20, terminate_at_tick=1)
+    try:
+        instance = run.build()
+        probe = _probe_sink(instance)
+        runner = run.runner("external", action_fn=zero_actions)
+
+        _step(runner, 1)
+        assert probe.flow.resets == [(0,)]
+
+        summary = runner.run(stop_when=lambda: True)
+    finally:
+        run.close()
+
+    report = _find_pack_report(summary)
+    assert report["episodes"]["count"] == 1
+    assert report["terminations"]["code"] == {"custom.probe.reset_tick": 1}
 
 
 def test_reset_of_an_open_env_restarts_without_fabricating_an_episode(

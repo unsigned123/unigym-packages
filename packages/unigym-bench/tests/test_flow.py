@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import pytest
 import torch
 from unigym.core.episode_termination import TerminationSource
@@ -10,6 +12,7 @@ from unigym_bench.compose import compose_task
 from unigym_bench.engine import EngineStateError, StreamingEngine
 from unigym_bench.events import EpisodeSummary, Event
 from unigym_bench.flow import (
+    BenchmarkFlow,
     BenchmarkTick,
     DefaultBenchmarkFlow,
     EpisodeBatch,
@@ -56,6 +59,22 @@ class NoOpFlow:
     def on_run_end(self, run: FlowRun) -> None:
         """Delegate the report to the sink's default fallback."""
         del run
+
+
+class ResetFlow(NoOpFlow):
+    """Flow that records real reset notifications and can fail on demand."""
+
+    name = "reset_probe"
+
+    def __init__(self, *, fail: bool = False) -> None:
+        self.resets: list[tuple[int, ...]] = []
+        self.fail = fail
+
+    def on_reset(self, env_ids: Sequence[int]) -> None:
+        """Record the ids, then raise when configured."""
+        self.resets.append(tuple(int(env_id) for env_id in env_ids))
+        if self.fail:
+            raise RuntimeError("flow reset boom")
 
 
 class EventFlow:
@@ -212,6 +231,30 @@ def test_validate_flow_accepts_a_no_op_flow_without_on_tick() -> None:
 
     assert validate_flow(flow) is flow
     assert not hasattr(flow, "on_tick")
+
+
+def test_validate_flow_accepts_absence_of_on_reset() -> None:
+    flow = NoOpFlow()
+
+    assert not hasattr(flow, "on_reset")
+    assert isinstance(flow, BenchmarkFlow)
+    assert validate_flow(flow) is flow
+
+
+def test_validate_flow_rejects_a_non_callable_on_reset() -> None:
+    class BadReset(NoOpFlow):
+        name = "bad_reset"
+        on_reset = 1
+
+    with pytest.raises(TypeError, match="on_reset"):
+        validate_flow(BadReset())
+
+
+def test_default_flow_on_reset_is_an_optional_noop() -> None:
+    flow = DefaultBenchmarkFlow()
+
+    assert callable(flow.on_reset)
+    flow.on_reset([0, 1])
 
 
 @pytest.mark.parametrize(

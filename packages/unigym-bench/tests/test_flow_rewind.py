@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 
 import pytest
 import torch
@@ -74,6 +75,45 @@ class CountingFlow:
                 raise ValueError(
                     f"counted flow state.{name}: expected a non-negative int, got {value!r}"
                 )
+
+
+class ResetCountingFlow:
+    """Stateful flow whose reset-driven counter must join the checkpoint."""
+
+    name = "reset_counted"
+    stateful = True
+
+    def __init__(self) -> None:
+        self.ticks = 0
+        self.resets = 0
+
+    def on_tick(self, tick: BenchmarkTick) -> FlowDecision:
+        """Count one observed tick."""
+        del tick
+        self.ticks += 1
+        return FlowDecision()
+
+    def on_reset(self, env_ids: Sequence[int]) -> None:
+        """Count the ids in one real reset chain."""
+        self.resets += len(env_ids)
+
+    def on_episode_end(self, batch: EpisodeBatch) -> None:
+        """Observe nothing."""
+        del batch
+
+    def on_run_end(self, run: FlowRun) -> None:
+        """Delegate the report to the sink's default fallback."""
+        del run
+
+    def snapshot(self) -> dict[str, int]:
+        """Return the reset-driven state as JSON-safe data."""
+        return {"ticks": self.ticks, "resets": self.resets}
+
+    def restore(self, state: JsonValue) -> None:
+        """Restore both counters."""
+        assert isinstance(state, dict)
+        self.ticks = state["ticks"]  # type: ignore[assignment]
+        self.resets = state["resets"]  # type: ignore[assignment]
 
 
 class ExplodingFlow(CountingFlow):
@@ -175,6 +215,26 @@ def test_stateful_flow_state_round_trips_after_a_due_episode() -> None:
     assert flow.snapshot() == {"ticks": 2, "episodes": 2}
     assert engine.summary.episodes == 2
     assert [record.episode_seq for record in engine.records] == [0, 1]
+
+
+def test_reset_driven_flow_state_is_captured_and_restored() -> None:
+    flow = ResetCountingFlow()
+    sink, _engine = _sink(flow)
+
+    _step(sink, 0, [0.0])
+    sink.on_reset([0])
+    assert flow.resets == 1
+    snapshot = sink.rewind_provider.rewind_state()
+    assert snapshot["flow"] == {
+        "name": "reset_counted",
+        "state": {"ticks": 1, "resets": 1},
+    }
+
+    sink.on_reset([0])
+    assert flow.resets == 2
+    sink.rewind_provider.apply_rewind_state(snapshot)
+
+    assert flow.snapshot() == {"ticks": 1, "resets": 1}
 
 
 def test_stop_requested_is_snapshotted_and_restored() -> None:

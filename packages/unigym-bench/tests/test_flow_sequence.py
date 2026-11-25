@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 
 import pytest
 from unigym.core.episode_termination import Termination
@@ -99,6 +99,21 @@ class BoundaryOnlyFlow:
 
     def on_run_end(self, run: FlowRun) -> None:
         self.runs.append(run)
+
+
+class ResetChild(BoundaryOnlyFlow):
+    """Child that records reset notifications and can fail on demand."""
+
+    def __init__(self, name: str, calls: list[tuple[str, tuple[int, ...]]], *, fail: bool = False):
+        super().__init__(name)
+        self.calls = calls
+        self.fail = fail
+
+    def on_reset(self, env_ids: Sequence[int]) -> None:
+        """Record the ordered call, then raise when configured."""
+        self.calls.append((self.name, tuple(int(env_id) for env_id in env_ids)))
+        if self.fail:
+            raise RuntimeError(f"{self.name} reset boom")
 
 
 class StatefulChild:
@@ -330,6 +345,40 @@ def test_every_child_observes_the_boundary_and_shared_keys_are_namespaced() -> N
     assert first.batches == [batch]
     assert second.batches == [batch]
     assert silent.batches == [batch]
+
+
+def test_on_reset_forwards_to_every_callable_child_in_declaration_order() -> None:
+    calls: list[tuple[str, tuple[int, ...]]] = []
+    first = ResetChild("first", calls)
+    second = BoundaryOnlyFlow("second")
+    third = ResetChild("third", calls)
+    sequence = FlowSequence(
+        (first, second, third),
+        terminal_owner="first",
+        report_owner="first",
+    )
+
+    sequence.on_reset([2, 0])
+
+    assert calls == [("first", (2, 0)), ("third", (2, 0))]
+    assert not hasattr(second, "on_reset")
+
+
+def test_on_reset_reaches_non_owner_children_and_stops_on_exception() -> None:
+    calls: list[tuple[str, tuple[int, ...]]] = []
+    first = ResetChild("first", calls)
+    boom = ResetChild("boom", calls, fail=True)
+    later = ResetChild("later", calls)
+    sequence = FlowSequence(
+        (first, boom, later),
+        terminal_owner="first",
+        report_owner="first",
+    )
+
+    with pytest.raises(RuntimeError, match="boom reset boom"):
+        sequence.on_reset([0])
+
+    assert calls == [("first", (0,)), ("boom", (0,))]
 
 
 def test_stateful_child_state_round_trips_as_a_flow_name_map() -> None:

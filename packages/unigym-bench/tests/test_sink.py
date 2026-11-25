@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Sequence
 
 import pytest
 import torch
@@ -33,6 +34,63 @@ from _support import (
 )
 
 _FACTORY = "_support:make_threshold_monitors"
+
+
+class _ResetProbeFlow:
+    """Stateless flow recording reset notifications for sink tests."""
+
+    name = "reset_probe"
+    stateful = False
+
+    def __init__(
+        self,
+        *,
+        fail: bool = False,
+        observe: object = None,
+    ) -> None:
+        self.resets: list[tuple[int, ...]] = []
+        self.fail = fail
+        self.observe = observe
+
+    def on_reset(self, env_ids: Sequence[int]) -> None:
+        """Observe engine state, record the ids, then raise when configured."""
+        if callable(self.observe):
+            self.observe(env_ids)
+        self.resets.append(tuple(int(env_id) for env_id in env_ids))
+        if self.fail:
+            raise RuntimeError("flow reset boom")
+
+    def on_episode_end(self, batch: object) -> None:
+        """Observe nothing."""
+        del batch
+
+    def on_run_end(self, run: object) -> None:
+        """Delegate the report to the sink's default fallback."""
+        del run
+
+
+class _StatefulResetProbeFlow(_ResetProbeFlow):
+    """Stateful probe whose reset count joins the checkpoint."""
+
+    name = "stateful_reset_probe"
+    stateful = True
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.counter = 0
+
+    def on_reset(self, env_ids: Sequence[int]) -> None:
+        """Record and count the reset ids."""
+        super().on_reset(env_ids)
+        self.counter += len(env_ids)
+
+    def snapshot(self) -> dict[str, int]:
+        """Return the reset-driven counter."""
+        return {"counter": self.counter}
+
+    def restore(self, state: dict[str, int]) -> None:
+        """Restore the reset-driven counter."""
+        self.counter = state["counter"]
 
 
 def _engine_sink(
@@ -289,6 +347,69 @@ def test_on_reset_before_the_first_tick_is_a_safe_noop() -> None:
     report = sink.on_run_end()["BenchmarkSink"]
     assert report["episodes"]["count"] == 0
     assert report["terminations"]["total"] == 0
+
+
+def test_pre_start_reset_still_notifies_the_flow_when_the_engine_is_unbound() -> None:
+    """A pre-start reset-all no-ops the engine but reaches the flow."""
+    flow = _ResetProbeFlow()
+    sink = BenchmarkSink([], flow=flow)
+
+    assert sink.rewind_provider.num_envs is None
+    sink.on_reset([0, 1])
+
+    assert flow.resets == [(0, 1)]
+
+
+def test_bound_reset_applies_the_engine_before_notifying_the_flow() -> None:
+    """The flow callback observes the already-reopened engine state."""
+    seen: list[tuple[int, ...]] = []
+    flow = _ResetProbeFlow(observe=lambda _ids: seen.append(engine.open_envs))
+    monitor = ScriptedMonitor("contact", {})
+    sink, engine = _engine_sink(monitor, flow)
+    sink.on_step(0, make_bundle(num_envs=2, t=0))
+    sink.drain_terminations()
+    sink.on_episode_end([0, 1], make_bundle(num_envs=2, t=0))
+    assert engine.open_envs == ()
+
+    sink.on_reset([0, 1])
+
+    assert seen == [(0, 1)]
+    assert flow.resets == [(0, 1)]
+    assert engine.open_envs == (0, 1)
+
+
+def test_flow_reset_exception_propagates_after_the_engine_reset() -> None:
+    flow = _ResetProbeFlow(fail=True)
+    monitor = ScriptedMonitor("contact", {0: TickScript()})
+    sink, engine = _engine_sink(monitor, flow)
+    sink.on_step(0, make_bundle(num_envs=1, t=0))
+    sink.drain_terminations()
+    sink.on_episode_end([0], make_bundle(num_envs=1, t=0))
+    assert engine.open_envs == ()
+
+    with pytest.raises(RuntimeError, match="flow reset boom"):
+        sink.on_reset([0])
+
+    assert flow.resets == [(0,)]
+    assert engine.open_envs == (0,)
+
+
+def test_rewind_restores_flow_state_without_replaying_on_reset() -> None:
+    flow = _StatefulResetProbeFlow()
+    monitor = ScriptedMonitor("contact", {0: TickScript()})
+    sink, _engine = _engine_sink(monitor, flow)
+    sink.on_step(0, make_bundle(num_envs=1, t=0))
+    snapshot = sink.rewind_provider.rewind_state()
+
+    sink.on_reset([0])
+    assert flow.resets == [(0,)]
+    assert flow.counter == 1
+
+    sink.rewind_provider.apply_rewind_state(snapshot)
+    sink.on_rewind({})
+
+    assert flow.resets == [(0,)]
+    assert flow.counter == 0
 
 
 def test_on_run_end_immediately_after_reset_skips_the_zero_tick_reopened_env() -> None:
