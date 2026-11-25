@@ -13,11 +13,13 @@ from unigym_bench.flow import (
     BenchmarkTick,
     DefaultBenchmarkFlow,
     EpisodeBatch,
+    EpisodeEvidence,
     EventRule,
     FlowDecision,
     FlowRun,
     TerminationRule,
     _MonitorTickOutput,
+    assemble_default_report,
     validate_flow,
 )
 from unigym_bench.report import REPORT_SCHEMA
@@ -95,6 +97,22 @@ class BadSourceFlow:
     def on_run_end(self, run: FlowRun) -> None:
         """Delegate the report to the default fallback."""
         del run
+
+
+class EvidenceFlow(NoOpFlow):
+    """Flow that returns one JSON evidence row per due env."""
+
+    name = "evidence"
+
+    def on_episode_end(self, batch: EpisodeBatch) -> EpisodeEvidence:
+        """Return evidence keyed by the current due envs."""
+        return EpisodeEvidence(
+            {env_id: {"seq": batch.records[env_id].episode_seq} for env_id in batch.due}
+        )
+
+    def on_run_end(self, run: FlowRun) -> dict[str, object]:
+        """Assemble the default report so evidence reaches the report block."""
+        return dict(assemble_default_report(run))
 
 
 class StatefulFlow(NoOpFlow):
@@ -375,7 +393,7 @@ def test_engine_conductor_episode_boundary_commits_a_record() -> None:
     assert engine.records[0].verdict == "terminal"
 
 
-def test_episode_batch_rejects_invalid_records_and_flow_evidence_is_rejected() -> None:
+def test_episode_batch_rejects_invalid_records_and_engine_accepts_typed_evidence() -> None:
     batch = EpisodeBatch(due=(0,), final_step=make_context(num_envs=1))
     with pytest.raises(TypeError):
         EpisodeBatch(due=(0,), final_step=batch.final_step, records={0: object()})  # type: ignore[dict-item]
@@ -385,8 +403,43 @@ def test_episode_batch_rejects_invalid_records_and_flow_evidence_is_rejected() -
     engine.on_step(make_bundle(num_envs=1, t=0))
     active = engine.begin_episode_end([0], make_bundle(num_envs=1, t=0))
     assert active is not None
-    with pytest.raises(NotImplementedError, match="evidence"):
-        engine.commit_episode_end(active, {0: {"score": 1.0}})
+    with pytest.raises(TypeError, match="EpisodeEvidence"):
+        engine.commit_episode_end(active, {0: {"score": 1.0}})  # type: ignore[arg-type]
+    assert engine.commit_episode_end(active, EpisodeEvidence({0: {"score": 1.0}})) == (0,)
+    assert dict(engine.evidence) == {(0, 0): {"score": 1.0}}
+
+
+def test_engine_rejects_evidence_for_an_env_that_is_not_due() -> None:
+    monitor = ScriptedMonitor("idle", {})
+    engine = StreamingEngine([monitor])
+    engine.on_step(make_bundle(num_envs=2, t=0))
+    active = engine.begin_episode_end([0], make_bundle(num_envs=2, t=0))
+    assert active is not None
+
+    with pytest.raises(ValueError, match="not due"):
+        engine.commit_episode_end(active, EpisodeEvidence({1: {"score": 1.0}}))
+    engine.discard_episode_end(active)
+
+
+def test_episode_evidence_survives_due_reset_reopen_and_rewind() -> None:
+    sink, engine, _monitor = _scripted_sink(EvidenceFlow())
+    bundle = make_bundle(num_envs=1, t=0)
+
+    sink.on_step(0, bundle)
+    sink.on_episode_end([0], bundle)
+    sink.on_reset([0])
+    assert dict(engine.evidence) == {(0, 0): {"seq": 0}}
+    snapshot = engine.rewind_state()
+
+    sink.on_step(1, bundle)
+    sink.on_episode_end([0], bundle)
+    assert dict(engine.evidence) == {(0, 0): {"seq": 0}, (0, 1): {"seq": 1}}
+
+    engine.apply_rewind_state(snapshot)
+
+    assert dict(engine.evidence) == {(0, 0): {"seq": 0}}
+    report = sink.on_run_end()["BenchmarkSink"]
+    assert report["episodes"]["evidence"] == {"0/0": {"seq": 0}}
 
 
 def test_default_flow_drives_each_extension_once() -> None:

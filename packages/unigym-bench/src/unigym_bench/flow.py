@@ -2,9 +2,11 @@
 
 A :class:`BenchmarkFlow` owns benchmark policy: it reads one immutable
 :class:`BenchmarkTick`, decides which events and terminals apply, observes
-episode boundaries and returns the pack report at run end.  The flow never
-mutates the engine, a monitor or an environment; the sink and engine validate
-every decision before changing run state.
+episode boundaries, returns episode evidence and extension invocation, and
+returns the pack report at run end.  The flow never mutates the engine, a
+monitor or an environment; the sink and engine validate every decision before
+changing run state.  Extension persistence and rewind stay engine-owned; only
+lifecycle invocation moves to the flow.
 
 Monitors publish values only.  :class:`DefaultBenchmarkFlow` applies explicit
 :class:`TerminationRule` declarations to those values (first true rule per env
@@ -20,7 +22,7 @@ without importing the engine, the sink or composition code.
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Protocol, cast, runtime_checkable
@@ -46,6 +48,7 @@ __all__ = [
     "BenchmarkTick",
     "DefaultBenchmarkFlow",
     "EpisodeBatch",
+    "EpisodeEvidence",
     "EventRule",
     "FlowDecision",
     "FlowRun",
@@ -206,23 +209,27 @@ def _validate_terminal_request(env_id: object, termination: object, where: str) 
 class EpisodeBatch:
     """The due-episode facts handed to :meth:`BenchmarkFlow.on_episode_end`.
 
-    This release is intentionally minimal: it carries the due ids, the final
-    step context, final monitor values and an empty record mapping.  A later
-    card adds evidence and the finalized records; no flow may schedule a runner
-    terminal from this callback.
+    The batch is the flow's only view of a boundary.  It carries the due ids,
+    the final step context, final monitor values, the finalized due records and
+    the engine-held report extensions.  A flow may inspect records and invoke
+    extension lifecycle callbacks, but it may not schedule a runner terminal
+    from this callback.
 
     Attributes:
         due: Sorted, unique due environment ids.
         final_step: The post-``on_step`` boundary context for the due episodes.
         monitor_values: Final per-monitor value tensors.
-        records: The finalized due records.  Empty until a later card owns
-            record projection for the flow.
+        records: The finalized due records, keyed by env id and containing
+            exactly ``due``.
+        extensions: The engine-held report extensions in declaration order.
+            The flow owns invocation, not persistence.
     """
 
     due: tuple[int, ...]
     final_step: BenchmarkStepContext
     monitor_values: Mapping[str, Mapping[str, Tensor]] = field(default_factory=dict)
     records: Mapping[int, EpisodeRecord] = field(default_factory=dict)
+    extensions: tuple[ReportExtension, ...] = ()
 
     def __post_init__(self) -> None:
         """Validate and freeze the episode batch."""
@@ -259,6 +266,7 @@ class EpisodeBatch:
                 )
             records[env_id] = record
         object.__setattr__(self, "records", MappingProxyType(records))
+        object.__setattr__(self, "extensions", tuple(self.extensions))
 
     @property
     def query(self) -> TickQuery | None:
@@ -272,19 +280,66 @@ class EpisodeBatch:
 
 
 @dataclass(frozen=True, slots=True)
+class EpisodeEvidence:
+    """Episode-scoped evidence returned from :meth:`BenchmarkFlow.on_episode_end`.
+
+    Evidence is keyed by due env id and merged into that episode's evidence by
+    the engine.  It is never a per-tick payload and never schedules a runner
+    terminal.  Every payload must be a JSON-safe object; a non-JSON value fails
+    at construction with the exact evidence path.
+
+    Attributes:
+        evidence: Due env id -> JSON object.  An empty mapping contributes
+            nothing.
+    """
+
+    evidence: Mapping[int, Mapping[str, JsonValue]] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
+
+    def __post_init__(self) -> None:
+        """Validate and freeze the evidence payloads."""
+        if not isinstance(self.evidence, Mapping):
+            raise TypeError(
+                "episode evidence: expected a mapping, " f"got {type(self.evidence).__name__}"
+            )
+        frozen: dict[int, Mapping[str, JsonValue]] = {}
+        for env_id, payload in self.evidence.items():
+            if isinstance(env_id, bool) or not isinstance(env_id, int) or env_id < 0:
+                raise TypeError(
+                    f"episode evidence: keys must be non-negative int env ids, got {env_id!r}"
+                )
+            if not isinstance(payload, Mapping):
+                raise TypeError(
+                    f"episode evidence[{env_id}]: expected a mapping, "
+                    f"got {type(payload).__name__}"
+                )
+            normalized = ensure_json_value(dict(payload), where=f"episode evidence[{env_id}]")
+            if not isinstance(normalized, dict):
+                raise TypeError(f"episode evidence[{env_id}]: expected an object")
+            frozen[env_id] = MappingProxyType(normalized)
+        object.__setattr__(self, "evidence", MappingProxyType(frozen))
+
+
+@dataclass(frozen=True, slots=True)
 class FlowRun:
     """The run-end facts handed to :meth:`BenchmarkFlow.on_run_end`.
 
     The flow is the report authority for the run.  It receives monitor report
     views, not live monitor objects: ``monitor_names`` preserves declaration
-    order and ``monitor_views`` carries the JSON report blocks.  The remaining
-    fields are the report metadata needed to reproduce the current document.
+    order and ``monitor_views`` carries the JSON report blocks.  ``evidence``
+    carries finalized episode evidence keyed by ``(env_id, episode_seq)``.
+    The remaining fields are the report metadata needed to reproduce the
+    current document.
     """
 
     metadata: RunMetadata
     summary: EpisodeSummary
     records: tuple[EpisodeRecord, ...]
     monitor_views: Mapping[str, Mapping[str, JsonValue]]
+    evidence: Mapping[tuple[int, int], Mapping[str, JsonValue]] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
     retention: RetentionSpec = field(default_factory=RetentionSpec)
     extensions: tuple[ReportExtension, ...] = ()
     monitor_names: tuple[str, ...] = ()
@@ -323,6 +378,39 @@ class FlowRun:
             raise ValueError(f"flow run.monitor_names: duplicate monitor names {checked_names!r}")
         object.__setattr__(self, "monitor_names", tuple(checked_names))
         object.__setattr__(self, "monitor_views", _freeze_monitor_views(raw_views))
+        if not isinstance(self.evidence, Mapping):
+            raise TypeError(
+                f"flow run.evidence: expected a mapping, got {type(self.evidence).__name__}"
+            )
+        frozen_evidence: dict[tuple[int, int], Mapping[str, JsonValue]] = {}
+        for key, payload in self.evidence.items():
+            if (
+                not isinstance(key, tuple)
+                or len(key) != 2
+                or any(
+                    isinstance(part, bool) or not isinstance(part, int) or part < 0 for part in key
+                )
+            ):
+                raise TypeError(
+                    "flow run.evidence: keys must be (env_id, episode_seq) non-negative int "
+                    f"tuples, got {key!r}"
+                )
+            if not isinstance(payload, Mapping):
+                raise TypeError(
+                    f"flow run.evidence[{key[0]}/{key[1]}]: expected a mapping, "
+                    f"got {type(payload).__name__}"
+                )
+            normalized = ensure_json_value(
+                dict(payload), where=f"flow run.evidence[{key[0]}/{key[1]}]"
+            )
+            if not isinstance(normalized, dict):
+                raise TypeError(f"flow run.evidence[{key[0]}/{key[1]}]: expected an object")
+            frozen_evidence[(key[0], key[1])] = MappingProxyType(normalized)
+        object.__setattr__(
+            self,
+            "evidence",
+            MappingProxyType(dict(sorted(frozen_evidence.items()))),
+        )
         if not isinstance(self.retention, RetentionSpec):
             raise TypeError(
                 "flow run.retention: expected a RetentionSpec, "
@@ -356,8 +444,8 @@ class BenchmarkFlow(Protocol):
     name: str
     stateful: bool
 
-    def on_episode_end(self, batch: EpisodeBatch) -> None:
-        """Observe the due episode boundary; this release has no evidence."""
+    def on_episode_end(self, batch: EpisodeBatch) -> EpisodeEvidence | None:
+        """Observe the due episode boundary and optionally return evidence."""
 
     def on_run_end(self, run: FlowRun) -> Mapping[str, JsonValue] | None:
         """Return the pack report document (or delegate to the default)."""
@@ -508,10 +596,19 @@ class DefaultBenchmarkFlow:
             automatic termination.
         events: Explicit event rules in declaration order.  Empty means no
             automatic events.
+        report_monitor_views: Monitor names whose report views are retained.
+            ``None`` retains every declared view.  A selected name that is not
+            present at run end is an error; an omitted name is simply absent
+            from the report's ``monitors`` block.
+        report_extensions: Extension names whose lifecycle callbacks run.
+            ``None`` runs every declared extension in declaration order.  A
+            selected name that is not present at run end is an error; an omitted
+            extension produces no ``extensions`` block.
 
     Raises:
         ValueError: A duplicate ``(monitor, value)`` termination rule is
-            declared, or a rule is malformed.
+            declared, a selection contains a duplicate name, or a rule is
+            malformed.
     """
 
     name = "default"
@@ -522,6 +619,8 @@ class DefaultBenchmarkFlow:
         rules: Sequence[TerminationRule] = (),
         *,
         events: Sequence[EventRule] = (),
+        report_monitor_views: Iterable[str] | None = None,
+        report_extensions: Iterable[str] | None = None,
     ) -> None:
         """Validate and freeze the explicit rule declarations."""
         checked_rules: list[TerminationRule] = []
@@ -551,6 +650,12 @@ class DefaultBenchmarkFlow:
             checked_events.append(rule)
         self._rules: tuple[TerminationRule, ...] = tuple(checked_rules)
         self._events: tuple[EventRule, ...] = tuple(checked_events)
+        self._report_monitor_views = _validate_report_selection(
+            report_monitor_views, "DefaultBenchmarkFlow.report_monitor_views"
+        )
+        self._report_extensions = _validate_report_selection(
+            report_extensions, "DefaultBenchmarkFlow.report_extensions"
+        )
 
     @property
     def rules(self) -> tuple[TerminationRule, ...]:
@@ -561,6 +666,16 @@ class DefaultBenchmarkFlow:
     def events(self) -> tuple[EventRule, ...]:
         """The explicit event rules in declaration order."""
         return self._events
+
+    @property
+    def report_monitor_views(self) -> frozenset[str] | None:
+        """Selected monitor view names, or ``None`` for every declared view."""
+        return None if self._report_monitor_views is None else frozenset(self._report_monitor_views)
+
+    @property
+    def report_extensions(self) -> frozenset[str] | None:
+        """Selected extension names, or ``None`` for every declared extension."""
+        return None if self._report_extensions is None else frozenset(self._report_extensions)
 
     def on_tick(self, tick: BenchmarkTick) -> FlowDecision:
         """Apply the explicit event and termination rules to this tick's values."""
@@ -598,13 +713,24 @@ class DefaultBenchmarkFlow:
                 )
         return FlowDecision(events=tuple(events), terminations=terminations)
 
-    def on_episode_end(self, batch: EpisodeBatch) -> None:
-        """Observe the boundary; this release has no episode evidence."""
-        del batch
+    def on_episode_end(self, batch: EpisodeBatch) -> EpisodeEvidence | None:
+        """Invoke each selected extension boundary callback exactly once.
+
+        Extensions run in declaration order.  The engine owns their persistence
+        and rewind state; the flow owns only this invocation.  The default flow
+        contributes no evidence of its own.
+        """
+        for extension in _select_extensions(batch.extensions, self._report_extensions):
+            extension.on_env_end(batch.due, batch.records)
+        return None
 
     def on_run_end(self, run: FlowRun) -> Mapping[str, JsonValue]:
-        """Assemble the current pack report from the run bundle."""
-        return assemble_default_report(run)
+        """Assemble the current pack report from the selected views/extensions."""
+        return assemble_default_report(
+            run,
+            report_monitor_views=self._report_monitor_views,
+            report_extensions=self._report_extensions,
+        )
 
 
 def _require_rule_name(value: object, where: str) -> str:
@@ -666,7 +792,77 @@ def _rule_mask(tick: BenchmarkTick, monitor: str, value: str, num_envs: int) -> 
     return [bool(item) for item in tensor.detach().to(device="cpu").tolist()]
 
 
-def assemble_default_report(run: FlowRun) -> Mapping[str, JsonValue]:
+def _validate_report_selection(
+    value: Iterable[str] | None,
+    where: str,
+) -> tuple[str, ...] | None:
+    """Validate an optional report selection.
+
+    A selection may be any finite iterable (a list, tuple, set or frozenset).
+    Its order is not significant: report assembly always follows declaration
+    order.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (str, bytes, bytearray)):
+        raise TypeError(f"{where}: expected an iterable of names or None, got {value!r}")
+    try:
+        items = list(value)
+    except TypeError as exc:
+        raise TypeError(
+            f"{where}: expected an iterable of names or None, got {type(value).__name__}"
+        ) from exc
+    names: list[str] = []
+    for name in items:
+        if not isinstance(name, str) or not name:
+            raise TypeError(f"{where}: expected non-empty strings, got {name!r}")
+        names.append(name)
+    if len(set(names)) != len(names):
+        raise ValueError(f"{where}: duplicate names {names!r}")
+    return tuple(names)
+
+
+def _select_extensions(
+    extensions: Sequence[ReportExtension],
+    selected: Iterable[str] | None,
+) -> tuple[ReportExtension, ...]:
+    """Return selected extensions in declaration order."""
+    if selected is None:
+        return tuple(extensions)
+    wanted = set(selected)
+    by_name = {extension.name: extension for extension in extensions}
+    unknown = sorted(wanted - set(by_name))
+    if unknown:
+        raise ValueError(
+            f"report_extensions: unknown extension name(s) {unknown}; "
+            f"declared extensions are {sorted(by_name)}"
+        )
+    return tuple(extension for extension in extensions if extension.name in wanted)
+
+
+def _select_monitor_names(
+    names: Sequence[str],
+    selected: Iterable[str] | None,
+) -> tuple[str, ...]:
+    """Return selected monitor names in declaration order."""
+    if selected is None:
+        return tuple(names)
+    wanted = set(selected)
+    unknown = sorted(wanted - set(names))
+    if unknown:
+        raise ValueError(
+            f"report_monitor_views: unknown monitor name(s) {unknown}; "
+            f"declared monitors are {sorted(names)}"
+        )
+    return tuple(name for name in names if name in wanted)
+
+
+def assemble_default_report(
+    run: FlowRun,
+    *,
+    report_monitor_views: Iterable[str] | None = None,
+    report_extensions: Iterable[str] | None = None,
+) -> Mapping[str, JsonValue]:
     """Build the current pack report for a run bundle.
 
     This is the default flow's report behavior and the sink's fallback when a
@@ -675,23 +871,50 @@ def assemble_default_report(run: FlowRun) -> Mapping[str, JsonValue]:
 
     Args:
         run: The frozen run bundle.
+        report_monitor_views: Selected monitor view names, or ``None`` for all.
+        report_extensions: Selected extension names, or ``None`` for all.
 
     Returns:
         The validated JSON-safe pack report document.
+
+    Raises:
+        ValueError: A selection names an unknown monitor or extension, or a
+            retained monitor view declares a ``report_extension`` that the same
+            selection omits (which would silently drop the monitor's report
+            content).
     """
+    selected_monitors = _select_monitor_names(run.monitor_names, report_monitor_views)
+    selected_extensions = _select_extensions(run.extensions, report_extensions)
+    selected_extension_names = {extension.name for extension in selected_extensions}
+    orphaned = sorted(
+        f"{monitor} -> {extension}"
+        for monitor in selected_monitors
+        if (extension := run.monitor_extensions.get(monitor)) is not None
+        and extension not in selected_extension_names
+    )
+    if orphaned:
+        raise ValueError(
+            "report selection would drop monitor report content: "
+            f"{orphaned}; each retained monitor that declares report_extension "
+            "requires its extension to be selected too. Select the extension, or "
+            "also omit the monitor view from report_monitor_views."
+        )
     summary = RunSummary(
         metadata=run.metadata,
         episodes=run.records,
         episode_summary=run.summary,
         monitor_views=run.monitor_views,
+        evidence=run.evidence,
         retention=run.retention,
     )
-    blocks = {extension.name: extension.on_run_end(summary) for extension in run.extensions}
-    monitors = tuple(_MonitorView(name, run.monitor_views[name]) for name in run.monitor_names)
+    blocks = {extension.name: extension.on_run_end(summary) for extension in selected_extensions}
+    monitors = tuple(_MonitorView(name, run.monitor_views[name]) for name in selected_monitors)
     builder = ReportBuilder(
         monitors=monitors,
-        extensions=run.extensions,
+        extensions=selected_extensions,
         monitor_extensions=run.monitor_extensions,
+        task_monitors=run.monitor_names,
+        task_extensions=tuple(extension.name for extension in run.extensions),
     )
     return builder.assemble(summary, blocks)
 

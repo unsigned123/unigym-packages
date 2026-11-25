@@ -9,10 +9,10 @@ metadata supplied at construction, the streaming engine's finalized
 Layout (fixed top-level blocks, in this order)::
 
     {
-      "schema": "external_benchmark_report/2",
+      "schema": "external_benchmark_report/3",
       "run": {...},          # identity + construction metadata
       "tasks": {...},        # task name, monitor names, extension names
-      "episodes": {...},     # retention-independent counts + retained detail
+      "episodes": {...},     # counts, retained detail and episode evidence
       "terminations": {...}, # counters by outcome/code/source
       "execution": {...},    # event total/dropped, conflicts, retention caps
       "monitors": {...},     # fallback: monitor.report_view()
@@ -58,6 +58,7 @@ from .specs import RetentionSpec
 from .version import __version__
 
 __all__ = [
+    "REPORT_BLOCKS",
     "REPORT_FILENAME",
     "REPORT_SCHEMA",
     "ReportBuilder",
@@ -71,10 +72,11 @@ __all__ = [
 
 #: Schema id of the pack-owned external benchmark report.
 #:
-#: Schema 2 removes the obsolete ``run.mode`` field: the post-deletion core has
-#: no run mode, and the pack must not fabricate one.  ``run.loop_mode`` remains
-#: the pack's own closed-loop selection.
-REPORT_SCHEMA = "external_benchmark_report/2"
+#: Schema 3 moves evidence under ``episodes.evidence`` and makes monitor report
+#: views flow-selected.  The obsolete ``run.mode`` field stays removed: the
+#: post-deletion core has no run mode, and the pack must not fabricate one.
+#: ``run.loop_mode`` remains the pack's own closed-loop selection.
+REPORT_SCHEMA = "external_benchmark_report/3"
 
 #: Pack-owned report filename written under a run's ``out_dir``.
 #: It can never collide with the core ``benchmark_report.json`` / ``results.json``
@@ -82,7 +84,7 @@ REPORT_SCHEMA = "external_benchmark_report/2"
 REPORT_FILENAME = "external_benchmark_report.json"
 
 #: The mandatory top-level blocks, in assembly order.
-_BASE_BLOCKS: tuple[str, ...] = (
+REPORT_BLOCKS: tuple[str, ...] = (
     "schema",
     "run",
     "tasks",
@@ -92,6 +94,8 @@ _BASE_BLOCKS: tuple[str, ...] = (
     "monitors",
     "extensions",
 )
+
+_BASE_BLOCKS = REPORT_BLOCKS
 
 #: Categories aggregated in the ``terminations`` base block.
 _TERMINATION_CATEGORIES: tuple[str, ...] = ("outcome", "code", "source")
@@ -186,16 +190,19 @@ class RunSummary:
 
     The summary exposes run identity/metadata, the retention-independent
     aggregate counters, the retained episode records, every monitor's fallback
-    view and the aggregated event/termination facts.  Open episodes that were
-    finalized at run end are present in ``episodes``/``episode_summary`` even
-    though they never triggered ``on_env_end``.  It holds no views, tensors or
-    backend handles.
+    view, finalized episode evidence and the aggregated event/termination
+    facts.  Open episodes that were finalized at run end are present in
+    ``episodes``/``episode_summary`` even though they never triggered
+    ``on_env_end``.  It holds no views, tensors or backend handles.
     """
 
     metadata: RunMetadata
     episodes: tuple[EpisodeRecord, ...]
     episode_summary: EpisodeSummary
     monitor_views: Mapping[str, Mapping[str, JsonValue]]
+    evidence: Mapping[tuple[int, int], Mapping[str, JsonValue]] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
     retention: RetentionSpec = field(default_factory=RetentionSpec)
     event_counts: Mapping[str, int] | None = None
     termination_counts: Mapping[str, Mapping[str, int]] | None = None
@@ -226,6 +233,7 @@ class RunSummary:
                 f"got {type(self.retention).__name__}"
             )
         object.__setattr__(self, "monitor_views", _freeze_monitor_views(self.monitor_views))
+        object.__setattr__(self, "evidence", _freeze_episode_evidence(self.evidence))
         event_counts = (
             _aggregate_event_counts(episodes)
             if self.event_counts is None
@@ -438,17 +446,22 @@ class ReportBuilder:
     """Assemble the pack report from a summary, monitors and extensions.
 
     The builder owns layout, namespacing, collision detection, JSON validation
-    and deterministic ordering.  It never invokes lifecycle callbacks: the sink
+    and deterministic ordering.  It never invokes lifecycle callbacks: the flow
     drives extension ``on_env_end``/``on_run_end`` at the correct point and
     passes the returned blocks to :meth:`assemble`.
 
     Args:
-        monitors: Monitor instances in task declaration order.
-        extensions: Report extensions in task declaration order.  Names must be
-            unique and a stateful extension must implement snapshot/restore.
+        monitors: Selected report monitor sources in declaration order.  A
+            monitor view absent from the run summary is omitted, not an error.
+        extensions: Selected report extensions in declaration order.  Names must
+            be unique and a stateful extension must implement snapshot/restore.
         monitor_extensions: Optional ``monitor name -> extension name`` map from
             a monitor's declared ``report_extension``.  A declared monitor is
             omitted from the ``monitors`` fallback block.
+        task_monitors: All task monitor names for the ``tasks.monitors`` block.
+            Defaults to the selected monitor names.
+        task_extensions: All declared extension names for the
+            ``tasks.extensions`` block.  Defaults to the selected extension names.
 
     Raises:
         TypeError: A monitor/extension is malformed or the stateful contract is
@@ -462,13 +475,39 @@ class ReportBuilder:
         monitors: Sequence[Monitor],
         extensions: Sequence[ReportExtension] = (),
         monitor_extensions: Mapping[str, str] | None = None,
+        task_monitors: Sequence[str] | None = None,
+        task_extensions: Sequence[str] | None = None,
     ) -> None:
         self._monitors = _validate_monitors(monitors)
         self._extensions = validate_report_extensions(extensions)
+        monitor_names = tuple(monitor.name for monitor in self._monitors)
+        extension_names = tuple(extension.name for extension in self._extensions)
+        self._task_monitors = _validate_task_names(
+            task_monitors,
+            default=monitor_names,
+            where="report builder task_monitors",
+        )
+        self._task_extensions = _validate_task_names(
+            task_extensions,
+            default=extension_names,
+            where="report builder task_extensions",
+        )
+        unknown_monitors = sorted(set(monitor_names) - set(self._task_monitors))
+        if unknown_monitors:
+            raise ValueError(
+                "report builder monitors: selected monitor(s) are not declared in "
+                f"task_monitors: {unknown_monitors}"
+            )
+        unknown_extensions = sorted(set(extension_names) - set(self._task_extensions))
+        if unknown_extensions:
+            raise ValueError(
+                "report builder extensions: selected extension(s) are not declared in "
+                f"task_extensions: {unknown_extensions}"
+            )
         self._monitor_extensions = _validate_monitor_extensions(
             monitor_extensions,
-            monitor_names=tuple(monitor.name for monitor in self._monitors),
-            extension_names=tuple(extension.name for extension in self._extensions),
+            monitor_names=self._task_monitors,
+            extension_names=self._task_extensions,
         )
 
     def assemble(
@@ -500,7 +539,11 @@ class ReportBuilder:
         report: dict[str, JsonValue] = {
             "schema": REPORT_SCHEMA,
             "run": _run_block(summary.metadata),
-            "tasks": _tasks_block(summary.metadata, self._monitors, self._extensions),
+            "tasks": _tasks_block(
+                summary.metadata,
+                self._task_monitors,
+                self._task_extensions,
+            ),
             "episodes": _episodes_block(summary),
             "terminations": _terminations_block(summary),
             "execution": _execution_block(summary),
@@ -708,13 +751,13 @@ def _run_block(metadata: RunMetadata) -> dict[str, JsonValue]:
 
 def _tasks_block(
     metadata: RunMetadata,
-    monitors: tuple[Monitor, ...],
-    extensions: tuple[ReportExtension, ...],
+    monitor_names: tuple[str, ...],
+    extension_names: tuple[str, ...],
 ) -> dict[str, JsonValue]:
     return {
         "name": metadata.task_name,
-        "monitors": [monitor.name for monitor in monitors],
-        "extensions": [extension.name for extension in extensions],
+        "monitors": list(monitor_names),
+        "extensions": list(extension_names),
     }
 
 
@@ -749,6 +792,13 @@ def _episodes_block(summary: RunSummary) -> dict[str, JsonValue]:
             "mean": (sum(ticks) / len(ticks)) if ticks else None,
         }
         block["by_env"] = _episodes_by_env(summary.episodes)
+    evidence = {
+        f"{env_id}/{episode_seq}": dict(payload)
+        for (env_id, episode_seq), payload in sorted(summary.evidence.items())
+        if payload
+    }
+    if evidence:
+        block["evidence"] = evidence
     return block
 
 
@@ -811,10 +861,9 @@ def _monitors_block(
             continue
         view = summary.monitor_views.get(monitor.name)
         if view is None:
-            raise ValueError(
-                f"external benchmark report.monitors: run summary has no report_view for "
-                f"monitor {monitor.name!r}"
-            )
+            # The flow owns view retention: an omitted view is absent, not an
+            # error.  Unknown selected names are rejected by the flow selection.
+            continue
         normalized = ensure_json_value(dict(view), where=f"monitors.{monitor.name}")
         if not isinstance(normalized, dict):
             raise TypeError(
@@ -840,6 +889,60 @@ def _extensions_block(
             )
         result[extension.name] = normalized
     return dict(sorted(result.items()))
+
+
+def _validate_task_names(
+    value: Sequence[str] | None,
+    *,
+    default: tuple[str, ...],
+    where: str,
+) -> tuple[str, ...]:
+    """Validate the full task declaration names for a report block."""
+    if value is None:
+        return default
+    if isinstance(value, (str, bytes, bytearray)) or not isinstance(value, Sequence):
+        raise TypeError(
+            f"{where}: expected a sequence of names or None, got {type(value).__name__}"
+        )
+    names: list[str] = []
+    for name in value:
+        if not isinstance(name, str) or not name:
+            raise TypeError(f"{where}: expected non-empty strings, got {name!r}")
+        names.append(name)
+    if len(set(names)) != len(names):
+        raise ValueError(f"{where}: duplicate names {names!r}")
+    return tuple(names)
+
+
+def _freeze_episode_evidence(
+    evidence: object,
+) -> Mapping[tuple[int, int], Mapping[str, JsonValue]]:
+    """Validate and freeze episode evidence keyed by ``(env_id, episode_seq)``."""
+    if not isinstance(evidence, Mapping):
+        raise TypeError(f"run summary.evidence: expected a mapping, got {type(evidence).__name__}")
+    frozen: dict[tuple[int, int], Mapping[str, JsonValue]] = {}
+    for key, payload in evidence.items():
+        if (
+            not isinstance(key, tuple)
+            or len(key) != 2
+            or any(isinstance(part, bool) or not isinstance(part, int) or part < 0 for part in key)
+        ):
+            raise TypeError(
+                "run summary.evidence: keys must be (env_id, episode_seq) non-negative "
+                f"int tuples, got {key!r}"
+            )
+        if not isinstance(payload, Mapping):
+            raise TypeError(
+                f"run summary.evidence[{key[0]}/{key[1]}]: expected a mapping, "
+                f"got {type(payload).__name__}"
+            )
+        normalized = ensure_json_value(
+            dict(payload), where=f"run summary.evidence[{key[0]}/{key[1]}]"
+        )
+        if not isinstance(normalized, dict):
+            raise TypeError(f"run summary.evidence[{key[0]}/{key[1]}]: expected an object")
+        frozen[(key[0], key[1])] = MappingProxyType(normalized)
+    return MappingProxyType(dict(sorted(frozen.items())))
 
 
 def _freeze_monitor_views(

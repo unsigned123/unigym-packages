@@ -54,8 +54,9 @@ engine binds on the first tick.  The sink never infers a reset from
 episodes with ``runner.terminate(...)`` or a pack sink terminal rather than a
 core clock.
 
-Report.  ``on_run_end`` finalizes the engine, drives every report extension's
-``on_run_end`` once and returns the pack report under :data:`SUMMARY_KEY`.  It
+Report.  ``on_run_end`` finalizes the engine, lets the flow drive report
+extensions and returns the pack report under :data:`SUMMARY_KEY`.  The sink
+validates the exact schema and top-level block set, caches the report once and
 never writes the core ``benchmark_report.json`` or any other core artifact.
 
 Rewind and early-stop hooks.  ``stop_when`` never stops.  The sink exposes the
@@ -93,7 +94,9 @@ from .flow import (
 from .json import JsonValue, ensure_json_value
 from .monitors import Monitor
 from .report import (
+    REPORT_BLOCKS,
     REPORT_FILENAME,
+    REPORT_SCHEMA,
     ReportExtension,
     RunMetadata,
     validate_report_configuration,
@@ -269,7 +272,8 @@ class BenchmarkSink:
 
     The sink is a thin lifecycle shell over a :class:`StreamingEngine`.  It
     never owns episode, latency, deadline or monitor/extension state of its own.
-    At run end it assembles and returns the pack report; it writes no core
+    At run end it asks the flow for the pack report, validates and returns it;
+    it writes no core
     artifact.
 
     Args:
@@ -473,10 +477,12 @@ class BenchmarkSink:
         """Finalize the run, let the flow own the report and return it.
 
         The report is assembled once and cached, so a second teardown call
-        cannot drive extension ``on_run_end`` twice.  With ``write_report`` the
-        cached report is serialized to :attr:`report_path`; a failed write is
-        raised and retried on the next call instead of leaving a cached
-        "success".  No core artifact is written.
+        cannot drive extension ``on_run_end`` twice after a successful attempt.
+        A failed assembly attempt is not cached: the next call retries the flow
+        and therefore invokes extension ``on_run_end`` again.  With
+        ``write_report`` the cached report is serialized to :attr:`report_path`;
+        a failed write is raised and retried on the next call instead of leaving
+        a cached "success".  No core artifact is written.
         """
         if self._report is None:
             aggregate = self._engine.run_summary()
@@ -494,6 +500,7 @@ class BenchmarkSink:
                 monitor_views={
                     monitor.name: monitor.report_view() for monitor in self._engine.monitors
                 },
+                evidence=self._engine.evidence,
                 retention=self._engine.retention,
                 extensions=self._engine.extensions,
                 monitor_names=tuple(monitor.name for monitor in self._engine.monitors),
@@ -510,7 +517,7 @@ class BenchmarkSink:
             normalized = ensure_json_value(result, where="benchmark flow report")
             if not isinstance(normalized, dict):
                 raise TypeError("benchmark flow report: expected an object")
-            self._report = normalized
+            self._report = _validate_report_document(normalized)
         path = self.report_path
         if path is not None and not self._report_written:
             _write_report_file(path, self._report)
@@ -524,6 +531,34 @@ class BenchmarkSink:
     def on_rewind(self, info: dict[str, object]) -> None:
         """Mark the currently open episodes as belonging to a forked timeline."""
         self._engine.on_rewind(info)
+
+
+def _validate_report_document(report: dict[str, JsonValue]) -> dict[str, JsonValue]:
+    """Validate the exact report schema and top-level block set.
+
+    The flow owns report content, not the document shape.  A flow cannot add a
+    top-level block, omit a block, or return an older schema id.
+    """
+    keys = tuple(report)
+    if keys != REPORT_BLOCKS:
+        missing = sorted(set(REPORT_BLOCKS) - set(keys))
+        extra = sorted(set(keys) - set(REPORT_BLOCKS))
+        if missing or extra:
+            raise ValueError(
+                "benchmark flow report: expected exactly the top-level blocks "
+                f"{list(REPORT_BLOCKS)}, missing {missing}, extra {extra}"
+            )
+        raise ValueError(
+            "benchmark flow report: top-level blocks are out of order; "
+            f"expected {list(REPORT_BLOCKS)}, got {list(keys)}"
+        )
+    schema = report["schema"]
+    if schema != REPORT_SCHEMA:
+        raise ValueError(
+            f"benchmark flow report.schema: expected {REPORT_SCHEMA!r}, got {schema!r}; "
+            "the previous external_benchmark_report/2 schema is rejected"
+        )
+    return report
 
 
 def _write_report_file(path: Path, report: dict[str, JsonValue]) -> None:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
@@ -18,7 +19,13 @@ from unigym.errors import ConfigError
 
 from unigym_bench.engine import StreamingEngine
 from unigym_bench.events import EpisodeRecord, EpisodeSummary
-from unigym_bench.flow import DefaultBenchmarkFlow, EventRule, TerminationRule
+from unigym_bench.flow import (
+    DefaultBenchmarkFlow,
+    EpisodeEvidence,
+    EventRule,
+    TerminationRule,
+    assemble_default_report,
+)
 from unigym_bench.json import ensure_json_value
 from unigym_bench.monitors import BaseMonitor, PredicateMonitor
 from unigym_bench.report import (
@@ -809,3 +816,350 @@ def test_final_episode_value_is_not_counted_as_a_termination() -> None:
     assert report["execution"]["terminal_conflicts"] == 0
     assert engine.drain_terminations() == {}
     assert monitor.report_view()["episode_end_fired"] == 1
+
+
+class _EvidenceFlow:
+    """Minimal flow that returns fixed evidence for the due envs."""
+
+    name = "evidence"
+    stateful = False
+
+    def on_episode_end(self, batch: object) -> EpisodeEvidence:
+        """Return one evidence row per due env."""
+        due = getattr(batch, "due")
+        return EpisodeEvidence({env_id: {"score": float(env_id) + 0.5} for env_id in due})
+
+    def on_run_end(self, run: object) -> dict[str, object]:
+        """Use the default report so evidence is visible."""
+        return dict(assemble_default_report(run))  # type: ignore[arg-type]
+
+
+class _EmptyEvidenceFlow:
+    """Flow that returns an empty evidence object for each due env."""
+
+    name = "empty_evidence"
+    stateful = False
+
+    def on_episode_end(self, batch: object) -> EpisodeEvidence:
+        """Return an empty payload per due env."""
+        due = getattr(batch, "due")
+        return EpisodeEvidence({env_id: {} for env_id in due})
+
+    def on_run_end(self, run: object) -> dict[str, object]:
+        """Use the default report so evidence filtering is observable."""
+        return dict(assemble_default_report(run))  # type: ignore[arg-type]
+
+
+class _OldSchemaFlow:
+    """Flow that returns the retired report schema id."""
+
+    name = "old_schema"
+    stateful = False
+
+    def on_episode_end(self, batch: object) -> None:
+        """No evidence."""
+        del batch
+
+    def on_run_end(self, run: object) -> dict[str, object]:
+        """Return a valid report with the previous schema id."""
+        report = dict(assemble_default_report(run))  # type: ignore[arg-type]
+        report["schema"] = "external_benchmark_report/2"
+        return report
+
+
+class _ExtraBlockFlow:
+    """Flow that tries to add a top-level block."""
+
+    name = "extra_block"
+    stateful = False
+
+    def on_episode_end(self, batch: object) -> None:
+        """No evidence."""
+        del batch
+
+    def on_run_end(self, run: object) -> dict[str, object]:
+        """Return a valid report plus one illegal top-level field."""
+        report = dict(assemble_default_report(run))  # type: ignore[arg-type]
+        report["extra"] = {}
+        return report
+
+
+class _OrderExtension:
+    """Stateless extension that records its boundary/run-end order."""
+
+    stateful = False
+
+    def __init__(self, name: str, calls: list[str]) -> None:
+        self.name = name
+        self._calls = calls
+
+    def on_env_end(self, env_ids: object, records: object) -> None:
+        """Record the boundary call."""
+        del env_ids, records
+        self._calls.append(f"{self.name}.env_end")
+
+    def on_run_end(self, summary: object) -> Mapping[str, object]:
+        """Record the run-end call and return a small block."""
+        del summary
+        self._calls.append(f"{self.name}.run_end")
+        return {"order": len(self._calls)}
+
+
+class _FailOnceExtension:
+    """Stateless extension whose first run-end attempt raises."""
+
+    stateful = False
+    name = "fail_once"
+
+    def __init__(self) -> None:
+        self.run_end_calls = 0
+
+    def on_env_end(self, env_ids: object, records: object) -> None:
+        """No accumulator."""
+        del env_ids, records
+
+    def on_run_end(self, summary: object) -> Mapping[str, object]:
+        """Fail on the first attempt, then report the attempt count."""
+        del summary
+        self.run_end_calls += 1
+        if self.run_end_calls == 1:
+            raise RuntimeError("first report attempt fails")
+        return {"calls": self.run_end_calls}
+
+
+class _OutOfOrderFlow:
+    """Flow that returns the default report blocks in reverse order."""
+
+    name = "out_of_order"
+    stateful = False
+
+    def on_episode_end(self, batch: object) -> None:
+        """No evidence."""
+        del batch
+
+    def on_run_end(self, run: object) -> dict[str, object]:
+        """Return the same blocks with a broken top-level order."""
+        report = dict(assemble_default_report(run))  # type: ignore[arg-type]
+        return {key: report[key] for key in reversed(tuple(report))}
+
+
+def test_report_schema_is_3_and_has_no_evidence_key_by_default() -> None:
+    sink = BenchmarkSink([BaseMonitor("m")], metadata=_metadata())
+    report = sink.on_run_end()["BenchmarkSink"]
+
+    assert report["schema"] == "external_benchmark_report/3"
+    assert REPORT_SCHEMA == "external_benchmark_report/3"
+    assert "evidence" not in report["episodes"]
+
+
+def test_monitor_report_blocks_carry_no_terminal_fields() -> None:
+    monitor = PredicateMonitor(
+        "pred",
+        {"source": "value:flag", "op": "gt", "value": 0.0},
+        "tick",
+    )
+    sink = BenchmarkSink([monitor], metadata=_metadata())
+    bundle = make_bundle(
+        num_envs=1,
+        t=0,
+        values=StepValues({"flag": torch.tensor([1.0])}),
+    )
+
+    sink.on_step(0, bundle)
+    block = sink.on_run_end()["BenchmarkSink"]["monitors"]["pred"]
+
+    assert {"terminal_reason", "terminal_outcome"}.isdisjoint(block)
+
+
+def test_sink_rejects_the_previous_report_schema() -> None:
+    sink = BenchmarkSink([BaseMonitor("m")], flow=_OldSchemaFlow(), metadata=_metadata())
+
+    with pytest.raises(ValueError, match="external_benchmark_report/3"):
+        sink.on_run_end()
+
+
+def test_sink_rejects_an_extra_top_level_report_block() -> None:
+    sink = BenchmarkSink([BaseMonitor("m")], flow=_ExtraBlockFlow(), metadata=_metadata())
+
+    with pytest.raises(ValueError, match="exactly the top-level blocks"):
+        sink.on_run_end()
+
+
+def test_sink_rejects_out_of_order_top_level_report_blocks() -> None:
+    sink = BenchmarkSink([BaseMonitor("m")], flow=_OutOfOrderFlow(), metadata=_metadata())
+
+    with pytest.raises(ValueError, match="out of order"):
+        sink.on_run_end()
+
+
+def test_default_flow_rejects_dropping_a_monitor_declared_extension() -> None:
+    sink = BenchmarkSink(
+        [BaseMonitor("contact")],
+        extensions=[ViewReportExtension("contact_report")],
+        flow=DefaultBenchmarkFlow(report_extensions=()),
+        metadata=_metadata(),
+        monitor_extensions={"contact": "contact_report"},
+    )
+
+    with pytest.raises(ValueError, match="contact -> contact_report"):
+        sink.on_run_end()
+
+    both_omitted = BenchmarkSink(
+        [BaseMonitor("contact")],
+        extensions=[ViewReportExtension("contact_report")],
+        flow=DefaultBenchmarkFlow(report_monitor_views=(), report_extensions=()),
+        metadata=_metadata(),
+        monitor_extensions={"contact": "contact_report"},
+    )
+    report = both_omitted.on_run_end()["BenchmarkSink"]
+    assert report["monitors"] == {}
+    assert report["extensions"] == {}
+
+
+def test_failed_report_attempt_retries_and_reinvokes_extension_on_run_end() -> None:
+    extension = _FailOnceExtension()
+    sink, _engine = _sink([BaseMonitor("m")], extensions=[extension])
+
+    with pytest.raises(RuntimeError, match="first report attempt fails"):
+        sink.on_run_end()
+
+    report = sink.on_run_end()["BenchmarkSink"]
+    assert extension.run_end_calls == 2
+    assert report["extensions"]["fail_once"] == {"calls": 2}
+
+    sink.on_run_end()
+    assert extension.run_end_calls == 2
+
+
+def test_missing_or_omitted_monitor_view_is_not_an_error() -> None:
+    builder = ReportBuilder(monitors=[BaseMonitor("a"), BaseMonitor("b")])
+    summary = RunSummary(
+        metadata=_metadata(),
+        episodes=(),
+        episode_summary=EpisodeSummary(),
+        monitor_views={"a": {"name": "a", "kind": "base"}},
+    )
+
+    report = builder.assemble(summary, {})
+
+    assert report["monitors"] == {"a": {"name": "a", "kind": "base"}}
+    assert report["tasks"]["monitors"] == ["a", "b"]
+
+
+def test_default_flow_filters_monitor_views_and_extensions() -> None:
+    calls: list[str] = []
+    first = _OrderExtension("first", calls)
+    second = _OrderExtension("second", calls)
+    flow = DefaultBenchmarkFlow(
+        report_monitor_views=frozenset({"kept"}),
+        report_extensions=frozenset({"second"}),
+    )
+    sink, engine = _sink(
+        [BaseMonitor("kept"), BaseMonitor("omitted")],
+        extensions=[first, second],
+        flow=flow,
+    )
+    bundle = make_bundle(num_envs=1, t=0)
+
+    sink.on_step(0, bundle)
+    sink.on_episode_end([0], bundle)
+    report = sink.on_run_end()["BenchmarkSink"]
+
+    assert engine.extensions == (first, second)
+    assert calls == ["second.env_end", "second.run_end"]
+    assert report["monitors"] == {"kept": {"name": "kept", "kind": "base"}}
+    assert report["tasks"]["monitors"] == ["kept", "omitted"]
+    assert report["extensions"] == {"second": {"order": 2}}
+    assert report["tasks"]["extensions"] == ["first", "second"]
+
+
+def test_default_flow_invokes_every_extension_once_in_declaration_order() -> None:
+    calls: list[str] = []
+    first = _OrderExtension("first", calls)
+    second = _OrderExtension("second", calls)
+    sink, _engine = _sink([BaseMonitor("m")], extensions=[first, second])
+    bundle = make_bundle(num_envs=1, t=0)
+
+    sink.on_step(0, bundle)
+    sink.on_episode_end([0], bundle)
+    sink.on_run_end()
+    sink.on_run_end()
+
+    assert calls == [
+        "first.env_end",
+        "second.env_end",
+        "first.run_end",
+        "second.run_end",
+    ]
+
+
+def test_default_flow_rejects_unknown_report_selections() -> None:
+    monitors = [BaseMonitor("m")]
+    extensions = [StaticReportExtension("ext", {})]
+    unknown_view, _ = _sink(
+        monitors,
+        extensions=extensions,
+        flow=DefaultBenchmarkFlow(report_monitor_views=("nope",)),
+    )
+    unknown_extension, _ = _sink(
+        monitors,
+        extensions=extensions,
+        flow=DefaultBenchmarkFlow(report_extensions=("nope",)),
+    )
+
+    with pytest.raises(ValueError, match="unknown monitor"):
+        unknown_view.on_run_end()
+    with pytest.raises(ValueError, match="unknown extension"):
+        unknown_extension.on_run_end()
+
+
+def test_episode_evidence_is_reported_at_the_fixed_location() -> None:
+    sink = BenchmarkSink(
+        [BaseMonitor("m")],
+        flow=_EvidenceFlow(),  # type: ignore[arg-type]
+        metadata=_metadata(),
+    )
+    bundle = make_bundle(num_envs=1, t=0)
+
+    sink.on_step(0, bundle)
+    sink.on_episode_end([0], bundle)
+    report = sink.on_run_end()["BenchmarkSink"]
+
+    assert report["episodes"]["evidence"] == {"0/0": {"score": 0.5}}
+    assert "evidence" not in report
+
+
+def test_empty_evidence_entries_are_omitted() -> None:
+    sink = BenchmarkSink(
+        [BaseMonitor("m")],
+        flow=_EmptyEvidenceFlow(),  # type: ignore[arg-type]
+        metadata=_metadata(),
+    )
+    bundle = make_bundle(num_envs=1, t=0)
+
+    sink.on_step(0, bundle)
+    sink.on_episode_end([0], bundle)
+    report = sink.on_run_end()["BenchmarkSink"]
+
+    assert "evidence" not in report["episodes"]
+    assert sink.rewind_provider.evidence == {}
+
+
+def test_non_json_evidence_fails_with_its_path() -> None:
+    with pytest.raises(TypeError, match=r"episode evidence\[2\]"):
+        EpisodeEvidence({2: {"tensor": torch.tensor(1.0)}})
+
+
+def test_engine_does_not_invoke_extension_on_env_end() -> None:
+    extension = CountingReportExtension()
+    monitor = ScriptedMonitor("idle", {})
+    engine = StreamingEngine([monitor], extensions=[extension])
+    bundle = make_bundle(num_envs=1, t=0)
+
+    engine.on_step(bundle)
+    batch = engine.begin_episode_end([0], bundle)
+    assert batch is not None
+    engine.commit_episode_end(batch, None)
+
+    assert extension.episodes == 0
+    assert extension.run_end_calls == 0

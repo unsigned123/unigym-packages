@@ -31,7 +31,10 @@ transport:
   events and no terminals;
 - `ScenarioSampler.bind_values(ValueView)` replaces `bind_signals`;
 - the pack rewind schema is `unigym_bench.rewind/5` and monitor snapshots are
-  `unigym_bench.monitor/4`; older payloads are rejected explicitly.
+  `unigym_bench.monitor/4`; older payloads are rejected explicitly. F4 added
+  finalized episode evidence to the `/5` engine payload, so the `/5` shape
+  changed in F4: pre-F4 `/5` payloads are rejected. F5 finalizes the rewind
+  schema.
 
 P14 collapses the typed built-in monitors. `ThresholdMonitor`, `HoldMonitor`,
 `SafetyMonitor` and `EventCounterMonitor` are now `PredicateMonitor`
@@ -84,9 +87,10 @@ Changed contracts:
 - The core has no run `mode`, no `episode_length_s`, no built-in benchmark and
   no `EvaluationSession`. The pack removes `ctx.mode` and `RunMetadata.mode`;
   no run mode is fabricated.
-- The report schema is `external_benchmark_report/2`. The obsolete `run.mode`
+- The report schema is `external_benchmark_report/3`. The obsolete `run.mode`
   field is removed; `run.loop_mode` remains the pack's own closed-loop
-  selection. Schema `/1` reports are not re-emitted as `/2`.
+  selection. The retired `/1` and `/2` report schemas are rejected; there is no
+  compatibility shim.
 - Episodes end only through an explicit boundary: `runner.terminate(env_ids,
   terminations, reset=True/False)` or a pack sink terminal drained by the
   runner. There is no hidden episode clock; a run that never ends an episode
@@ -149,7 +153,7 @@ Changed contracts:
   only; it produces no event or terminal.
 - The pack rewind schema is `unigym_bench.rewind/5` and monitor snapshots are
   `unigym_bench.monitor/4`; older payloads are rejected explicitly.
-- The report schema remains `external_benchmark_report/2`. `PredicateMonitor`
+- The report schema is `external_benchmark_report/3`. `PredicateMonitor`
   blocks are predicate-shaped (`kind: predicate`, `condition`, `trigger`,
   `emit`, `fired`, `fired_counts`); `PhaseMonitor` blocks keep `kind: phase`,
   and `module`/API factory monitors contribute their own `report_view`. For
@@ -213,7 +217,9 @@ the rewind card adds flow snapshots.
 The stop flag is transient. A successful rewind restore, and the core
 `on_rewind` notification, clear it so a forked branch never inherits a stop
 from the abandoned timeline. Stop persistence is deferred to the flow-rewind
-card; the report schema is unchanged.
+card. Episode evidence is engine-persisted and included in the flow rewind
+payload; extension persistence and rewind stay engine-owned while the flow owns
+extension invocation.
 
 Flow callback exceptions are fail-fast with no rollback. `begin_tick` advances
 the episode tick counters and reads monitor values before `flow.on_tick`, and
@@ -223,20 +229,30 @@ tick/boundary and closes its query snapshot, but it does not restore tick
 counters or already-observed values. The exception propagates and the run must
 abort; it must not silently continue on partially observed state.
 
-### F3 report and episode-end semantics
+### F3/F4 report and episode-end semantics
 
-The report schema stays `external_benchmark_report/2` in F3. Because monitors
-no longer produce terminal/event metadata, monitor report blocks no longer carry
-`terminal_reason`, `terminal_outcome` or event severity/content even though the
-top-level schema id is unchanged. The `/3` report shape, evidence and flow-owned
-report selection are F4 work. Consumers that inspect monitor blocks must treat
-the F3 payload as changed content under a stable `/2` id until F4.
+The report schema is `external_benchmark_report/3`. Because monitors no longer
+produce terminal/event metadata, monitor report blocks do not carry
+`terminal_reason`, `terminal_outcome` or event severity/content. Episode
+evidence, when the flow returns any, lives only under `episodes.evidence` keyed
+by `"<env>/<seq>"`; the key is absent for a run with no evidence. The fixed
+top-level block set is unchanged and a flow cannot add a block. The sink rejects
+the retired `external_benchmark_report/2` id and unknown top-level fields.
+
+The flow owns report selection. `DefaultBenchmarkFlow(report_monitor_views=...)`
+retains only the named monitor views and
+`DefaultBenchmarkFlow(report_extensions=...)` invokes only the named extensions;
+an omitted monitor view is absent from `monitors` but stays listed in
+`tasks.monitors`, and an omitted extension produces no `extensions` block.
+`None` keeps the previous default of every declared view/extension.
 
 Episode-end monitor terminals are gone, not silently reinterpreted. A monitor's
 `episode_end` trigger now only refreshes its observed value for due rows; it
 never schedules a report/scoring terminal. Any termination policy must be an
 explicit flow `TerminationRule` evaluated on a tick value. A document without
-`flow` therefore has no automatic termination and no automatic events.
+`flow` therefore has no automatic termination and no automatic events. The
+engine no longer invokes `extension.on_env_end`; the flow does, exactly once per
+due boundary and in declaration order.
 
 ## Authoring a run
 
@@ -317,7 +333,7 @@ this boundary.
 
 With `write_report: true` the sink writes the assembled document to
 `<out_dir>/external_benchmark_report.json` at run end. The filename and the
-`external_benchmark_report/2` schema are pack-owned; the core
+`external_benchmark_report/3` schema are pack-owned; the core
 `benchmark_report.json`, `results.json` and `metrics.npz` are never touched.
 Writing is opt-in because it is a filesystem side effect. The sink creates
 `out_dir` if needed and replaces the file atomically; a failed write raises and
@@ -594,7 +610,7 @@ Parity against the deleted core built-in benchmark is **frozen, not live**:
 | --- | --- | --- | --- |
 | Entry | `tests/_frozen_builtin_facts.json` (historical) | custom sink (`make_sink`) with monitors | Different composition; both used the same core runner tick engine |
 | Report artifact | `benchmark_report.json` / `results.json` / `metrics.npz` (historical) | `external_benchmark_report.json` (opt-in) | Disjoint, pack-owned filename |
-| Schema | `benchmark_report` (historical) | `external_benchmark_report/2` | Not byte-compatible; mapping documented here |
+| Schema | `benchmark_report` (historical) | `external_benchmark_report/3` | Not byte-compatible; mapping documented here |
 | Episode end | core term group + episode horizon (historical) | explicit `runner.terminate`/sink terminal; verdicts `terminal`, `deadline`, `core`, `incomplete`, `rewound` | Same core boundary facts; pack owns the lifecycle |
 | Scoring | per-task `success` and metrics (historical) | monitor `report_view` and extension blocks; no aggregate success score | Different purpose; not interchangeable |
 | Early stop | `min_episodes` / `max_steps` (historical) | caller-provided `stop_when` | Pack has no built-in stop policy |

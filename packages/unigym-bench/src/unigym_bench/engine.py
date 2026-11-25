@@ -21,7 +21,7 @@ Lifecycle (delegated by the sink)::
                  -> engine.apply_decision(tick, decision)
     runner drain -> engine.drain_terminations()
     runner due   -> engine.begin_episode_end(due, bundle) -> flow.on_episode_end
-                 -> engine.commit_episode_end(batch, None)   # finalize
+                 -> engine.commit_episode_end(batch, evidence)  # finalize
     runner reset -> engine.on_reset(due)                 # reopen new episodes
     runner end   -> engine.run_summary()
 
@@ -79,6 +79,7 @@ from .events import (
 from .flow import (
     BenchmarkTick,
     EpisodeBatch,
+    EpisodeEvidence,
     FlowDecision,
     _MonitorTickOutput,
 )
@@ -92,9 +93,10 @@ if TYPE_CHECKING:
     from unigym.values import ValuePublisher
 
 #: Checkpoint payload key and schema owned by the pack's rewind provider.
-#: Schema 5 pairs the value/context boundary with monitor snapshot schema 4.
-#: Monitor snapshots contain only construction config and observed state, so
-#: schema 4 and older rewind payloads are rejected rather than silently upgraded.
+#: Schema 5 pairs the value/context boundary with monitor snapshot schema 4 and
+#: carries finalized episode evidence plus stateful-extension snapshots.  Monitor
+#: snapshots contain only construction config and observed state, so schema 4 and
+#: older rewind payloads are rejected rather than silently upgraded.
 REWIND_PROVIDER_NAME = "unigym_bench"
 REWIND_SCHEMA = "unigym_bench.rewind/5"
 
@@ -121,6 +123,7 @@ _ENGINE_KEYS = frozenset(
         "episode_events",
         "episode_command",
         "episode_reset",
+        "episode_evidence",
         "latched",
         "pending",
         "conflicts",
@@ -161,6 +164,7 @@ class _DecodedEngineState:
     episode_events: list[dict[str, int]]
     episode_command: list[tuple[float, ...] | None]
     episode_reset: list[dict[str, JsonValue]]
+    episode_evidence: dict[tuple[int, int], Mapping[str, JsonValue]]
     latched: dict[int, Termination]
     pending: dict[int, Termination]
     conflicts: dict[int, int]
@@ -202,7 +206,6 @@ class _ActiveEpisode:
     """One validated episode boundary awaiting flow observation and commit."""
 
     batch: EpisodeBatch
-    bundle: Mapping[str, object]
     due: tuple[int, ...]
     final_values: tuple[tuple[Monitor, dict[str, Tensor]], ...]
     query: TickQuery | None
@@ -285,6 +288,7 @@ class StreamingEngine:
         self._episode_events: list[dict[str, int]] = []
         self._episode_command: list[tuple[float, ...] | None] = []
         self._episode_reset: list[dict[str, JsonValue]] = []
+        self._episode_evidence: dict[tuple[int, int], Mapping[str, JsonValue]] = {}
 
         self._latched: dict[int, Termination] = {}
         self._pending: dict[int, Termination] = {}
@@ -378,6 +382,20 @@ class StreamingEngine:
         return tuple(self._records)
 
     @property
+    def evidence(self) -> Mapping[tuple[int, int], Mapping[str, JsonValue]]:
+        """Finalized episode evidence keyed by ``(env_id, episode_seq)``.
+
+        Evidence is independent of episode retention: it is stored for every
+        due episode that returned a non-empty payload.
+        """
+        return MappingProxyType(
+            {
+                key: MappingProxyType(dict(payload))
+                for key, payload in sorted(self._episode_evidence.items())
+            }
+        )
+
+    @property
     def summary(self) -> EpisodeSummary:
         """Aggregate finalized-episode totals for the current run."""
         return EpisodeSummary(
@@ -423,6 +441,10 @@ class StreamingEngine:
                 None if command is None else list(command) for command in self._episode_command
             ],
             "episode_reset": [dict(facts) for facts in self._episode_reset],
+            "episode_evidence": {
+                f"{env_id}/{episode_seq}": dict(payload)
+                for (env_id, episode_seq), payload in sorted(self._episode_evidence.items())
+            },
             "latched": {
                 str(env_id): termination.to_json()
                 for env_id, termination in sorted(self._latched.items())
@@ -791,15 +813,16 @@ class StreamingEngine:
             raise
 
         monitor_values = {monitor.name: values for monitor, values in final_values}
+        records = self._build_records(due_ids, bundle)
         batch = EpisodeBatch(
             due=due_ids,
             final_step=final_context,
             monitor_values=monitor_values,
-            records={},
+            records={record.env_id: record for record in records},
+            extensions=self._extensions,
         )
         self._active_episode = _ActiveEpisode(
             batch=batch,
-            bundle=bundle,
             due=due_ids,
             final_values=tuple(final_values),
             query=final_query,
@@ -807,26 +830,61 @@ class StreamingEngine:
         )
         return batch
 
+    def _build_records(
+        self,
+        due_ids: tuple[int, ...],
+        bundle: Mapping[str, object],
+    ) -> list[EpisodeRecord]:
+        """Build the finalized due records without mutating run aggregates."""
+        return [
+            EpisodeRecord(
+                env_id=env_id,
+                episode_seq=self._episode_seq[env_id],
+                ticks=self._episode_ticks[env_id],
+                verdict=(
+                    "terminal" if env_id in self._latched else self._due_verdict(bundle, env_id)
+                ),
+                command_at_start=self._episode_command[env_id],
+                first_terminal=self._first_terminal(bundle, env_id),
+                core_termination=self._core_termination(bundle, env_id),
+                reset_facts=dict(self._episode_reset[env_id]),
+                event_counts=dict(self._episode_events[env_id]),
+                rewound=self._rewound[env_id],
+            )
+            for env_id in due_ids
+        ]
+
     def commit_episode_end(
         self,
         batch: EpisodeBatch,
-        evidence: Mapping[int, Mapping[str, JsonValue]] | None = None,
+        evidence: EpisodeEvidence | None = None,
     ) -> tuple[int, ...]:
         """Apply a begun episode boundary and finalize its due records.
 
-        This release accepts only ``evidence=None``; episode evidence is a later card.
+        The flow owns extension lifecycle; the engine only persists the returned
+        evidence, resets monitors and finalizes records.  Evidence is validated
+        against the batch's due ids before any state mutates.
         """
         state = self._active_episode
         if state is None or state.batch is not batch:
             raise EngineStateError("engine: commit_episode_end received a batch that is not active")
+        if evidence is not None and not isinstance(evidence, EpisodeEvidence):
+            raise TypeError(
+                "engine commit_episode_end.evidence: expected an EpisodeEvidence or None, "
+                f"got {type(evidence).__name__}"
+            )
         try:
-            if evidence is not None:
-                raise NotImplementedError(
-                    "engine episode evidence is not supported in this release; a "
-                    "flow must return None from on_episode_end"
-                )
             due_ids = state.due
-            bundle = state.bundle
+            due_set = set(due_ids)
+            evidence_rows: dict[int, Mapping[str, JsonValue]] = {}
+            if evidence is not None:
+                unknown = sorted(set(evidence.evidence) - due_set)
+                if unknown:
+                    raise ValueError(
+                        "engine commit_episode_end.evidence: env ids "
+                        f"{unknown} are not due in this boundary; due ids are {list(due_ids)}"
+                    )
+                evidence_rows = dict(evidence.evidence)
 
             # Publish after final evaluation so the store never receives stale tick
             # levels for the due rows.  A partial open set is skipped for the same
@@ -836,30 +894,15 @@ class StreamingEngine:
                     for local_name, value in values.items():
                         self._publisher.publish(f"{monitor.name}/{local_name}", value)
 
-            records = [
-                EpisodeRecord(
-                    env_id=env_id,
-                    episode_seq=self._episode_seq[env_id],
-                    ticks=self._episode_ticks[env_id],
-                    verdict=(
-                        "terminal" if env_id in self._latched else self._due_verdict(bundle, env_id)
-                    ),
-                    command_at_start=self._episode_command[env_id],
-                    first_terminal=self._first_terminal(bundle, env_id),
-                    core_termination=self._core_termination(bundle, env_id),
-                    reset_facts=dict(self._episode_reset[env_id]),
-                    event_counts=dict(self._episode_events[env_id]),
-                    rewound=self._rewound[env_id],
+            records = [batch.records[env_id] for env_id in due_ids]
+            for env_id, payload in evidence_rows.items():
+                if not payload:
+                    # An empty evidence object carries no fact; storing it would
+                    # emit an empty placeholder in the report and rewind payload.
+                    continue
+                self._episode_evidence[(env_id, self._episode_seq[env_id])] = MappingProxyType(
+                    dict(payload)
                 )
-                for env_id in due_ids
-            ]
-
-            if self._extensions:
-                # Only this boundary's envs are visible, and the records are frozen;
-                # an extension cannot reach another env or mutate a finalized record.
-                due_records = MappingProxyType({record.env_id: record for record in records})
-                for extension in self._extensions:
-                    extension.on_env_end(due_ids, due_records)
             for monitor in self._monitors:
                 monitor.reset(due_ids)
 
@@ -1133,6 +1176,9 @@ class StreamingEngine:
             raw["episode_command"], f"{where}.episode_command", num_envs
         )
         episode_reset = _decode_reset_list(raw["episode_reset"], f"{where}.episode_reset", num_envs)
+        episode_evidence = _decode_episode_evidence(
+            raw["episode_evidence"], f"{where}.episode_evidence", num_envs
+        )
         latched = _decode_termination_map(raw["latched"], f"{where}.latched", num_envs)
         pending = _decode_termination_map(raw["pending"], f"{where}.pending", num_envs)
         for env_id in latched:
@@ -1210,6 +1256,7 @@ class StreamingEngine:
             episode_events=[dict(counts) for counts in episode_events],
             episode_command=list(episode_command),
             episode_reset=[dict(facts) for facts in episode_reset],
+            episode_evidence=episode_evidence,
             latched=latched,
             pending=pending,
             conflicts=conflicts,
@@ -1241,6 +1288,7 @@ class StreamingEngine:
         self._episode_events = decoded.episode_events
         self._episode_command = decoded.episode_command
         self._episode_reset = decoded.episode_reset
+        self._episode_evidence = decoded.episode_evidence
         self._latched = decoded.latched
         self._pending = decoded.pending
         self._conflicts = decoded.conflicts
@@ -1807,6 +1855,28 @@ def _decode_env_key(key: str, where: str) -> int:
     if not key.isdigit() or str(int(key)) != key:
         raise ValueError(f"{where}: expected a non-negative integer key, got {key!r}")
     return int(key)
+
+
+def _decode_episode_evidence(
+    value: JsonValue, where: str, num_envs: int | None
+) -> dict[tuple[int, int], Mapping[str, JsonValue]]:
+    """Decode finalized evidence keyed by ``"<env>/<seq>"``."""
+    if not isinstance(value, dict):
+        raise TypeError(f"{where}: expected an object, got {type(value).__name__}")
+    evidence: dict[tuple[int, int], Mapping[str, JsonValue]] = {}
+    for key, item in value.items():
+        env_text, separator, seq_text = key.partition("/")
+        if not separator:
+            raise ValueError(f"{where}: expected an '<env>/<seq>' key, got {key!r}")
+        env_id = _decode_env_key(env_text, where)
+        seq = _decode_env_key(seq_text, f"{where}[{key!r}].episode_seq")
+        if num_envs is None or env_id >= num_envs:
+            raise ValueError(f"{where}: env id {env_id} is outside [0, num_envs={num_envs})")
+        normalized = ensure_json_value(item, where=f"{where}[{key!r}]")
+        if not isinstance(normalized, dict):
+            raise TypeError(f"{where}[{key!r}]: expected an object")
+        evidence[(env_id, seq)] = MappingProxyType(normalized)
+    return evidence
 
 
 def _decode_termination_map(
