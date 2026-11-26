@@ -46,22 +46,18 @@ not copy core source into this repo.
 
 ## Local development
 
-Core is not on PyPI yet, so a plain `uv sync` cannot resolve `unigym` and no
-lockfile is committed until it can. Use a core checkout on `PYTHONPATH`, or
-install core editable into an environment first:
+Core `0.110.0` is published on PyPI. Install the supported core range and the
+editable package:
 
 ```bash
-git clone https://github.com/unsigned123/unigym ../unigym-core
 python -m venv .venv
 . .venv/bin/activate
-pip install -e ../unigym-core
+pip install "unigym>=0.110,<0.111"
 pip install -e 'packages/unigym-rl[gymnasium,skrl]'
 pip install -e packages/unigym-bench
 
-PYTHONPATH=../unigym-core:packages/unigym-rl/src \
-  python -m pytest packages/unigym-rl/tests -q
-PYTHONPATH=../unigym-core:packages/unigym-bench/src \
-  python -m pytest packages/unigym-bench/tests -q
+python -m pytest packages/unigym-rl/tests -q
+python -m pytest packages/unigym-bench/tests -q
 ```
 
 Static checks:
@@ -103,9 +99,9 @@ python examples/cartpole/train_skrl.py --num-envs 1 --max-iterations 1
 - Core compatibility is recorded per release in `COMPATIBILITY.md`, which is the
   authority; the current lanes are `unigym-rl 0.2.x` -> `unigym >=0.110,<0.111`
   and `unigym-bench 0.4.x` -> `unigym >=0.110,<0.111`.
-- Release ordering: core `0.110.0` must be on core `main` before
-  `unigym-bench 0.4.1` and `unigym-rl 0.2.2` can resolve their dependency or
-  their CI lanes can run. Core `0.110.0` is the breaking pack model v2 release
+- Core `0.110.0` is published on PyPI, so
+  `unigym-bench 0.4.1` and `unigym-rl 0.2.2` resolve their dependency range
+  directly. Core `0.110.0` is the breaking pack model v2 release
   (`PackLoader` replaces `PackRuntime`, the catalog module and the
   `Pack.robot`/`PackSet.robot` helpers); migrate external pack consumers before
   widening the range. See `MIGRATION.md`.

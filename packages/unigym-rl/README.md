@@ -347,21 +347,18 @@ class MyTask(TaskEnv):
 `unigym-rl` is developed and released from
 `packages/unigym-rl` in the
 [`unigym-packages`](https://github.com/unsigned123/unigym-packages)
-repository. Core is not on PyPI yet, so install `unigym` from a checkout and
-install this package against it from `packages/unigym-rl`:
+repository. Core `0.110.0` is published on PyPI, so install the supported core
+range and this package against it:
 
 ```bash
-git clone https://github.com/unsigned123/unigym ../unigym-core
-pip install -e ../unigym-core
+pip install "unigym>=0.110,<0.111"
 pip install -e '.[gymnasium,skrl]'
 ```
 
-From the **root of the `unigym-packages` repository**, run the tests with the
-core checkout on `PYTHONPATH` (adjust paths for your environment):
+From the **root of the `unigym-packages` repository**, run the tests:
 
 ```bash
-PYTHONPATH=../unigym-core:packages/unigym-rl/src \
-  python -m pytest packages/unigym-rl/tests -q
+python -m pytest packages/unigym-rl/tests -q
 ```
 
 Static checks:

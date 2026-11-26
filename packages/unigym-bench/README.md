@@ -803,17 +803,17 @@ retention test proves the journal is bounded by `max_events`.
 
 ### Release validation
 
-The `0.4.1` release is validated against the pack model v2 core (`0.110.x`)
-worktree. From
-`packages/unigym-bench`, using the Python from the core virtual environment:
+The `0.4.1` release is validated against core `0.110.0` from PyPI. From
+`packages/unigym-bench`, with the supported core range and `dev` extra
+installed:
 
 ```bash
-PYTHONPATH=<core-worktree>:src python -m pytest -q tests
-PYTHONPATH=<core-worktree>:src python -m pytest -q \
+python -m pytest -q tests
+python -m pytest -q \
   tests/test_parity.py tests/test_retention.py tests/test_rewind.py \
   tests/test_integration.py
-PYTHONPATH=<core-worktree>:src python -m ruff check src tests
-PYTHONPATH=<core-worktree>:src python -m ruff format --check src tests
+python -m ruff check src tests
+python -m ruff format --check src tests
 ```
 
 The full suite includes the real tiny-arm MuJoCo integration, explicit
