@@ -48,7 +48,7 @@ G1_USDA_SHA256 = "d465d4c4ee6bd4863556f86e306bfb0eeaee125128a17a24bbe52d5340f3e5
 
 CONSUMER_TEST = '''\
 import pytest
-from unigym.pack_api import load_manifest_v1
+from unigym.pack_api import ItemStatus, load_manifest_v1
 from unigym.robots import build_robot_profile
 from unigym.scene_presets import load_scene_preset
 
@@ -60,29 +60,33 @@ def test_installed_wheels(pack_root, pack_runtime):
     assert load_manifest_v1(root).name == "basic"
     assert (root / "robots" / "basic_arm.yaml").is_file()
     runtime = pack_runtime("basic")
-    assert runtime.catalog.packs() == ("basic",)
-    assert runtime.resource_for("providers", "basic_arm").is_file()
-    assert runtime.resource_for("scene_presets", "basic.tabletop").is_file()
+    assert tuple(pack.name for pack in runtime.pack_set.packs()) == ("basic",)
+    assert runtime.resolve("providers", "basic_arm").is_file()
+    assert runtime.resolve("scene_presets", "basic.tabletop").is_file()
     assert load_scene_preset("basic.tabletop", runtime).name == "tabletop"
 
     cartpole_root = pack_root("isaaclab_cartpole")
     assert load_manifest_v1(cartpole_root).name == "isaaclab_cartpole"
     cartpole = pack_runtime("isaaclab_cartpole")
-    usd = cartpole.resource_for("assets", "isaaclab_cartpole.usd")
+    usd = cartpole.resolve("assets", "isaaclab_cartpole.usd")
     assert b"Props" in usd.read_bytes()
     assert (usd.parent / "Props" / "instanceable_meshes.usd").is_file()
 
     g1_root = pack_root("g1")
     assert load_manifest_v1(g1_root).name == "g1"
     g1 = pack_runtime("g1")
-    g1_usd = g1.resource_for("assets", "g1.usd")
+    g1_usd = g1.resolve("assets", "g1.usd")
     assert (g1_usd.parent / "configuration" / "three_finger_hand").is_dir()
     assert (g1_usd.parent / "configuration" / "g1_29dof_with_hand_rev_1_0_base.usd").is_file()
 
-    assert g1.activate("g1").robots == ("g1",)
+    g1_robots = g1.activate("g1").items_for(face="providers", kind="robot")
+    assert tuple(item.id for item in g1_robots) == ("g1",)
+    assert all(item.status is ItemStatus.REGISTERED for item in g1_robots)
     assert build_robot_profile({"name": "g1"}).base_height == pytest.approx(0.78)
     gr1 = pack_runtime("gr1")
-    assert gr1.activate("gr1").robots == ("gr1",)
+    gr1_robots = gr1.activate("gr1").items_for(face="providers", kind="robot")
+    assert tuple(item.id for item in gr1_robots) == ("gr1",)
+    assert all(item.status is ItemStatus.REGISTERED for item in gr1_robots)
     assert len(build_robot_profile({"name": "gr1"}).full_joint_names) == 39
 '''
 
@@ -290,6 +294,7 @@ def main() -> int:
                 *offline,
                 "pytest>=8,<10",
                 "PyYAML>=6,<7",
+                "numpy>=1.26,<3",
             ],
             cwd=REPO_ROOT,
         )

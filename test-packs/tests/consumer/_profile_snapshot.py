@@ -31,8 +31,8 @@ def profile_document(profile: RobotProfile) -> dict[str, Any]:
         "body_bindings": {
             str(key): dict(value.names) for key, value in profile.body_bindings.items()
         },
-        "action_faces": {
-            key: list(value) for key, value in profile.action_faces.items()
+        "extra_action_sets": {
+            key: list(value) for key, value in profile.extra_action_sets.items()
         },
         "full_joint_order": (
             list(profile.full_joint_order) if profile.full_joint_order else None

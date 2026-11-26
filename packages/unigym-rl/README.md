@@ -16,6 +16,15 @@ core Run / ExternalRunner / reset / state
 It does **not** own the training loop, optimizer, checkpoint format, reward
 implementation, or policy execution/deployment (L3 stays in core).
 
+## Release 0.2.2: core 0.110 pack model v2
+
+`unigym-rl 0.2.2` is a patch release. It moves the core range to
+`unigym >=0.110,<0.111` for the core pack model v2 cutover. The task/lifecycle
+contract is unchanged from `0.2.1`; the Go2 velocity example now resolves its
+profile through `PackLoader.from_pack_set(...).robot_profile(...)` instead of
+the removed `Pack.robot(...)` helper. `unigym-rl` itself still does not use
+packs, subscriptions or a trainer.
+
 ## Release 0.2.1: core 0.109 range
 
 `unigym-rl 0.2.1` is a patch release. It moves the core range to
@@ -363,7 +372,7 @@ python -m ruff format --check packages/unigym-rl/src packages/unigym-rl/tests pa
 ```
 
 Releases declare a core range in `pyproject.toml`
-(`unigym>=0.109,<0.110`) and are tagged `unigym-rl-v<version>`; see
+(`unigym>=0.110,<0.111`) and are tagged `unigym-rl-v<version>`; see
 `COMPATIBILITY.md` at the repository root.
 
 ## External termination mode

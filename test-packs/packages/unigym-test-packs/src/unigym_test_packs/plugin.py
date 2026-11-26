@@ -6,7 +6,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 import pytest
-from unigym.pack_api import PackRuntime, discover
+from unigym.pack_api import PackLoader, discover
 
 from .discovery import PackDiscoveryError, PackIndex, discover_installed_packs
 from .markers import (
@@ -19,7 +19,7 @@ from .markers import (
 _STRICT_OPTION = "--strict-test-packs"
 _STRICT_DEST = "strict_test_packs"
 _INDEX_KEY = pytest.StashKey[PackIndex]()
-_RUNTIME_KEY = pytest.StashKey[dict[tuple[str, ...], PackRuntime]]()
+_RUNTIME_KEY = pytest.StashKey[dict[tuple[str, ...], PackLoader]]()
 
 
 def _install_hint(name: str) -> str:
@@ -46,7 +46,7 @@ def _index(config: pytest.Config) -> PackIndex:
         ) from None
 
 
-def _runtime_cache(config: pytest.Config) -> dict[tuple[str, ...], PackRuntime]:
+def _runtime_cache(config: pytest.Config) -> dict[tuple[str, ...], PackLoader]:
     """Return the configuration's per-tuple runtime cache."""
     try:
         return config.stash[_RUNTIME_KEY]
@@ -143,15 +143,15 @@ def pack_root(request: pytest.FixtureRequest) -> Callable[[str], Path]:
 
 
 @pytest.fixture
-def pack_runtime(request: pytest.FixtureRequest) -> Callable[..., PackRuntime]:
-    """Return a factory for an explicit core pack runtime over declared packs."""
+def pack_runtime(request: pytest.FixtureRequest) -> Callable[..., PackLoader]:
+    """Return a factory for an explicit core pack loader over declared packs."""
     item = request.node
     if not isinstance(item, pytest.Item):
         pytest.fail("pack_runtime is only available to collected test items", pytrace=False)
     index = _index(request.config)
     cache = _runtime_cache(request.config)
 
-    def build(*names: str) -> PackRuntime:
+    def build(*names: str) -> PackLoader:
         if not names:
             pytest.fail("pack_runtime requires at least one pack name", pytrace=False)
         validated = tuple(

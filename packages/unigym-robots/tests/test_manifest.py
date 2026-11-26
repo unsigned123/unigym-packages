@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+import unigym_robots
 from unigym_robots import cli, download, manifest
 from unigym_robots.download import (
     ASSET_SETS,
@@ -241,6 +242,13 @@ def test_cli_list_and_info_are_offline(capsys: pytest.CaptureFixture[str]) -> No
 
     assert cli.main(["info", "mjcf-v0"]) == 0
     assert "mjcf-v0" in capsys.readouterr().out
+
+
+def test_cli_version_matches_package_version(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as exit_info:
+        cli.main(["--version"])
+    assert exit_info.value.code == 0
+    assert capsys.readouterr().out.strip() == f"unigym-robots {unigym_robots.__version__}"
 
 
 def test_cli_errors_return_nonzero(capsys: pytest.CaptureFixture[str]) -> None:

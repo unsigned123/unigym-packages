@@ -1,5 +1,5 @@
 {
-  "action_faces": {
+  "extra_action_sets": {
     "left_hand": [
       "gripper0_left_L_pinky_intermediate_joint",
       "gripper0_left_L_pinky_proximal_joint",

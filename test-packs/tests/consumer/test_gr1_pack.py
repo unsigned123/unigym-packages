@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from unigym.pack_api import load_manifest_v1
+from unigym.pack_api import ItemStatus, load_manifest_v1
 from unigym.robots import build_robot_profile
 from tests.consumer._profile_snapshot import load_profile_snapshot, profile_document
 
@@ -21,9 +21,10 @@ def test_gr1_pack_carries_the_robot_data(pack_root) -> None:
 def test_gr1_robot_provider_registers_the_neutral_profile(pack_runtime) -> None:
     runtime = pack_runtime("gr1")
 
-    handle = runtime.activate("gr1")
-
-    assert handle.robots == ("gr1",)
+    activated = runtime.activate("gr1")
+    robots = activated.items_for(face="providers", kind="robot")
+    assert tuple(item.id for item in robots) == ("gr1",)
+    assert all(item.status is ItemStatus.REGISTERED for item in robots)
     profile = build_robot_profile({"name": "gr1"})
     assert profile.name == "gr1"
     assert len(profile.joint_sets["body"]) == 17
@@ -33,6 +34,6 @@ def test_gr1_robot_provider_registers_the_neutral_profile(pack_runtime) -> None:
     assert profile.full_joint_names[0] == "robot0_torso_waist_yaw"
     assert profile.base_body == "base"
     assert profile.foot_bodies == ()
-    assert set(profile.action_faces) == {"right_hand", "left_hand"}
+    assert set(profile.extra_action_sets) == {"right_hand", "left_hand"}
     assert profile.assets is None
     assert profile_document(profile) == load_profile_snapshot("gr1")

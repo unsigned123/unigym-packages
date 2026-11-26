@@ -947,7 +947,7 @@ wheels = [
 
 [[package]]
 name = "unigym"
-version = "0.106.0"
+version = "0.110.0"
 source = { editable = "../unigym-core" }
 dependencies = [
     { name = "mujoco" },

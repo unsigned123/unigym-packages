@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "unigym-robots"
-version = "0.1.0"
+version = "0.1.1"
 description = "Pinned Unitree robot assets (MJCF and USD) for unigym, distributed as GitHub Release tarballs"
 readme = "README.md"
 requires-python = ">=3.11"

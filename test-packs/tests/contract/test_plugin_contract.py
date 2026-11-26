@@ -30,9 +30,9 @@ def test_fixtures_read_installed_pack_and_runtime(pytester: pytest.Pytester) -> 
             root = pack_root("basic")
             assert load_manifest_v1(root).name == "basic"
             runtime = pack_runtime("basic")
-            assert runtime.catalog.packs() == ("basic",)
+            assert tuple(pack.name for pack in runtime.pack_set.packs()) == ("basic",)
             assert runtime is pack_runtime("basic")
-            assert runtime.resource_for("providers", "basic_arm").is_file()
+            assert runtime.resolve("providers", "basic_arm").is_file()
         """
     )
 
@@ -174,7 +174,7 @@ def test_plugin_ignores_pack_environment(
         def test_installed_only(pack_root, pack_runtime):
             root = pack_root("basic")
             assert not (root / "poison.txt").exists()
-            assert pack_runtime("basic").catalog.packs() == ("basic",)
+            assert tuple(pack.name for pack in pack_runtime("basic").pack_set.packs()) == ("basic",)
         """
     )
 

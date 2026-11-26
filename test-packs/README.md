@@ -41,8 +41,8 @@ pytestmark = pytest.mark.requires_test_packs("basic")
 ```
 
 Then uses `pack_root(name)` for the installed tree or `pack_runtime(*names)` for
-the explicit core pack runtime. Activation is always explicit through
-`PackRuntime.activate`.
+the explicit core `PackLoader` over those roots (`loader.pack_set` is the
+read-only pack index). Activation is always explicit through `PackLoader.activate`.
 
 Missing packs skip by default. The strict/full CI lanes use
 `--strict-test-packs` so a missing required pack fails at test setup; the

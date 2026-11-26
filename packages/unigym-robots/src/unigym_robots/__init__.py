@@ -24,7 +24,7 @@ from .download import (
 )
 from .manifest import ASSETS, ASSETS_BY_ID, RELEASE_TAG, Asset, get_asset
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 
 def pack_root() -> Path:

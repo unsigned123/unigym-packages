@@ -5,10 +5,13 @@ streaming, monitor-driven benchmarking layer on the public sink, evaluation,
 value and step-context contracts, without importing `unigym.benchmarks`,
 `unigym.runner.evaluation` or `unigym.runner.episodes`.
 
-Status: `0.4.0`, the flow-owned post-deletion-core release (core `0.109.x`; no
-throughput claim). The pack requires `unigym>=0.109,<0.110` and
+Status: `0.4.1`, the pack-model-v2 core-lockstep release (core `0.110.x`; no
+throughput claim). The pack requires `unigym>=0.110,<0.111` and
 `CORE_SURFACE_VERSION` is `5` (the 0.109 add of
-`ValueStore.subscribe`). The post-deletion core owns no run `mode`, no episode
+`ValueStore.subscribe`). `0.4.1` is a metadata and compatibility release: it
+moves the core range onto the pack model v2 cutover and uses `PackLoader` in
+the tiny-arm test helper; benchmark behavior, schemas and the production sink
+are unchanged from `0.4.0`. The post-deletion core owns no run `mode`, no episode
 clock and no built-in benchmark or `EvaluationSession`; the pack therefore ends
 every episode through an explicit `runner.terminate(...)` boundary (or a pack
 sink terminal) and reopens envs through the core `ResetAwareSink.on_reset`
@@ -80,6 +83,16 @@ scenario with its rewind-capable sampler (`unigym_bench.scenario`,
 test through `Run.runner` (the core SyncRunner tick engine), zero-episode and
 multi-env conformance coverage, a bounded-journal retention test, and the
 parity limitations documented below.
+
+## Release 0.4.1: pack model v2 core range
+
+`unigym-bench 0.4.1` is a patch release. It moves the core range to
+`unigym>=0.110,<0.111` and `REQUIRED_CORE_VERSION` to `0.110.0` so the lane
+resolves against the core pack model v2 cutover. The benchmark sink, flow,
+monitor, report and rewind contracts are unchanged from `0.4.0`; only the
+test-only tiny-arm helper now types the explicit run runtime as
+`unigym.packs.loader.PackLoader`. There is no pack-runtime dependency in the
+production benchmark path.
 
 ## Release 0.4.0: flow-owned benchmark layer
 
@@ -790,7 +803,7 @@ retention test proves the journal is bounded by `max_events`.
 
 ### Release validation
 
-The `0.4.0` release is validated against the flow-owned post-deletion core
+The `0.4.1` release is validated against the pack model v2 core (`0.110.x`)
 worktree. From
 `packages/unigym-bench`, using the Python from the core virtual environment:
 
@@ -812,14 +825,14 @@ or Isaac Lab lane is claimed.
 ## Dependencies
 
 Development requires Python >=3.11 with a compatible `unigym`
-(`>=0.109,<0.110`) installed, plus the `dev` extra. The YAML loader requires
+(`>=0.110,<0.111`) installed, plus the `dev` extra. The YAML loader requires
 `PyYAML>=6.0,<7.0`, which is a direct runtime dependency of the pack. Pytest
 adds `src` to its own path, so tests do not need a caller-provided
 `PYTHONPATH`; the import-fence subprocess also sets its own path from the
 imported package.
 
-`unigym_bench.__version__` is `0.4.0` for the flow-owned post-deletion core
-`0.109.x` release. `CORE_SURFACE_VERSION` is a pack-local revision of the
+`unigym_bench.__version__` is `0.4.1` for the pack model v2 core
+`0.110.x` release. `CORE_SURFACE_VERSION` is a pack-local revision of the
 required `unigym` public surface (currently `5`, after adopting the explicit
 sink selection, reset-aware lifecycle and additive
 `ValueStore.subscribe` seams), not the distribution version.

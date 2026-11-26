@@ -4,14 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "unigym-rl"
-version = "0.2.1"
+version = "0.2.2"
 description = "L2 task-environment layer over unigym core"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [{ name = "unsigned123" }]
 dependencies = [
-    "unigym>=0.109,<0.110",
+    "unigym>=0.110,<0.111",
     "torch",
     "numpy",
 ]

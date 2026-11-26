@@ -80,9 +80,9 @@ source_modules = [
     "unigym_test_pack_isaaclab_cartpole",
 ]
 forbidden_modules = [
-    "unigym.packs.runtime",
+    "unigym.packs.loader",
     "unigym.packs.schema",
-    "unigym.packs.catalog",
+    "unigym.packs.packset",
     "unigym.backends",
     "unigym.backends.*",
     "unigym.core",

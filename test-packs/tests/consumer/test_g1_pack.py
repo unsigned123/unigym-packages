@@ -53,7 +53,7 @@ def test_g1_pack_runtime_resolves_root_usd(pack_root, pack_runtime) -> None:
     root: Path = pack_root("g1")
     runtime = pack_runtime("g1")
 
-    usd = runtime.resource_for("assets", "g1.usd")
+    usd = runtime.resolve("assets", "g1.usd")
     assert usd == root / "assets" / "g1.usd"
     assert b"g1_29dof_with_hand_rev_1_0" in usd.read_bytes()
     assert (usd.parent / "configuration").is_dir()

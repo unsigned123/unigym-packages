@@ -6,7 +6,8 @@ wheel and adds no package API.
 
 What it proves:
 
-- the installed `unigym-robots` pack profile loads (joints, standby pose,
+- the installed `unigym-robots` pack profile loads through
+  `PackLoader.from_pack_set(...).robot_profile(...)` (joints, standby pose,
   feet, actuation) after the Go2 foot-body fix;
 - explicit `OrderedActionSpec` / `PolicyBinding` constants for the 12 leg
   joints;

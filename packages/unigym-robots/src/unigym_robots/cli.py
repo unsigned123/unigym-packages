@@ -9,6 +9,7 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
+from . import __version__
 from .download import (
     ASSET_SETS,
     RobotsError,
@@ -125,7 +126,7 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="unigym-robots",
         description="Download pinned Unitree MJCF and USD assets for unigym.",
     )
-    parser.add_argument("--version", action="version", version="unigym-robots 0.1.0")
+    parser.add_argument("--version", action="version", version=f"unigym-robots {__version__}")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     list_parser = subparsers.add_parser("list", help="list sets and assets")

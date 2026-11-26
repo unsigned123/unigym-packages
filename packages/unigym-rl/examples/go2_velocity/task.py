@@ -16,7 +16,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
-from unigym.packs import require
+from unigym.packs import PackLoader, require
 from unigym.runtime.actions import OrderedActionGroup, OrderedActionSpec, PolicyBinding
 from unigym.world import World
 
@@ -168,7 +168,8 @@ GO2_POLICIES = (PolicyBinding(adapter="manual", groups=((GO2_ARTICULATION, GO2_A
 def go2_profile() -> RobotProfile:
     """Load the installed ``unigym-robots`` Go2 profile without downloading."""
     packs = require("unigym_robots")
-    return packs.pack("unigym_robots").robot(GO2_PROFILE_ID)
+    loader = PackLoader.from_pack_set(packs)
+    return loader.robot_profile("unigym_robots", GO2_PROFILE_ID)
 
 
 def make_go2_velocity_spec(

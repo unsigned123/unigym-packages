@@ -73,14 +73,14 @@ def test_no_robot_binaries_are_shipped() -> None:
 
 def test_pack_robot_returns_a_complete_profile() -> None:
     pytest.importorskip("unigym")
-    from unigym.packs import discover_set
+    from unigym.packs import PackLoader, discover_set
     from unigym.robots import ROBOT_REGISTRY
     from unigym.robots.base import RobotProfile
 
     pack_set = discover_set([PACK])
-    pack = pack_set.pack("unigym_robots")
+    loader = PackLoader.from_pack_set(pack_set)
     for robot_id in ROBOT_IDS:
-        profile = pack.robot(robot_id)
+        profile = loader.robot_profile("unigym_robots", robot_id)
         assert isinstance(profile, RobotProfile)
         assert profile.name == robot_id
         assert profile.assets is not None
@@ -90,9 +90,9 @@ def test_pack_robot_returns_a_complete_profile() -> None:
             for asset_format, backends in profile.asset_backends.items()
         } == EXPECTED_ASSET_BACKENDS[robot_id]
         assert profile.actuation
-        assert pack_set.robot(robot_id) == profile
+        assert loader.provider("robot", robot_id).id == robot_id
         assert robot_id not in ROBOT_REGISTRY
 
-    go2 = pack.robot("go2")
+    go2 = loader.robot_profile("unigym_robots", "go2")
     assert go2.assets.usd == "release:go2-usd"
     assert go2.actuation[0].joint_set == "body"

@@ -20,7 +20,7 @@ from unigym.runtime.actions import NamedAction, OrderedActionSpec, PolicyBinding
 from unigym.world import World
 
 if TYPE_CHECKING:
-    from unigym.packs.runtime import PackRuntime
+    from unigym.packs.loader import PackLoader
     from unigym.runner.external import ExternalRunner
 
 __all__ = [
@@ -106,7 +106,7 @@ def make_run(
     *,
     steps: int,
     sink: SinkSpec | None,
-    pack_runtime: PackRuntime | None = None,
+    pack_runtime: PackLoader | None = None,
 ) -> Run:
     """Build one real tiny-arm ``Run`` with the supplied sink.
 

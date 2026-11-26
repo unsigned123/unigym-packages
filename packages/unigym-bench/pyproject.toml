@@ -11,7 +11,7 @@ authors = [{name = "UniGym contributors"}]
 requires-python = ">=3.11"
 dynamic = ["version"]
 dependencies = [
-    "unigym>=0.109,<0.110",
+    "unigym>=0.110,<0.111",
     "PyYAML>=6.0,<7.0",
 ]
 

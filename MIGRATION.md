@@ -1,4 +1,43 @@
-# Migration record: standalone `unigym-rl` into `unigym-packages`
+# Migration records
+
+## Pack model v2 (core 0.110.0)
+
+Core `0.110.0` removes the transitional pack bridge with no compatibility shim.
+The public replacement is `unigym.packs.loader.PackLoader`; `unigym.pack_api`
+still exports it. External consumers move like this:
+
+```python
+from unigym.packs import PackLoader, require
+
+packs = require("unigym_robots")
+pack = packs.pack("unigym_robots")      # stored Pack declaration
+loader = PackLoader.from_pack_set(packs)
+
+profile = loader.robot_profile("unigym_robots", "go2")    # was pack.robot("go2")
+path = loader.resolve("providers", "go2")                # was 2-arg resource_for
+item = loader.provider("robot", "go2")                   # stored PackItem
+activated = loader.activate("unigym_robots")             # returns the Pack snapshot
+robots = activated.items_for(face="providers", kind="robot")  # was handle.robots
+```
+
+The mapping for the removed names:
+
+| Removed | Replacement |
+| --- | --- |
+| `PackRuntime` | `unigym.packs.loader.PackLoader` |
+| `unigym.packs.runtime` / `unigym.packs.catalog` | `unigym.packs.loader` / `unigym.packs.packset` |
+| `PackSet.robot(id)` / `Pack.robot(id)` | `PackLoader.robot_profile(pack, id)` |
+| `resource_for(face, id)` | `PackLoader.resolve(face, id)` or `PackLoader.resource_for(item)` |
+| `runtime.catalog.packs()` | `tuple(pack.name for pack in loader.pack_set.packs())` |
+| `ActivationHandle.robots` | `loader.activate(pack).items_for(face="providers", kind="robot")` with `ItemStatus` |
+| `Pack.provides` | `Pack.items` / `Pack.items_for(...)` |
+
+`unigym-bench 0.4.1` and `unigym-rl 0.2.2` are the coordinated releases for
+this core range; `unigym-robots 0.1.1` updates its docs and tests while keeping
+no core dependency. `test-packs/ci/core-pin.toml` is a separate vendored pin
+and is not part of these package releases.
+
+## Standalone `unigym-rl` into `unigym-packages`
 
 `unigym-rl` is now developed in `packages/unigym-rl` of this repository. This
 file records the history import from the standalone checkout.

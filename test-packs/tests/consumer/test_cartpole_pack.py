@@ -21,7 +21,7 @@ def test_cartpole_pack_runtime_resolves_asset(pack_root, pack_runtime) -> None:
     root: Path = pack_root("isaaclab_cartpole")
     runtime = pack_runtime("isaaclab_cartpole")
 
-    usd = runtime.resource_for("assets", "isaaclab_cartpole.usd")
+    usd = runtime.resolve("assets", "isaaclab_cartpole.usd")
     assert usd == root / "assets" / "cartpole.usd"
     assert b"Props" in usd.read_bytes()
     assert (usd.parent / "Props" / "instanceable_meshes.usd").is_file()
@@ -39,7 +39,7 @@ def test_cartpole_pack_runtime_resolves_asset_scene_fixtures(pack_root, pack_run
         "jointed_cube.urdf": root / "assets" / "jointed_cube.urdf",
     }
     for asset_id, path in expected.items():
-        assert runtime.resource_for("assets", asset_id) == path
+        assert runtime.resolve("assets", asset_id) == path
         assert path.is_file()
 
     static_stage = expected["static_cup.usda"].read_text(encoding="utf-8")

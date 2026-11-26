@@ -109,7 +109,7 @@ body_sets: {}
 body_bindings:
   base:
     mjcf: robot0_whole_body
-action_faces:
+extra_action_sets:
   right_hand:
   - gripper0_right_R_pinky_intermediate_joint
   - gripper0_right_R_pinky_proximal_joint

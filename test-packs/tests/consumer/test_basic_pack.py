@@ -22,10 +22,10 @@ def test_basic_pack_runtime_resolves_declared_resources(pack_root, pack_runtime)
     root: Path = pack_root("basic")
     runtime = pack_runtime("basic")
 
-    assert runtime.catalog.packs() == ("basic",)
-    assert runtime.resource_for("providers", "basic_arm") == root / "robots" / "basic_arm.yaml"
+    assert tuple(pack.name for pack in runtime.pack_set.packs()) == ("basic",)
+    assert runtime.resolve("providers", "basic_arm") == root / "robots" / "basic_arm.yaml"
     assert (
-        runtime.resource_for("scene_presets", "basic.tabletop")
+        runtime.resolve("scene_presets", "basic.tabletop")
         == root / "scene_presets" / "tabletop.yaml"
     )
     assert "name: basic_arm" in (root / "robots" / "basic_arm.yaml").read_text(encoding="utf-8")
